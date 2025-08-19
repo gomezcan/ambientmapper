@@ -1,6 +1,8 @@
 # ambientmapper
 Ambient contamination cleaning for multi-genome mappings (single-cell, scifi-ATAC)
 
+![tests](https://github.com/gomezcan/ambientmapper/actions/workflows/test.yml/badge.svg)
+
 ## install your package (editable dev install)
 ```bash
 pip install -e .
@@ -23,5 +25,5 @@ ambientmapper assign  -c configs/example.json -t 16
 ambientmapper merge   -c configs/example.json
 ```
 
-![tests](https://github.com/gomezcan/ambientmapper/actions/workflows/test.yml/badge.svg)
+
 
