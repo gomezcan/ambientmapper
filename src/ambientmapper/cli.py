@@ -1,9 +1,8 @@
-#
 from __future__ import annotations
 
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import json, csv, re
+import json, csv
 from typing import Dict, List
 import typer
 
@@ -55,10 +54,6 @@ def _cfg_from_inline(sample: str, genomes_csv: str, bams_csv: str,
     }
 
 def _cfgs_from_tsv(tsv: Path, min_barcode_freq: int, chunk_size_cells: int) -> List[Dict[str, object]]:
-    """
-    TSV columns: sample, genome, bam, workdir
-    Rows with same 'sample' are grouped into one config.
-    """
     groups: Dict[str, Dict[str, str]] = {}
     workdirs: Dict[str, str] = {}
     with open(tsv, "r", newline="") as f:
@@ -93,8 +88,7 @@ def _cfgs_from_tsv(tsv: Path, min_barcode_freq: int, chunk_size_cells: int) -> L
     return cfgs
 
 def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
-    """extract -> filter -> chunks -> assign -> merge (local; scheduler-agnostic)."""
-    # Lazy import step functions so `ambientmapper --help` doesn't load heavy deps
+    # Lazy import step functions so `ambientmapper --help` stays fast
     from .extract import bam_to_qc
     from .filtering import filter_qc_file
     from .chunks import make_barcode_chunks
@@ -106,10 +100,8 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
 
     # 10) extract (parallel over genomes)
     with ProcessPoolExecutor(max_workers=_clamp(threads, 1, len(genomes))) as ex:
-        futs = [
-            ex.submit(bam_to_qc, Path(bam), d["qc"] / f"{g}_QCMapping.txt")
-            for g, bam in genomes
-        ]
+        futs = [ex.submit(bam_to_qc, Path(bam), d["qc"] / f"{g}_QCMapping.txt")
+                for g, bam in genomes]
         for f in as_completed(futs): f.result()
 
     # 20) filter (parallel over genomes)
@@ -139,14 +131,13 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     merge_chunk_outputs(d["chunks"], cfg["sample"], out)
 
 # ----------------
-# Stepwise commands (optional, still useful)
+# Stepwise commands (optional)
 # ----------------
 @app.command()
 def extract(config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
             threads: int = typer.Option(4, "--threads", "-t", min=1)):
     from .extract import bam_to_qc
-    d = _cfg_dirs(json.loads(Path(config).read_text())); _ensure_dirs(d)
-    cfg = json.loads(Path(config).read_text())
+    cfg = json.loads(Path(config).read_text()); d = _cfg_dirs(cfg); _ensure_dirs(d)
     genomes = sorted(cfg["genomes"].items())
     with ProcessPoolExecutor(max_workers=_clamp(threads, 1, len(genomes))) as ex:
         futs = [ex.submit(bam_to_qc, Path(b), d["qc"]/f"{g}_QCMapping.txt") for g, b in genomes]
@@ -174,7 +165,7 @@ def chunks(config: Path = typer.Option(..., "--config", "-c", exists=True, reada
     n = make_barcode_chunks(d["filtered"], d["chunks"], cfg["sample"], int(cfg["chunk_size_cells"]))
     typer.echo(f"[chunks] wrote {n} chunk files")
 
-@app.command()
+@app.command())
 def assign(config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
            threads: int = typer.Option(4, "--threads", "-t", min=1)):
     from .assign import assign_winners_for_chunk
