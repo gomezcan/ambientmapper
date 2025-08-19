@@ -21,21 +21,26 @@ def _load_pool_design(pool_tsv: Optional[Path], sample: str, default_genomes: li
     """
     import pandas as pd
     if pool_tsv is None:
+        # whole-sample = one pool; in-pool = all genomes listed for this sample
         return [g.upper() for g in default_genomes], [sample]
+
     pdf = pd.read_csv(pool_tsv, sep="\t", header=0)
     cols = {c.lower(): c for c in pdf.columns}
     genome_col = cols.get("genome")
     pool_col   = cols.get("pool")
-    plate_col  = cols.get("plate")  # optional
     if not (genome_col and pool_col):
-        raise ValueError("Pool design TSV must have at least columns: Genome, Pool (and optional Plate).")
-    df = pdf.copy()
-    if plate_col:
-        df = df[df[plate_col].astype(str).str.upper() == sample.upper()]
+        raise ValueError("Pool design TSV must include columns: Genome, Pool (Plate optional).")
+
+    # 🔒 enforce: this run's sample IS the pool id
+    df = pdf[pdf[pool_col].astype(str).str.upper() == sample.upper()].copy()
+    if df.empty:
+        raise ValueError(
+            f"No rows in pool design where Pool == '{sample}'. "
+            "Remember: sample name must equal Pool ID for this run."
+        )
+
     inpool = sorted(df[genome_col].astype(str).str.upper().unique())
-    pools  = sorted(df[pool_col].astype(str).unique())
-    if not pools:
-        pools = [sample]
+    pools  = [sample]  # single active pool for this run
     return inpool, pools
 
 def summarize_and_mark(
