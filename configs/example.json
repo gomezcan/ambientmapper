@@ -1,0 +1,10 @@
+{
+  "sample": "example",
+  "genomes": {
+    "B73": "B73_scifiATAC.mq20.BC.rmdup.mm.bam",
+    "Mo17": "Mo17_scifiATAC.mq20.BC.rmdup.mm.bam"    
+  },
+  "min_barcode_freq": 10,
+  "chunk_size_cells": 100,
+  "workdir": "./"
+}
