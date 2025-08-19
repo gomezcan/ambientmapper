@@ -189,6 +189,23 @@ def merge(config: Path = typer.Option(..., "--config", "-c", exists=True, readab
     n = merge_chunk_outputs(d["chunks"], cfg["sample"], out)
     typer.echo(f"[merge] wrote {out} rows={n}")
 
+@app.command()
+def summarize(
+    config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True, help="Sample JSON"),
+    pool_design: Path = typer.Option(None, "--pool-design", help="TSV with columns: Genome, Pool [optional: Plate]"),
+    xa_max: int = typer.Option(2, "--xa-max", help="Keep winners with XAcount <= xa_max; -1 disables"),
+):
+    """
+    Summarize winner tables, make QC PDF, and produce Reads_to_discard CSV.
+    """
+    from .summary import summarize_cli
+    out = summarize_cli(config_json=config, pool_design=pool_design, xa_max=xa_max)
+    typer.echo(f"[summarize] PDF: {out['pdf']}")
+    typer.echo(f"[summarize] HQ_BC: {out['hq_barcodes']}")
+    typer.echo(f"[summarize] Reads_to_discard: {out['reads_to_discard']}")
+    typer.echo(f"[summarize] winners={out['n_winners']} hq_bc={out['n_hq_bc']} discard_reads={out['n_discard_reads']}")
+
+
 # ----------------
 # End-to-end (3 modes)
 # ----------------
