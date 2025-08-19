@@ -22,3 +22,6 @@ ambientmapper assign  -c configs/example.json -t 16
 
 ambientmapper merge   -c configs/example.json
 ```
+
+![tests](https://github.com/gomezcan/ambientmapper/actions/workflows/test.yml/badge.svg)
+
