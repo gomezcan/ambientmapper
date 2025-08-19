@@ -126,11 +126,6 @@ ambientmapper assign  -c configs/example.json -t 16
 conda config --add channels conda-forge
 conda config --add channels bioconda
 conda config --set channel_priority strict
-
-```
-
-
-ambientmapper merge   -c configs/example.json
 ```
 
 
