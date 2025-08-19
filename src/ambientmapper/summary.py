@@ -1,13 +1,13 @@
+# src/ambientmapper/summary.py
 from __future__ import annotations
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 def _load_winners(sample_dir: Path, sample: str) -> "pandas.DataFrame":
     import pandas as pd
     final = sample_dir / "final" / f"{sample}_per_read_winner.tsv.gz"
     if final.exists():
-        df = pd.read_csv(final, sep="\t", low_memory=False)
-        return df
+        return pd.read_csv(final, sep="\t", low_memory=False)
     # fallback to chunk files
     chunks = sorted((sample_dir / "cell_map_ref_chunks").glob(f"{sample}_cell_genotype_reads_chunk_*.txt"))
     dfs = [pd.read_csv(p, sep="\t") for p in chunks if p.exists() and p.stat().st_size > 0]
@@ -15,7 +15,8 @@ def _load_winners(sample_dir: Path, sample: str) -> "pandas.DataFrame":
 
 def _load_pool_design(pool_tsv: Optional[Path], sample: str, default_genomes: list[str]) -> Tuple[list[str], list[str]]:
     """
-    Returns (inpool_genomes, pools_for_sample). If pool_tsv is None, inpool=default_genomes and pool=[sample].
+    Returns (inpool_genomes, pools_for_sample).
+    If pool_tsv is None, inpool = default_genomes (uppercased) and pools = [sample].
     Expect TSV with at least columns: Genome, Pool; optional: Plate
     """
     import pandas as pd
@@ -23,51 +24,83 @@ def _load_pool_design(pool_tsv: Optional[Path], sample: str, default_genomes: li
         return [g.upper() for g in default_genomes], [sample]
     pdf = pd.read_csv(pool_tsv, sep="\t", header=0)
     cols = {c.lower(): c for c in pdf.columns}
-    # normalize columns
     genome_col = cols.get("genome")
-    pool_col = cols.get("pool")
-    plate_col = cols.get("plate")  # optional
+    pool_col   = cols.get("pool")
+    plate_col  = cols.get("plate")  # optional
     if not (genome_col and pool_col):
         raise ValueError("Pool design TSV must have at least columns: Genome, Pool (and optional Plate).")
     df = pdf.copy()
-    # If Plate present, filter to Plate==sample. Else assume all rows belong to this sample.
     if plate_col:
         df = df[df[plate_col].astype(str).str.upper() == sample.upper()]
     inpool = sorted(df[genome_col].astype(str).str.upper().unique())
-    pools = sorted(df[pool_col].astype(str).unique())
+    pools  = sorted(df[pool_col].astype(str).unique())
     if not pools:
         pools = [sample]
     return inpool, pools
 
-    
-# src/ambientmapper/summary.py (patches)
 def summarize_and_mark(
     workdir: Path,
     sample: str,
     inpool_genomes: list[str],
     xa_max: int = 2,
     out_dirname: str = "Plots",
-    contam_thresh_for_plots: float = 0.20,   # NEW
-    
-    pools_for_sample: list[str] | None = None,  # pass from loader; None => no-pool mode
-    ) -> dict:
-    
-    # After building `genotype_assignment` and `agg` (per-BC AS_mean table), build read-level mismatch
-    win_g = winners[["BC","Read","Genome"]]
-    assigned = genotype_assignment[["BC","AssignedGenome","Total_n"]]
-
-    out_dir = (workdir / sample / out_dirname) # NEW
-    out_dir.mkdir(parents=True, exist_ok=True) # NEW
-    pdf_path = out_dir / f"{sample}_contamination_correction_summary.pdf" # NEW
-
-    # mark "Contaminated" (only meaningful with pools, but harmless otherwise)
+    contam_thresh_for_plots: float = 0.20,
+    pools_for_sample: list[str] | None = None,  # None => no-pool mode
+) -> Dict[str, object]:
+    """
+    Build summaries, plots, and read-discard list. Returns paths & counts.
+    """
+    import pandas as pd
     import numpy as np
+    import matplotlib.pyplot as plt
+    import matplotlib.backends.backend_pdf as mpdf
+    from scipy import stats
+
+    sdir = workdir / sample
+    winners = _load_winners(sdir, sample)
+    if winners.empty:
+        raise FileNotFoundError("No winner tables found. Run `ambientmapper merge` (or `run`) first.")
+
+    # Normalize columns
+    colmap = {c.lower(): c for c in winners.columns}
+    need = ["read", "bc", "genome", "as"]
+    missing = [k for k in need if k not in colmap]
+    if missing:
+        raise ValueError(f"Winners table missing required columns: {missing}. Found: {list(winners.columns)}")
+
+    # Optional XA filter if available
+    if xa_max >= 0 and "xacount" in colmap:
+        winners = winners[winners[colmap["xacount"]].fillna(0) <= xa_max].copy()
+
+    winners["Pool"]   = sample  # single-pool default
+    winners["Genome"] = winners[colmap["genome"]].astype(str).str.upper()
+    winners["BC"]     = winners[colmap["bc"]].astype(str)
+    winners["AS"]     = pd.to_numeric(winners[colmap["as"]], errors="coerce")
+    winners["Read"]   = winners[colmap["read"]].astype(str)
+
+    # -------- per-BC genotype scoring (AS_mean) --------
+    agg = (winners
+           .groupby(["BC","Genome","Pool"], as_index=False)
+           .agg(AS_Total=("AS","sum"), n_Read=("Read","count")))
+    agg["AS_mean"] = agg["AS_Total"] / agg["n_Read"]
+    total_n = agg.groupby("BC", as_index=False)["n_Read"].sum().rename(columns={"n_Read":"Total_n"})
+    agg = agg.merge(total_n, on="BC", how="left")
+
+    # Best assignment per BC (break ties by n_Read desc, then Genome lex)
+    genotype_assignment = (agg.sort_values(["BC","AS_mean","n_Read","Genome"],
+                                           ascending=[True, False, False, True])
+                             .groupby("BC", as_index=False).head(1)
+                             .rename(columns={"Genome":"AssignedGenome"}))
+
+    # Contaminated flag relative to in-pool genomes (if pools are meaningful)
     genotype_assignment["Contaminated"] = np.where(
-        genotype_assignment["AssignedGenome"].astype(str).str.upper()
-        .isin([g.upper() for g in inpool_genomes]),
+        genotype_assignment["AssignedGenome"].isin([g.upper() for g in inpool_genomes]),
         1, 0
     )
 
+    # -------- read-level mismatch & BC contamination rate --------
+    win_g = winners[["BC","Read","Genome"]]
+    assigned = genotype_assignment[["BC","AssignedGenome","Total_n"]]
     merged = win_g.merge(assigned, on="BC", how="left")
     merged["mismatch"] = (merged["Genome"] != merged["AssignedGenome"]).astype(int)
     contam = (merged.groupby("BC", as_index=False)
@@ -75,71 +108,58 @@ def summarize_and_mark(
                           Mismatch_reads=("mismatch","sum")))
     contam["Contamination_Rate"] = contam["Mismatch_reads"] / contam["Total_reads"]
 
-    # Attach BC-level contamination to the AS_mean table
+    # Attach contamination to per-BC AS table
     agg_bc = agg.merge(contam[["BC","Contamination_Rate","Total_reads"]], on="BC", how="left")
-    # Attach the assignment classification (with/without pool design)
+
+    # Pools vs no-pool grouping for plots
     has_pools = bool(pools_for_sample and len(pools_for_sample) > 0)
     if has_pools:
-        # earlier logic: Contaminated = 1 if AssignedGenome is within in-pool genomes
-        # (you already set Contaminated above using inpool_genomes)
         agg_bc = agg_bc.merge(genotype_assignment[["BC","Contaminated","Pool"]], on="BC", how="left")
-        groups_col = "Contaminated"
-        labels = {1: "InPool", 0: "Not_InPool"}
-        group_mask_in = agg_bc[groups_col].fillna(0).astype(int) == 1
+        group_mask_in  = agg_bc["Contaminated"].fillna(0).astype(int) == 1
         group_mask_out = ~group_mask_in
-        x_label_group_in = "InPool"
-        x_label_group_out = "Not_InPool"
+        label_in, label_out = "InPool", "Not_InPool"
     else:
-        # NEW: no-pool mode -> split BCs by contamination rate
-        agg_bc["Group"] = (agg_bc["Contamination_Rate"].fillna(0.0) <= float(contam_thresh_for_plots)).map(
-            {True: "LowContam", False: "HighContam"}
-        )
-        groups_col = "Group"
-        group_mask_in = agg_bc["Group"] == "LowContam"
+        agg_bc["Group"] = (agg_bc["Contamination_Rate"].fillna(0.0) <= float(contam_thresh_for_plots))\
+                            .map({True: "LowContam", False: "HighContam"})
+        group_mask_in  = agg_bc["Group"] == "LowContam"
         group_mask_out = agg_bc["Group"] == "HighContam"
-        x_label_group_in = "LowContam"
-        x_label_group_out = "HighContam"
+        label_in, label_out = "LowContam", "HighContam"
 
-    # ---------- ECDFs ----------
-    import numpy as np
-    from scipy import stats
-    def _safe_ks(a, b):    
-        a = np.asarray(a); b = np.asarray(b)
-        if a.size == 0 or b.size == 0:
-            # return NaNs instead of raising
-            class R: pass
-            r = R(); r.statistic = float("nan"); r.pvalue = float("nan")
-            return r
-    return stats.ks_2samp(a, b, alternative="two-sided")
-    
+    # ---------- ECDF helpers ----------
     def _ecdf(x):
         x = np.sort(np.asarray(x))
         y = np.arange(1, len(x)+1) / len(x) if len(x) else np.array([])
         return x, y
 
+    def _safe_ks(a, b):
+        a = np.asarray(a); b = np.asarray(b)
+        if a.size == 0 or b.size == 0:
+            class R: pass
+            r = R(); r.statistic = float("nan"); r.pvalue = float("nan")
+            return r
+        return stats.ks_2samp(a, b, alternative="two-sided")
+
     in_as  = agg_bc.loc[group_mask_in,  "AS_mean"].dropna().values
     out_as = agg_bc.loc[group_mask_out, "AS_mean"].dropna().values
-    ks_as = stats.ks_2samp(in_as, out_as, alternative="two-sided")
-
-    in_n  = agg_bc.loc[group_mask_in,  "Total_n"].dropna().values
-    out_n = agg_bc.loc[group_mask_out, "Total_n"].dropna().values
-    ks_n = stats.ks_2samp(in_n, out_n, alternative="two-sided")
+    in_n   = agg_bc.loc[group_mask_in,  "Total_n"].dropna().values
+    out_n  = agg_bc.loc[group_mask_out, "Total_n"].dropna().values
 
     ks_as = _safe_ks(in_as, out_as)
     ks_n  = _safe_ks(in_n,  out_n)
 
-    x1,y1 = _ecdf(in_as); x2,y2 = _ecdf(out_as)
-    xn1,yn1 = _ecdf(in_n); xn2,yn2 = _ecdf(out_n)
+    x1,y1   = _ecdf(in_as);   x2,y2   = _ecdf(out_as)
+    xn1,yn1 = _ecdf(in_n);    xn2,yn2 = _ecdf(out_n)
 
-    # ---------- PDF pages ----------
-    import matplotlib.pyplot as plt
-    import matplotlib.backends.backend_pdf as mpdf
+    # ---------- PDF ----------
+    out_dir = (workdir / sample / out_dirname)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = out_dir / f"{sample}_contamination_correction_summary.pdf"
     pdf = mpdf.PdfPages(str(pdf_path))
 
     # Plot 1: ECDF AS_mean
     fig1 = plt.figure(figsize=(4,3)); ax = fig1.gca()
-    ax.plot(x1, y1, drawstyle="steps-post", label=x_label_group_in)
-    ax.plot(x2, y2, drawstyle="steps-post", label=x_label_group_out)
+    ax.plot(x1, y1, drawstyle="steps-post", label=label_in)
+    ax.plot(x2, y2, drawstyle="steps-post", label=label_out)
     ax.set_title("Cum. Dist.\nAS mean"); ax.set_xlabel("AS mean"); ax.set_ylabel("Cumulative probability")
     ax.legend(loc="lower right", fontsize=8)
     ax.text(0.98, 0.1, f"KS D={ks_as.statistic:.3f}\np={ks_as.pvalue:.2e}",
@@ -148,8 +168,8 @@ def summarize_and_mark(
 
     # Plot 2: ECDF Total reads per BC
     fig2 = plt.figure(figsize=(4,3)); ax = fig2.gca()
-    ax.plot(xn1, yn1, drawstyle="steps-post", label=x_label_group_in)
-    ax.plot(xn2, yn2, drawstyle="steps-post", label=x_label_group_out)
+    ax.plot(xn1, yn1, drawstyle="steps-post", label=label_in)
+    ax.plot(xn2, yn2, drawstyle="steps-post", label=label_out)
     ax.set_title("Cum. Dist.\nTotal reads per BC"); ax.set_xlabel("Reads"); ax.set_ylabel("Cumulative probability")
     ax.legend(loc="lower right", fontsize=8)
     ax.text(0.98, 0.1, f"KS D={ks_n.statistic:.3f}\np={ks_n.pvalue:.2e}",
@@ -167,14 +187,32 @@ def summarize_and_mark(
         ax.text(0.5,0.5,"No BCs", ha="center")
     pdf.savefig(fig3); plt.close(fig3)
 
-    # Plot 4: if pools exist -> heatmap (AssignedGenome x Pool); else -> bar chart (AssignedGenome)
+    # Plot 4: heatmap (if multiple pools) else bar chart per AssignedGenome
     fig4 = plt.figure(figsize=(5,4)); ax = fig4.gca()
-    if has_pools:
-        # existing heatmap code here (unchanged) ...
-        pass
+    if has_pools and len(set(pools_for_sample)) > 1:
+        # Build simple heatmap using counts per (AssignedGenome, Pool)
+        heat = (genotype_assignment.groupby(["AssignedGenome","Pool"])
+                                   .size().reset_index(name="n"))
+        genomes = sorted(heat["AssignedGenome"].unique())
+        pools   = sorted(heat["Pool"].unique())
+        mat = np.zeros((len(genomes), len(pools)), dtype=int)
+        g2i = {g:i for i,g in enumerate(genomes)}
+        p2j = {p:j for j,p in enumerate(pools)}
+        for _, row in heat.iterrows():
+            mat[g2i[row["AssignedGenome"]], p2j[row["Pool"]]] = int(row["n"])
+        im = ax.imshow(mat, aspect="auto")
+        ax.set_yticks(range(len(genomes))); ax.set_yticklabels(genomes, fontsize=7)
+        ax.set_xticks(range(len(pools)));  ax.set_xticklabels(pools, fontsize=7, rotation=90)
+        ax.set_title("Barcode (BC) per AssignedGenome × Pool")
+        for i,g in enumerate(genomes):
+            for j,p in enumerate(pools):
+                val = mat[i,j]
+                ax.text(j, i, str(val), ha="center", va="center", fontsize=6,
+                        color=("white" if val else "black"))
+        fig4.colorbar(im, ax=ax, label="BCs")
     else:
-        counts = (genotype_assignment.groupby("AssignedGenome").size()
-                  .reset_index(name="n").sort_values("n", ascending=False))
+        counts = (genotype_assignment.groupby("AssignedGenome")
+                  .size().reset_index(name="n").sort_values("n", ascending=False))
         ax.bar(counts["AssignedGenome"], counts["n"])
         ax.set_title("Barcodes per AssignedGenome")
         ax.set_ylabel("BC count")
@@ -183,7 +221,33 @@ def summarize_and_mark(
 
     pdf.close()
 
-def summarize_cli(config_json: Path, pool_design: Optional[Path] = None, xa_max: int = 2) -> dict:
+    # -------- outputs --------
+    # HQ_BC = BCs assigned to an in-pool genome
+    hq = genotype_assignment[genotype_assignment["Contaminated"]==1].copy()
+    hq_path = sdir / f"{sample}_BCs_PASS_by_mapping.csv"
+    hq[["BC","AssignedGenome","Total_n","Pool"]].to_csv(hq_path, index=False)
+
+    # Reads to discard: winner genome != assigned BC genome
+    to_filter = winners[["Read","BC","Genome"]].merge(
+        genotype_assignment[["BC","AssignedGenome","Pool"]],
+        on="BC", how="left"
+    )
+    bad = to_filter[to_filter["Genome"] != to_filter["AssignedGenome"]].copy()
+    bad.rename(columns={"Genome":"Genome.Mapped","AssignedGenome":"Genome.Assigned"}, inplace=True)
+    bad = bad.sort_values(["BC","Read"])
+    discard_path = sdir / f"Reads_to_discard_{sample}.csv"
+    bad.to_csv(discard_path, index=False)
+
+    return {
+        "pdf": str(pdf_path),
+        "hq_barcodes": str(hq_path),
+        "reads_to_discard": str(discard_path),
+        "n_winners": int(len(winners)),
+        "n_hq_bc": int(len(hq)),
+        "n_discard_reads": int(len(bad)),
+    }
+
+def summarize_cli(config_json: Path, pool_design: Optional[Path] = None, xa_max: int = 2) -> Dict[str, object]:
     import json
     cfg = json.loads(Path(config_json).read_text())
     workdir = Path(cfg["workdir"]).expanduser().resolve()
@@ -193,6 +257,5 @@ def summarize_cli(config_json: Path, pool_design: Optional[Path] = None, xa_max:
         workdir, sample,
         inpool_genomes=inpool,
         xa_max=xa_max,
-        pools_for_sample=pools if len(pools) > 0 else None,  # tell the plotter if we have pooling
+        pools_for_sample=pools if len(pools) > 0 else None,
     )
-
