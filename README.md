@@ -86,6 +86,26 @@ ambientmapper run \
   --threads 16
 ```
 
+### Quick test
+```
+# Quick local checks (copy/paste)
+
+```bash
+# help should show the new options
+ambientmapper run --help
+
+# dry sanity: create two empty dummy BAMs and run inline (just to test arg parsing)
+# (the pipeline will start and likely fail earlier because they’re empty,
+#  but it proves your flag parsing & file existence checks.)
+touch /tmp/a.bam /tmp/b.bam
+ambientmapper run \
+  --sample TEST \
+  --genome G1,G2 \
+  --bam /tmp/a.bam,/tmp/b.bam \
+  --workdir /tmp/amb_out \
+  --threads 2
+```
+
 ### or stepwise
 ```bash
 ambientmapper extract -c configs/example.json -t 8
