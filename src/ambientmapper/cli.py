@@ -9,6 +9,145 @@ app = typer.Typer(help="ambientmapper: local-first ambient cleaning pipeline")
 # ----------------
 # Config helpers
 # ----------------
+# --- add near the top of cli.py ---
+from __future__ import annotations
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import typer, json, csv, re
+from typing import Dict, List
+
+# Import your step functions (adapt paths to match your repo)
+from .extract import bam_to_qc
+from .filtering import filter_qc_file
+from .chunks import make_barcode_chunks
+from .assign import assign_winners_for_chunk
+from .merge import merge_chunk_outputs
+
+app = typer.Typer(help="ambientmapper: local-first ambient cleaning pipeline")
+
+def _clamp(n: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, n))
+
+def _parse_csv_list(s: str | None) -> List[str]:
+    if not s:
+        return []
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+def _infer_genome_name(p: Path) -> str:
+    # e.g., B73_scifiATAC...bam -> "B73"
+    return re.split(r"[_.]", p.stem, maxsplit=1)[0]
+
+def _cfg_dirs(cfg: Dict[str, object]) -> Dict[str, Path]:
+    root = Path(cfg["workdir"]) / cfg["sample"]
+    return {
+        "root": root,
+        "qc": root / "qc",
+        "filtered": root / "filtered_QCFiles",
+        "chunks": root / "cell_map_ref_chunks",
+        "final": root / "final",
+    }
+
+def _ensure_dirs(d: Dict[str, Path]) -> None:
+    for p in d.values():
+        if isinstance(p, Path):
+            p.mkdir(parents=True, exist_ok=True)
+
+def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
+    """extract -> filter -> chunks -> assign -> merge (local; scheduler-agnostic)."""
+    d = _cfg_dirs(cfg); _ensure_dirs(d)
+    genomes = sorted(cfg["genomes"].items())
+
+    # 10) extract (parallel over genomes)
+    with ProcessPoolExecutor(max_workers=_clamp(threads, 1, len(genomes))) as ex:
+        futs = [
+            ex.submit(bam_to_qc, Path(bam), d["qc"] / f"{g}_QCMapping.txt")
+            for g, bam in genomes
+        ]
+        for f in as_completed(futs): f.result()
+
+    # 20) filter (parallel over genomes)
+    minf = int(cfg["min_barcode_freq"])
+    with ProcessPoolExecutor(max_workers=_clamp(threads, 1, len(genomes))) as ex:
+        futs = []
+        for g, _ in genomes:
+            ip = d["qc"] / f"{g}_QCMapping.txt"
+            op = d["filtered"] / f"filtered_{g}_QCMapping.txt"
+            futs.append(ex.submit(filter_qc_file, ip, op, minf))
+        for f in as_completed(futs): f.result()
+
+    # 25) chunks
+    make_barcode_chunks(d["filtered"], d["chunks"], cfg["sample"], int(cfg["chunk_size_cells"]))
+
+    # 30) assign (parallel over chunks)
+    chunk_files = sorted(d["chunks"].glob(f"{cfg['sample']}_cell_map_ref_chunk_*.txt"))
+    with ProcessPoolExecutor(max_workers=_clamp(threads, 1, len(chunk_files))) as ex:
+        futs = []
+        for ch in chunk_files:
+            out = d["chunks"] / ch.name.replace("_cell_map_ref_chunk_", "_cell_genotype_reads_chunk_")
+            futs.append(ex.submit(assign_winners_for_chunk, d["filtered"], ch, out))
+        for f in as_completed(futs): f.result()
+
+    # 40) merge
+    out = d["final"] / f"{cfg['sample']}_per_read_winner.tsv.gz"
+    merge_chunk_outputs(d["chunks"], cfg["sample"], out)
+
+def _cfg_from_inline(sample: str, genomes_csv: str, bams_csv: str,
+                     workdir: str, min_barcode_freq: int, chunk_size_cells: int) -> Dict[str, object]:
+    genomes = _parse_csv_list(genomes_csv)
+    bam_paths = [Path(p).expanduser().resolve() for p in _parse_csv_list(bams_csv)]
+    if len(genomes) != len(bam_paths):
+        raise typer.BadParameter(f"#genome names ({len(genomes)}) must equal #bams ({len(bam_paths)}).")
+    for p in bam_paths:
+        if not p.exists():
+            raise typer.BadParameter(f"BAM not found: {p}")
+    if len(set(genomes)) != len(genomes):
+        raise typer.BadParameter("Genome names must be unique.")
+    return {
+        "sample": sample,
+        "genomes": {g: str(p) for g, p in zip(genomes, bam_paths)},
+        "min_barcode_freq": int(min_barcode_freq),
+        "chunk_size_cells": int(chunk_size_cells),
+        "workdir": str(Path(workdir).expanduser().resolve()),
+    }
+
+def _cfgs_from_tsv(tsv: Path, min_barcode_freq: int, chunk_size_cells: int) -> List[Dict[str, object]]:
+    """
+    TSV columns: sample, genome, bam, workdir
+    Rows with same 'sample' are grouped into one config.
+    """
+    groups: Dict[str, Dict[str, str]] = {}
+    workdirs: Dict[str, str] = {}
+    with open(tsv, "r", newline="") as f:
+        r = csv.DictReader(f, delimiter="\t")
+        need = {"sample","genome","bam","workdir"}
+        if need - set(r.fieldnames or []):
+            raise typer.BadParameter(f"TSV must include columns: {sorted(need)}")
+        for row in r:
+            s = row["sample"].strip()
+            g = row["genome"].strip()
+            b = str(Path(row["bam"]).expanduser().resolve())
+            w = str(Path(row["workdir"]).expanduser().resolve())
+            if s not in groups:
+                groups[s] = {}
+                workdirs[s] = w
+            if g in groups[s]:
+                raise typer.BadParameter(f"Duplicate genome '{g}' for sample '{s}' in TSV.")
+            if not Path(b).exists():
+                raise typer.BadParameter(f"BAM not found: {b}")
+            groups[s][g] = b
+    cfgs: List[Dict[str, object]] = []
+    for s, gmap in groups.items():
+        if not gmap:
+            continue
+        cfgs.append({
+            "sample": s,
+            "genomes": gmap,
+            "min_barcode_freq": int(min_barcode_freq),
+            "chunk_size_cells": int(chunk_size_cells),
+            "workdir": workdirs[s],
+        })
+    return cfgs
+
 def load_cfg(path: Path):
     d = json.loads(Path(path).read_text())
     req = ["sample","genomes","min_barcode_freq","chunk_size_cells","workdir"]
@@ -178,11 +317,61 @@ def merge(config: Path = typer.Option(..., "--config", "-c")):
 # End-to-end
 # ----------------
 @app.command()
-def run(config: Path = typer.Option(..., "--config", "-c"),
-        threads: int = typer.Option(8, "--threads", "-t", min=1)):
-    extract.callback(config=config, threads=threads)
-    filter.callback(config=config, threads=threads)
-    chunks.callback(config=config)
-    assign.callback(config=config, threads=threads)
-    merge.callback(config=config)
-    typer.echo("[run] complete")
+def run(
+    # mode A: single JSON (still supported)
+    config: Path = typer.Option(None, "--config", "-c", exists=True, readable=True, help="Single JSON config"),
+    # mode B: inline one-sample
+    sample: str = typer.Option(None, "--sample", help="Sample name"),
+    genome: str = typer.Option(None, "--genome", help="Comma-separated genome names (e.g. B73,Mo17)"),
+    bam: str = typer.Option(None, "--bam", help="Comma-separated BAM paths, same order as --genome"),
+    workdir: Path = typer.Option(None, "--workdir", help="Output root directory"),
+    # mode C: many samples from TSV
+    configs: Path = typer.Option(None, "--configs", help="TSV with: sample, genome, bam, workdir"),
+    # common knobs
+    min_barcode_freq: int = typer.Option(10, "--min-barcode-freq"),
+    chunk_size_cells: int = typer.Option(5000, "--chunk-size-cells"),
+    threads: int = typer.Option(8, "--threads", "-t", min=1),
+):
+    """
+    Run the pipeline.
+
+    Modes:
+      (A) --config path.json
+      (B) --sample + --genome "A,B,..." + --bam "/p/a.bam,/p/b.bam" + --workdir /out
+      (C) --configs samples.tsv   (columns: sample, genome, bam, workdir)
+    """
+    modes_used = sum([
+        1 if config else 0,
+        1 if (sample and (genome or bam or workdir)) else 0,
+        1 if configs else 0,
+    ])
+    if modes_used != 1:
+        raise typer.BadParameter("Choose exactly one mode: --config OR (--sample/--genome/--bam/--workdir) OR --configs")
+
+    # Mode A: JSON
+    if config:
+        cfg = json.loads(Path(config).read_text())
+        _run_pipeline(cfg, threads)
+        typer.echo(f"[run] {cfg['sample']} complete")
+        raise typer.Exit()
+
+    # Mode B: inline single
+    if sample and genome and bam and workdir:
+        cfg = _cfg_from_inline(sample, genome, bam, str(workdir),
+                               min_barcode_freq, chunk_size_cells)
+        _run_pipeline(cfg, threads)
+        typer.echo(f"[run] {cfg['sample']} complete")
+        raise typer.Exit()
+
+    # Mode C: TSV batch
+    if configs:
+        batch = _cfgs_from_tsv(configs, min_barcode_freq, chunk_size_cells)
+        if not batch:
+            typer.echo("[run] no configs found in TSV"); raise typer.Exit(0)
+        for cfg in batch:
+            typer.echo(f"[run] starting {cfg['sample']}")
+            _run_pipeline(cfg, threads)
+            typer.echo(f"[run] {cfg['sample']} complete")
+        raise typer.Exit()
+
+            
