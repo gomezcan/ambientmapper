@@ -51,18 +51,39 @@ pip install "git+https://github.com/gomezcan/ambientmapper.git"
 ```
 
 ## Use
-### one-shot, local, threads=N
+### one-sample, at least two genome (no JSON file needed), threads=N
 ```bash
-ambientmapper run --config configs/example.json --threads 16
+ambientmapper run \
+  --sample SAMPLE_NAME \
+  --genome GENOME1,GENOME2 \
+  --bam /path_to_bam1.bam,path_to_bam2.bam \
+  --workdir ./ambient_out \
+  --min-barcode-freq 10 \
+  --chunk-size-cells 5000 \
+  --threads 16
 ```
 this produces:
 
 ```
-<workdir>/<sample>/
+<ambient_out>/<SAMPLE_NAME>/
   qc/                         # per-genome QC TSVs
   filtered_QCFiles/           # per-genome filtered/collapsed TSVs
   cell_map_ref_chunks/        # per-chunk winner TSVs
   final/<sample>_per_read_winner.tsv.gz   # merged result
+```
+### one-sample, at least two genome (JSON mode), threads=N
+```
+ambientmapper run --config configs/example.json --threads 16
+
+```
+### one-sample, many genomes from a TSV (tab-separated), threads=N
+#### # TSV columns: sample  genome  bam  workdir
+```
+ambientmapper run \
+  --configs configs/samples.tsv \
+  --min-barcode-freq 10 \
+  --chunk-size-cells 5000 \
+  --threads 16
 ```
 
 ### or stepwise
