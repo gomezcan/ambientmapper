@@ -1,8 +1,13 @@
-from __future__ import annotations
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import typer, glob, pandas as pd, numpy as np
-import pysam, csv, json
+import typer, json, csv, re
+from typing import Dict, List
+
+from .extract import bam_to_qc            # contains 'import pysam' INSIDE that file
+from .filtering import filter_qc_file     # contains 'import pandas' INSIDE that file
+from .chunks import make_barcode_chunks
+from .assign import assign_winners_for_chunk
+from .merge import merge_chunk_outputs
 
 app = typer.Typer(help="ambientmapper: local-first ambient cleaning pipeline")
 
