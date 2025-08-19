@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.parquet
+*.tsv
+*.tsv.gz
+*.log
+_logs/
+dist/
+build/
+*.egg-info/
+.venv/
+.env
