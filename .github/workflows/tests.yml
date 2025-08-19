@@ -23,13 +23,6 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
 
-      # If/when you add steps that call samtools, flip "if" to true and install it.
-      - name: (Optional) Install system deps
-        if: ${{ false }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y samtools
-
       - name: Install package + test deps
         run: |
           python -m pip install --upgrade pip
