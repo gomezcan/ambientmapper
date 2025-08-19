@@ -117,6 +117,7 @@ ambientmapper filter  -c configs/example.json -t 8
 ambientmapper chunks  -c configs/example.json
 
 ambientmapper assign  -c configs/example.json -t 16
+```
 
 ## Troubleshooting
 - Reduce --threads or chunk_size_cells if you hit RAM limits.
@@ -127,6 +128,3 @@ conda config --add channels conda-forge
 conda config --add channels bioconda
 conda config --set channel_priority strict
 ```
-
-
-
