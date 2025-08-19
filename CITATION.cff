@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+title: "ambientmapper"
+message: "If you use ambientmapper, please cite this software."
+type: software
+authors:
+  - family-names: Gomez
+    given-names: Fabio
+repository-code: "https://github.com/gomezcan/ambientmapper"
+license: MIT
+version: 0.1.0
+date-released: 2025-08-18
+preferred-citation:
+  type: software
+  title: "ambientmapper (v0.1.0)"
+  authors:
+    - family-names: Gomez
+      given-names: Fabio
+  repository-code: "https://github.com/gomezcan/ambientmapper"
