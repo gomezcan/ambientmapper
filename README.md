@@ -71,6 +71,8 @@ this produces:
   cell_map_ref_chunks/        # per-chunk winner TSVs
   final/<sample>_per_read_winner.tsv.gz   # merged result
 ```
+***Final columns:*** Read, BC, Genome, AS, MAPQ, NM, delta_AS, is_tie.
+
 ### one-sample, at least two genome (JSON mode), threads=N
 ```
 ambientmapper run --config configs/example.json --threads 16
@@ -115,6 +117,18 @@ ambientmapper filter  -c configs/example.json -t 8
 ambientmapper chunks  -c configs/example.json
 
 ambientmapper assign  -c configs/example.json -t 16
+
+## Troubleshooting
+- Reduce --threads or chunk_size_cells if you hit RAM limits.
+- Prefer fast local/scratch disk for workdir.
+- If conda channels cause issues:
+```
+conda config --add channels conda-forge
+conda config --add channels bioconda
+conda config --set channel_priority strict
+
+```
+
 
 ambientmapper merge   -c configs/example.json
 ```
