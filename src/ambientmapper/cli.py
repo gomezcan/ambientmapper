@@ -316,6 +316,7 @@ def merge(config: Path = typer.Option(..., "--config", "-c")):
 # ----------------
 # End-to-end
 # ----------------
+
 @app.command()
 def run(
     # mode A: single JSON (still supported)
