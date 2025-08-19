@@ -165,7 +165,7 @@ def chunks(config: Path = typer.Option(..., "--config", "-c", exists=True, reada
     n = make_barcode_chunks(d["filtered"], d["chunks"], cfg["sample"], int(cfg["chunk_size_cells"]))
     typer.echo(f"[chunks] wrote {n} chunk files")
 
-@app.command())
+@app.command()
 def assign(config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
            threads: int = typer.Option(4, "--threads", "-t", min=1)):
     from .assign import assign_winners_for_chunk
