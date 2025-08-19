@@ -61,7 +61,7 @@ all outputs live under:
 ## Running the pipeline
 You can run **end-to-end** (*extract → filter → chunks → assign → merge*) and optionally **summarize**.
 
-### Mode A — Inline one sample
+### One Step. Mode A — Inline one sample
 ```bash
 ambientmapper run \
   --sample SC1_P1 \
@@ -75,7 +75,7 @@ ambientmapper run \
   --xa-max 2
 ```
 
-### Mode B — JSON config
+### One Step. Mode B — JSON config
 configs/example.json
 ```json
 {
@@ -98,7 +98,7 @@ ambientmapper run --config configs/SC1_P1.json \
 
 ```
 
-### Mode C — TSV for many samples
+### One Step. Mode C — TSV for many samples
 configs/samples.tsv (tab-separated; one row per **(sample, genome)**)
 
 ```ts
@@ -119,23 +119,54 @@ ambientmapper run \
   --xa-max 2
 ```
 
-## Pool design (optional)
-If your library is split into **pools** (e.g., plates/wells with subsets of genotypes), provide a TSV so summary plots compare **InPool vs Not_InPool.**
+## Two steps (recommended): per-pool then inter-pool
 
-configs/pools.tsv
-```tsv
-Genome  Pool    Plate
-B73     P01_A    P01
-Mo17    P02_B    P01
-```
-Use:
+If your library is split into **pools** (e.g. plates/wells with subsets of genotypes), treat **each pool as its own sample.**
+Run each pool end-to-end; the summary treats the genomes listed for that sample as the **in-pool** set.
+Then, optionally, run an **inter-pool** comparison across multiple pools.
 
+### 1) Per-pool run (one pool = one sample)
 ```bash
-ambientmapper run --config configs/SC1_P1.json \
+ambientmapper run \
+  --sample P01_A \
+  --genome B73,Mo17 \
+  --bam /bam/B73.bam,/bam/Mo17.bam \
+  --workdir ./ambient_out \
+  --min-barcode-freq 10 \
+  --chunk-size-cells 5000 \
+  --threads 16 \
   --with-summary \
-  --pool-design configs/pools.tsv
+  --xa-max 2
 ```
-If **no pool design** is given, the sample is treated as **one big pool** with all listed genomes. The summary splits BCs into **LowContam vs HighContam** based on contamination rate (default threshold 0.20).
+Repeat for other pools (e.g. P01_B, P02_A, …).
+
+### 2) Inter-pool comparison (after multiple pools are run)
+Use a TSV listing all pool runs. **Headers must be lowercase** and include these columns:
+
+configs/samples.tsv
+
+```tsv
+sample  genome  bam                 workdir
+P01_A   B73     /bam/B73.bam        ./ambient_out
+P01_A   Mo17    /bam/Mo17.bam       ./ambient_out
+P01_B   B73     /bam/B73.bam        ./ambient_out
+P01_B   W22     /bam/W22.bam        ./ambient_out
+```
+Now aggregate:
+```bash
+ambientmapper interpool \
+  --configs configs/samples.tsv \
+  --outdir ./ambient_out/interpool
+```
+
+This writes:
+- interpool_bc_counts.tsv — #BCs per AssignedGenome × sample\
+- interpool_read_composition.tsv — winner-read fractions per Genome × sample\
+- interpool_summary.pdf — two heatmaps (BC counts and read composition)\
+
+### No pool design?
+If you don’t split by pools, just run per-sample. The summary treats the sample as **one big pool** and splits BCs into **LowContam vs HighContam** using contamination rate (default threshold *0.20*).
+
 
 ## dry sanity: 
 create two empty dummy BAMs and run inline (just to test arg parsing).\ 
@@ -166,24 +197,46 @@ ambientmapper summarize -c configs/example.json --xa-max 2
   
 ```
 
+### What the steps do (brief)
 
-## What the steps do (brief)
-- extract: from each genome BAM → per-read QC table (Read, BC, MAPQ, AS, NM, XAcount).
-- filter: keep BCs with frequency ≥ --min-barcode-freq; collapse duplicates per (Read, BC) by MAPQ=max, AS=max, NM=min, XAcount=max).
--chunks: build BC chunk files to limit memory.
-- assign: for reads in each chunk, pick the genome with best score (AS, MAPQ, NM) → per-read winners.
-- merge: combine per-chunk winners → <sample>_per_read_winner.tsv.gz.
-- summarize (optional):
-  - per-BC assigned genome (by AS_mean),
-  - contamination rate per BC = fraction of winner reads whose genome ≠ assigned genome,
-  - PDF with ECDFs, hexbin, and counts (heatmap if there are multiple pools; bar chart otherwise),
-  - *_BCs_PASS_by_mapping.csv (BCs assigned to in-pool genome)
-  - Reads_to_discard_*.csv (reads whose winner genome ≠ that BC’s assigned genome).
+- **extract**
+  From each genome BAM → per-read QC table with columns: `Read, BC, MAPQ, AS, NM, XAcount.`
+
+- **filter**
+  Keep barcodes (BCs) with frequency `≥ --min-barcode-freq.`
+  Collapse duplicate (`Read`, `BC`) rows per genome using:
+  - `MAPQ = max, AS = max, NM = min, XAcount = max.`
+
+- **chunks**
+  Build BC chunk files to cap memory (size controlled by `--chunk-size-cells`).
+
+- **assign**
+  For reads in each chunk, pick the genome “winner” per read by sorting:
+  - AS (desc), then MAPQ (desc), then NM (asc).
+    Writes per-read winners.
+
+- **merge**
+  Combine per-chunk winners `→ final/<sample>_per_read_winner.tsv.gz.`
+
+- **summarize** (*optional; per-pool*)
+  Treat the current sample as **one pool**.
+  - Compute assigned genome per BC (by AS_mean across that BC’s reads).
+  - Contamination rate per BC = fraction of winner reads whose Genome ≠ AssignedGenome.
+  - Produce a PDF with ECDFs (AS_mean, reads/BC), a contamination-vs-reads hexbin,\and counts (heatmap if multiple pools are provided; bar chart otherwise).
+  - Write:
+    - `<sample>_BCs_PASS_by_mapping.csv` (BCs whose assigned genome is considered in-pool for this run)
+    - `Reads_to_discard_<sample>.csv` (winner reads where Genome ≠ AssignedGenome for that BC)
+
+- **interpool** (*optional; cross-pool comparison after multiple per-pool runs*)
+  Aggregate several samples (pools) to compare:
+  - `interpool_bc_counts.tsv` — #BCs per **AssignedGenome × sample**
+  - `interpool_read_composition.tsv` — winner-read **fractions per Genome × sample**
+  - `interpool_summary.pdf` — two heatmaps (BC counts, read composition)
 
 ## Notes
-  - BAMs should be coordinate-sorted and indexed; barcodes in CB or BC; alignment tags AS, NM expected; XA optional.\
-  -  --xa-max 2 filters winners by XAcount ≤ 2. If your BAMs lack XA, set --xa-max -1.\
-  -  --threads parallelizes per-genome (extract/filter) and per-chunk (assign). Adjust --chunk-size-cells to manage memory.\
+  - BAMs should be coordinate-sorted and indexed; barcodes in CB or BC; alignment tags AS, NM expected; XA optional.
+  - --xa-max 2 filters winners by XAcount ≤ 2. If your BAMs lack XA, set --xa-max -1.
+  - --threads parallelizes per-genome (extract/filter) and per-chunk (assign). Adjust --chunk-size-cells to manage memory.
 
 ## Troubleshooting
 - Reduce --threads or chunk_size_cells if you hit RAM limits.
