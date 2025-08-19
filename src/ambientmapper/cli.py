@@ -192,7 +192,8 @@ def merge(config: Path = typer.Option(..., "--config", "-c", exists=True, readab
 @app.command()
 def summarize(
     config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True, help="Sample JSON"),
-    pool_design: Path = typer.Option(None, "--pool-design", help="TSV with columns: Genome, Pool [optional: Plate]"),
+    pool_design: Path = typer.Option(None, "--pool-design", exists=True, readable=True,
+                                     help="TSV with columns: Genome, Pool [optional: Plate]"),
     xa_max: int = typer.Option(2, "--xa-max", help="Keep winners with XAcount <= xa_max; -1 disables"),
 ):
     """
@@ -225,8 +226,10 @@ def run(
     chunk_size_cells: int = typer.Option(5000, "--chunk-size-cells"),
     threads: int = typer.Option(8, "--threads", "-t", min=1),
     # NEW: summary options
-    with_summary: bool = typer.Option(False, "--with-summary", help="Produce summary PDF + PASS BCs + Reads_to_discard"),
-    pool_design: Path = typer.Option(None, "--pool-design", help="TSV with columns: Genome, Pool [optional: Plate]"),
+    with_summary: bool = typer.Option(False, "--with-summary", 
+                                      help="Produce summary PDF + PASS BCs + Reads_to_discard"),
+    pool_design: Path = typer.Option(None, "--pool-design", exists=True, readable=True,
+                                     help="TSV with columns: Genome, Pool [optional: Plate]"),
     xa_max: int = typer.Option(2, "--xa-max", help="Keep winners with XAcount <= xa_max in summary; set -1 to disable"),
 ):
     """
@@ -251,15 +254,20 @@ def run(
         raise typer.BadParameter("Choose exactly one mode: --config OR (--sample/--genome/--bam/--workdir) OR --configs")
 
     def _do_one(cfg: dict):
-        from .summary import summarize_and_mark, _load_pool_design as load_pool_design
-        inpool, pools = load_pool_design(
-            pool_design, cfg["sample"], default_genomes=list(cfg["genomes"].keys())
-        )
+        # only load pool info if we’re going to summarize
+        if with_summary:
+            from .summary import _load_pool_design as load_pool_design
+            inpool, pools = load_pool_design(
+                pool_design, cfg["sample"], default_genomes=list(cfg["genomes"].keys())
+            )
+        else:
+            inpool, pools = [], []
+
         _run_pipeline(cfg, threads)  # extract -> filter -> chunks -> assign -> merge
         typer.echo(f"[run] {cfg['sample']} pipeline complete")
+
         if with_summary:
-            from .summary import summarize_and_mark, _load_pool_design as load_pool_design
-            inpool, _ = load_pool_design(pool_design, cfg["sample"], default_genomes=list(cfg["genomes"].keys()))
+            from .summary import summarize_and_mark
             out = summarize_and_mark(
                 workdir=Path(cfg["workdir"]),
                 sample=cfg["sample"],
