@@ -97,6 +97,9 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
 
     d = _cfg_dirs(cfg); _ensure_dirs(d)
     genomes = sorted(cfg["genomes"].items())
+    if not genomes:
+        typer.echo("[run] no genomes in config; nothing to do")
+        return
 
     # 10) extract (parallel over genomes)
     with ProcessPoolExecutor(max_workers=_clamp(threads, 1, len(genomes))) as ex:
