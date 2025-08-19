@@ -1,5 +1,5 @@
 # ambientmapper
-Ambient contamination cleaning for multi-genome mappings (single-cell, scifi-ATAC)
+Ambient contamination cleaning for multi-genome mapping (single-cell, scifi-ATAC)
 
 ![tests](https://github.com/gomezcan/ambientmapper/actions/workflows/tests.yml/badge.svg)
 
