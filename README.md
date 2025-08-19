@@ -117,6 +117,13 @@ ambientmapper filter  -c configs/example.json -t 8
 ambientmapper chunks  -c configs/example.json
 
 ambientmapper assign  -c configs/example.json -t 16
+
+# after ambientmapper run / merge
+ambientmapper summarize \
+  --config configs/SC1_P1.json \
+  --pool-design configs/pools.tsv \
+  --xa-max 2
+
 ```
 
 ## Troubleshooting
