@@ -18,6 +18,7 @@ dependencies = [
   "scipy>=1.10",
   "typer>=0.9",
   "pyarrow>=14.0",
+  "matplotlib>=3.7",
   "tqdm>=4.66",
 ]
 
