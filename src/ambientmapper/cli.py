@@ -224,6 +224,10 @@ def run(
     min_barcode_freq: int = typer.Option(10, "--min-barcode-freq"),
     chunk_size_cells: int = typer.Option(5000, "--chunk-size-cells"),
     threads: int = typer.Option(8, "--threads", "-t", min=1),
+    # NEW: summary options
+    with_summary: bool = typer.Option(False, "--with-summary", help="Produce summary PDF + PASS BCs + Reads_to_discard"),
+    pool_design: Path = typer.Option(None, "--pool-design", help="TSV with columns: Genome, Pool [optional: Plate]"),
+    xa_max: int = typer.Option(2, "--xa-max", help="Keep winners with XAcount <= xa_max in summary; set -1 to disable"),
 ):
     """
     Run the pipeline.
@@ -246,16 +250,36 @@ def run(
     if modes_used != 1:
         raise typer.BadParameter("Choose exactly one mode: --config OR (--sample/--genome/--bam/--workdir) OR --configs")
 
+    def _do_one(cfg: dict):
+        from .summary import summarize_and_mark, _load_pool_design as load_pool_design
+        inpool, pools = load_pool_design(
+            pool_design, cfg["sample"], default_genomes=list(cfg["genomes"].keys())
+        )
+        _run_pipeline(cfg, threads)  # extract -> filter -> chunks -> assign -> merge
+        typer.echo(f"[run] {cfg['sample']} pipeline complete")
+        if with_summary:
+            from .summary import summarize_and_mark, _load_pool_design as load_pool_design
+            inpool, _ = load_pool_design(pool_design, cfg["sample"], default_genomes=list(cfg["genomes"].keys()))
+            out = summarize_and_mark(
+                workdir=Path(cfg["workdir"]),
+                sample=cfg["sample"],
+                inpool_genomes=inpool,
+                xa_max=xa_max,
+                pools_for_sample=pools,   # <-- pass pools here
+            )
+            typer.echo(f"[summary] PDF: {out['pdf']}")
+            typer.echo(f"[summary] HQ_BC: {out['hq_barcodes']}")
+            typer.echo(f"[summary] Reads_to_discard: {out['reads_to_discard']}")
+            typer.echo(f"[summary] winners={out['n_winners']} hq_bc={out['n_hq_bc']} discard_reads={out['n_discard_reads']}")
+
     if config:
         cfg = json.loads(Path(config).read_text())
-        _run_pipeline(cfg, threads)
-        typer.echo(f"[run] {cfg['sample']} complete")
+        _do_one(cfg)
         raise typer.Exit()
 
     if inline_ready:
         cfg = _cfg_from_inline(sample, genome, bam, str(workdir), min_barcode_freq, chunk_size_cells)
-        _run_pipeline(cfg, threads)
-        typer.echo(f"[run] {cfg['sample']} complete")
+        _do_one(cfg)
         raise typer.Exit()
 
     if configs:
@@ -264,6 +288,5 @@ def run(
             typer.echo("[run] no configs found in TSV"); raise typer.Exit(0)
         for cfg in batch:
             typer.echo(f"[run] starting {cfg['sample']}")
-            _run_pipeline(cfg, threads)
-            typer.echo(f"[run] {cfg['sample']} complete")
+            _do_one(cfg)
         raise typer.Exit()
