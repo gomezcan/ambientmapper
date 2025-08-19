@@ -9,12 +9,12 @@ ambientmapper run --config configs/example.json --threads 16
 
 ## or stepwise
 
-ambientmapper extract -c configs/SC1_P1.json -t 8
+ambientmapper extract -c configs/example.json -t 8
 
-ambientmapper filter  -c configs/SC1_P1.json -t 8
+ambientmapper filter  -c configs/example.json -t 8
 
-ambientmapper chunks  -c configs/SC1_P1.json
+ambientmapper chunks  -c configs/example.json
 
-ambientmapper assign  -c configs/SC1_P1.json -t 16
+ambientmapper assign  -c configs/example.json -t 16
 
-ambientmapper merge   -c configs/SC1_P1.json
+ambientmapper merge   -c configs/example.json
