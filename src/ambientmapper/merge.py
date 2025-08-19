@@ -1,9 +1,9 @@
 from __future__ import annotations
 from pathlib import Path
-import pandas as pd
 import glob
 
 def merge_chunk_outputs(chunks_dir: str | Path, sample: str, out_gz: str | Path) -> int:
+    import pandas as pd
     paths = sorted(glob.glob(str(Path(chunks_dir) / f"{sample}_cell_genotype_reads_chunk_*.txt")))
     dfs = [pd.read_csv(p, sep="\t") for p in paths if Path(p).stat().st_size > 0]
     df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(
