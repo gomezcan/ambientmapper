@@ -1,9 +1,10 @@
 from __future__ import annotations
 from pathlib import Path
 import csv
-import pysam
+
 
 def bam_to_qc(bam_path: str | Path, out_path: str | Path) -> None:
+    import pysam
     bam_path, out_path = str(bam_path), str(out_path)
     with pysam.AlignmentFile(bam_path, "rb") as bam, open(out_path, "w", newline="") as out:
         w = csv.writer(out, delimiter="\t")
