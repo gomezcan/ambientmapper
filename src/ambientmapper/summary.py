@@ -180,7 +180,7 @@ def summarize_and_mark(
     import matplotlib.pyplot as plt
     import matplotlib.backends.backend_pdf as mpdf
     
-    # vectors
+        # vectors
     in_as   = agg_bc.loc[group_low,  "AS_mean_1"].dropna().values
     out_as  = agg_bc.loc[group_high, "AS_mean_1"].dropna().values
     in_n    = agg_bc.loc[group_low,  "Total_n"].dropna().values
@@ -202,13 +202,13 @@ def summarize_and_mark(
     pdf_path = out_dir / f"{sample}_contamination_correction_summary.pdf"
     pdf = mpdf.PdfPages(str(pdf_path))
 
-    # Plot 1: ECDF AS_mean (of assigned genome per BC)    
+    # Plot 1: ECDF AS_mean (of assigned genome per BC)
     fig1, ax = _new_fig((4.8, 3.2))
     ax.plot(x1, y1, drawstyle="steps-post", label=label_low)
     ax.plot(x2, y2, drawstyle="steps-post", label=label_high)
     ax.set_title("Cum. Dist. AS_mean (assigned)", pad=6)
-    ax.set_xlabel("AS_mean", pad=2)
-    ax.set_ylabel("Cumulative probability", pad=2)
+    ax.set_xlabel("AS_mean", labelpad=2)
+    ax.set_ylabel("Cumulative probability", labelpad=2)
     ax.legend(loc="lower right", frameon=False, fontsize=8)
     _add_ks_box(ax, ks_as)
     ax.margins(x=0.02, y=0.02)
@@ -222,19 +222,31 @@ def summarize_and_mark(
     ax.set_title("Cum. Dist. Reads per BC", pad=6)
     ax.set_xlabel("Reads", labelpad=2)
     ax.set_ylabel("Cumulative probability", labelpad=2)
-    ax.legend(loc="lower right", fontsize=8)
     ax.legend(loc="lower right", frameon=False, fontsize=8)
     _add_ks_box(ax, ks_n)
     ax.margins(x=0.02, y=0.02)
     ax.tick_params(labelsize=8)
-    df.savefig(fig2, bbox_inches="tight"); plt.close(fig2)
+    pdf.savefig(fig2, bbox_inches="tight"); plt.close(fig2)
 
     # Plot 3: ECDF AS_gap (confidence gap between top-1 and top-2 AS_mean)
-    fig3, ax = _new_fig((6.2, 3.6))
+    fig3, ax = _new_fig((4.8, 3.2))
+    ax.plot(xg1, yg1, drawstyle="steps-post", label=label_low)
+    ax.plot(xg2, yg2, drawstyle="steps-post", label=label_high)
+    ax.set_title("Cum. Dist. AS_gap (top1 - top2)", pad=6)
+    ax.set_xlabel("AS_gap", labelpad=2)
+    ax.set_ylabel("Cumulative probability", labelpad=2)
+    ax.legend(loc="lower right", frameon=False, fontsize=8)
+    _add_ks_box(ax, ks_gap)
+    ax.margins(x=0.02, y=0.02)
+    ax.tick_params(labelsize=8)
+    pdf.savefig(fig3, bbox_inches="tight"); plt.close(fig3)
+
+    # Plot 4: Hexbin contamination vs reads (all BCs)
+    fig4, ax = _new_fig((6.2, 3.6))
     if not contam.empty:
         hb = ax.hexbin(contam["Total_reads"], contam["Contamination_Rate"],
-                   gridsize=20, mincnt=1)
-        cbar = fig3.colorbar(hb, ax=ax, shrink=0.85, pad=0.02)
+                       gridsize=20, mincnt=1)
+        cbar = fig4.colorbar(hb, ax=ax, shrink=0.85, pad=0.02)
         cbar.set_label("Density", fontsize=8)
         ax.set_title("BC contamination vs reads", pad=6)
         ax.set_xlabel("Reads per BC", labelpad=2)
@@ -242,30 +254,10 @@ def summarize_and_mark(
     else:
         ax.text(0.5, 0.5, "No BCs", ha="center", va="center")
     ax.tick_params(labelsize=8)
-    pdf.savefig(fig3, bbox_inches="tight"); plt.close(fig3)
+    pdf.savefig(fig4, bbox_inches="tight"); plt.close(fig4)
+    pdf.close()
 
-    # Plot 4: Hexbin contamination vs reads (all BCs)
-    fig4, ax = _new_fig((6.2, 4.0))
-    if has_pools and len(set(pools_for_sample)) > 1:
-        if not agg_bc.empty:
-            hb = ax.hexbin(agg_bc["Total_reads"], agg_bc["Contamination_Rate"], gridsize=20, mincnt=1)
-            ax.set_xlabel("Reads per BC"); ax.set_ylabel("Contamination rate")            
-            ax.set_title("Barcode (BC) per AssignedGenome × Pool", pad=6)
-            fig4.colorbar(hb, ax=ax, label="Density")            
-        else:
-            counts = (genotype_assignment.groupby("AssignedGenome")
-                      .size().reset_index(name="n").sort_values("n", ascending=False))
-            ax.bar(counts["AssignedGenome"], counts["n"])
-            ax.set_title("Barcodes per AssignedGenome", pad=6)
-            ax.set_ylabel("BC count", labelpad=2)
-            ax.tick_params(axis="x", labelrotation=45, labelsize=8)
-            for tick in ax.get_xticklabels():
-                tick.set_ha("right")  # prevents overlap at 45°
-        ax.tick_params(labelsize=8)
-        pdf.savefig(fig4, bbox_inches="tight"); plt.close(fig4)
-        
-
-    # Plot 5: Bar chart of counts per AssignedGenome (per-pool summary)
+    # Plot 5: Bar chart of counts per AssignedGenome
     fig5, ax = _new_fig((6.2, 4.0))
     counts = (assigned.groupby("AssignedGenome")
               .size().reset_index(name="n").sort_values("n", ascending=False))
@@ -273,10 +265,12 @@ def summarize_and_mark(
         ax.bar(counts["AssignedGenome"], counts["n"])
     ax.set_title("Barcodes per AssignedGenome", pad=6)
     ax.set_ylabel("BC count", labelpad=2)
-    ax.tick_params(axis='x', labelrotation=90, labelsize=7)
-    pdf.savefig(fig5); plt.close(fig5)
+    ax.tick_params(axis="x", labelrotation=45, labelsize=8)
+    for tick in ax.get_xticklabels():
+        tick.set_ha("right")
+    pdf.savefig(fig5, bbox_inches="tight"); 
+    plt.close(fig5)
 
-    pdf.close()
 
     # -------- outputs --------
     # PASS BCs = assigned to a genome that is in the per-pool genome list
