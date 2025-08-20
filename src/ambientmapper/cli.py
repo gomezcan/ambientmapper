@@ -229,6 +229,24 @@ def interpool(
     typer.echo(f"[interpool] Read composition: {res['read_comp']}")
     typer.echo(f"[interpool] PDF: {res['pdf']}")
 
+@app.command()
+def plate(
+    workdir: Path = typer.Option(..., "--workdir", help="Output root where pool folders live"),
+    plate_map: Path = typer.Option(..., "--plate-map", help="TSV mapping Sample<TAB>Wells (e.g., 'A1-12,B1-12')"),
+    outdir: Path = typer.Option(None, "--outdir", help="Where to write plate outputs (default: WORKDIR/PlateSummary)"),
+    xa_max: int = typer.Option(2, "--xa-max", help="Keep winner rows with XAcount <= xa_max; set -1 to disable"),
+):
+    """
+    Plate-level summary: contamination distributions by pool and a 96-well heatmap.
+    """
+    from .plate import plate_summary_cli
+    out = plate_summary_cli(workdir=workdir, plate_map=plate_map, outdir=outdir, xa_max=xa_max)
+    typer.echo(f"[plate] per-BC: {out['per_bc']}")
+    typer.echo(f"[plate] per-sample: {out['per_sample']}")
+    typer.echo(f"[plate] density: {out['density_pdf']}")
+    typer.echo(f"[plate] heatmap: {out['heatmap_pdf']}")
+
+
 
 # ----------------
 # End-to-end (3 modes)
