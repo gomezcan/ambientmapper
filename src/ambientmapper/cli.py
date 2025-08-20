@@ -114,7 +114,7 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
         for g, _ in genomes:
             ip = d["qc"] / f"{g}_QCMapping.txt"
             op = d["filtered"] / f"filtered_{g}_QCMapping.txt"
-            futs.append(ex.submit(filter_qc_file, ip, op, minf))
+            futs.append(ex.submit(filter_qc_file, ip, op, minf, cfg["sample"]))
         for f in as_completed(futs): f.result()
 
     # 25) chunks
