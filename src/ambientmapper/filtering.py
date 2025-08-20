@@ -2,6 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Union
 from .normalization import canonicalize_bc_seq_sample
+import pandas as pd  # <- FIX
 
 USECOLS = ["Read", "BC", "MAPQ", "AS", "NM", "XAcount"]
 
