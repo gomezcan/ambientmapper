@@ -255,8 +255,7 @@ def summarize_and_mark(
         ax.text(0.5, 0.5, "No BCs", ha="center", va="center")
     ax.tick_params(labelsize=8)
     pdf.savefig(fig4, bbox_inches="tight"); plt.close(fig4)
-    pdf.close()
-
+    
     # Plot 5: Bar chart of counts per AssignedGenome
     fig5, ax = _new_fig((6.2, 4.0))
     counts = (assigned.groupby("AssignedGenome")
@@ -270,7 +269,7 @@ def summarize_and_mark(
         tick.set_ha("right")
     pdf.savefig(fig5, bbox_inches="tight"); 
     plt.close(fig5)
-
+    pdf.close()
 
     # -------- outputs --------
     # PASS BCs = assigned to a genome that is in the per-pool genome list
