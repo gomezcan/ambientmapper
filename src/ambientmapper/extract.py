@@ -1,11 +1,12 @@
 # src/ambientmapper/extract.py
 from pathlib import Path
 import csv, pysam
-from .normalization import canonicalize_bc_seq_sample
+from .normalization import canonicalize_bc_seq_sample_force
+
 
 def bam_to_qc(bam_path: Path, out_path: Path, sample_hint: str | None = None):
     """
-    Write per-read QC with normalized BC = '<seq>-<sample>'.
+    Write per-read QC with normalized BC = '<seq>-<sample_name>'.
     """
     with pysam.AlignmentFile(str(bam_path), "rb") as bam, open(out_path, "w", newline="") as out:
         w = csv.writer(out, delimiter="\t")
@@ -20,7 +21,7 @@ def bam_to_qc(bam_path: Path, out_path: Path, sample_hint: str | None = None):
             if aln.has_tag("CB"): bc_raw = aln.get_tag("CB")
             elif aln.has_tag("BC"): bc_raw = aln.get_tag("BC")
             # NEW: normalize to seq-sample
-            bc = canonicalize_bc_seq_sample(bc_raw, sample_hint=sample_hint)
+            bc = canonicalize_bc_seq_sample_force(bc_raw, sample_name)
 
             xa_count = 0
             if aln.has_tag("XA"):
