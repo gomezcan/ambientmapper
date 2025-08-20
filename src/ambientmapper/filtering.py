@@ -2,14 +2,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 import pandas as pd  # <- FIX
-from .normalization import canonicalize_bc_seq_sample
+from .normalization import canonicalize_bc_seq_sample_force
 
 
 def filter_qc_file(
     in_path: Path,
     out_path: Path,
     min_freq: int,
-    sample_hint: Optional[str] = None,
+    sample_name: Optional[str] = None,
 ) -> int:
     """
     Read a QC mapping TSV (from extract), normalize BC to '<seq>-<sample>',
@@ -29,9 +29,9 @@ def filter_qc_file(
     )
 
     # Normalize BC to '<seq>-<sample>'
-    df["BC"] = df["BC"].fillna("").astype(str).map(
-        lambda s: canonicalize_bc_seq_sample(s, sample_hint=sample_hint)
-    )
+    if sample_name:
+        df["BC"] = df["BC"].fillna("").map(lambda s: canonicalize_bc_seq_sample_force(s, sample_name))
+    
 
     # Keep only barcodes with sufficient frequency
     bc_counts = df["BC"].value_counts()
