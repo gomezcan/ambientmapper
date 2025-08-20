@@ -86,13 +86,23 @@ def summarize_and_mark(
     total_n = agg.groupby("BC", as_index=False)["n_Read"].sum().rename(columns={"n_Read":"Total_n"})
     agg = agg.merge(total_n, on="BC", how="left")
 
-    # Compute AS_mean gap between best and second-best genome per BC (useful diagnostic)
-    # Sort so best first, then take top2 per BC.
-    agg_sorted = agg.sort_values(["BC","AS_mean","n_Read","Genome"], ascending=[True, False, False, True])
-    top1 = agg_sorted.groupby("BC", as_index=False).head(1).rename(columns={"Genome":"AssignedGenome",
-                                                                            "AS_mean":"AS_mean_1"})
-    top2 = (agg_sorted.groupby("BC", as_index=False).nth(1)[["AS_mean"]]
-            .rename(columns={"AS_mean":"AS_mean_2"})).reset_index()
+    # 1) Sort by your preferred ranking
+    #    Primary key: AS_mean desc
+    #    Tie-breakers: n_Read desc, then Genome asc for determinism
+    ranked = (agg.sort_values(["BC", "AS_mean", "n_Read", "Genome"],
+                          ascending=[True, False, False, True])
+              .assign(rank=lambda d: d.groupby("BC").cumcount()))
+
+    # 2) First and second per BC from that explicit rank
+    top1 = (ranked[ranked["rank"] == 0]
+          .rename(columns={"Genome": "AssignedGenome",
+                           "AS_mean": "AS_mean_1"}))
+    top1 = top1[["BC", "AssignedGenome", "AS_mean_1", "Total_n"]]
+    
+    top2 = (ranked[ranked["rank"] == 1][["BC", "AS_mean"]]
+          .rename(columns={"AS_mean": "AS_mean_2"}))
+    
+    # 3) Merge and compute the gap
     assigned = top1.merge(top2, on="BC", how="left")
     assigned["AS_mean_2"] = assigned["AS_mean_2"].fillna(-np.inf)
     assigned["AS_gap"] = assigned["AS_mean_1"] - assigned["AS_mean_2"]
