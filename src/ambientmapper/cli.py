@@ -103,7 +103,7 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
 
     # 10) extract (parallel over genomes)
     with ProcessPoolExecutor(max_workers=_clamp(threads, 1, len(genomes))) as ex:
-        futs = [ex.submit(bam_to_qc, Path(bam), d["qc"] / f"{g}_QCMapping.txt")
+        futs = [ex.submit(bam_to_qc, Path(bam), d["qc"] / f"{g}_QCMapping.txt", cfg["sample"])
                 for g, bam in genomes]
         for f in as_completed(futs): f.result()
 
