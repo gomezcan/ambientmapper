@@ -275,36 +275,43 @@ def run(
         raise typer.BadParameter("Inline mode requires --sample, --genome, --bam, and --workdir together.")
     if modes_used != 1:
         raise typer.BadParameter("Choose exactly one mode: --config OR (--sample/--genome/--bam/--workdir) OR --configs")
-
+    
     typer.echo(f"[run] mode=inline={inline_ready} config={bool(config)} tsv={bool(configs)}")
 
     def _do_one(cfg: dict):
-        _run_pipeline(cfg, threads)  # extract -> filter -> chunks -> assign -> merge
-        typer.echo(f"[run] {cfg['sample']} pipeline complete")
-    
-        if with_summary:
-            from .summary import summarize_and_mark, _load_pool_design as load_pool_design
-    
-            if pool_design:
-                # optional: restrict design to Pool == sample
-                inpool, pools = load_pool_design(pool_design, cfg["sample"],
-                                                 default_genomes=list(cfg["genomes"].keys()))
-            else:
-                # per-pool run: in-pool = genomes listed in this JSON; no cross-pool context
-                inpool = [g.upper() for g in cfg["genomes"].keys()]
-                pools = []  # no-pool mode
+    # run the pipeline
+    _run_pipeline(cfg, threads)
+    typer.echo(f"[run] {cfg['sample']} pipeline complete")
 
-            out = summarize_and_mark(
-                workdir=Path(cfg["workdir"]),
-                sample=cfg["sample"],
-                inpool_genomes=inpool,
-                xa_max=xa_max,
-                pools_for_sample=pools,   # [] means no-pool mode
+    if with_summary:
+        from .summary import summarize_and_mark, _load_pool_design as load_pool_design
+
+        # Decide the in-pool genome set:
+        # - If a pool design TSV is provided, use rows matching Pool==sample (or all rows if your loader permits).
+        # - Otherwise, treat the genomes listed in this sample's config as the in-pool list.
+        if pool_design:
+            inpool, _ = load_pool_design(
+                pool_design, cfg["sample"], default_genomes=list(cfg["genomes"].keys())
             )
-            typer.echo(f"[summary] PDF: {out['pdf']}")
-            typer.echo(f"[summary] HQ_BC: {out['hq_barcodes']}")
-            typer.echo(f"[summary] Reads_to_discard: {out['reads_to_discard']}")
-            typer.echo(f"[summary] winners={out['n_winners']} hq_bc={out['n_hq_bc']} discard_reads={out['n_discard_reads']}")
+        else:
+            inpool = [g.upper() for g in cfg["genomes"].keys()]
+
+        # Per-pool summary compares Low/High contamination only; no pools_for_sample arg needed.
+        out = summarize_and_mark(
+            workdir=Path(cfg["workdir"]),
+            sample=cfg["sample"],
+            inpool_genomes=inpool,
+            xa_max=xa_max,
+        )
+
+        typer.echo(f"[summary] PDF: {out['pdf']}")
+        typer.echo(f"[summary] HQ_BC: {out['hq_barcodes']}")
+        typer.echo(f"[summary] Reads_to_discard: {out['reads_to_discard']}")
+        typer.echo(
+            f"[summary] winners={out['n_winners']} hq_bc={out['n_hq_bc']} "
+            f"discard_reads={out['n_discard_reads']}"
+        )
+
 
     if config:
         cfg = json.loads(Path(config).read_text())
