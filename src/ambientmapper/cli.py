@@ -143,7 +143,8 @@ def extract(config: Path = typer.Option(..., "--config", "-c", exists=True, read
     cfg = json.loads(Path(config).read_text()); d = _cfg_dirs(cfg); _ensure_dirs(d)
     genomes = sorted(cfg["genomes"].items())
     with ProcessPoolExecutor(max_workers=_clamp(threads, 1, len(genomes))) as ex:
-        futs = [ex.submit(bam_to_qc, Path(b), d["qc"]/f"{g}_QCMapping.txt") for g, b in genomes]
+        futs = [ex.submit(bam_to_qc, Path(bam), d["qc"] / f"{g}_QCMapping.txt", cfg["sample"])
+            for g, bam in genomes]
         for f in as_completed(futs): f.result()
     typer.echo("[extract] done")
 
@@ -156,8 +157,9 @@ def filter(config: Path = typer.Option(..., "--config", "-c", exists=True, reada
     with ProcessPoolExecutor(max_workers=_clamp(threads, 1, len(genomes))) as ex:
         futs=[]
         for g in genomes:
-            ip = d["qc"]/f"{g}_QCMapping.txt"; op = d["filtered"]/f"filtered_{g}_QCMapping.txt"
-            futs.append(ex.submit(filter_qc_file, ip, op, minf))
+            ip = d["qc"]/f"{g}_QCMapping.txt"
+            op = d["filtered"]/f"filtered_{g}_QCMapping.txt"
+            futs.append(ex.submit(filter_qc_file, ip, op, minf, cfg["sample"]))
         for f in as_completed(futs): f.result()
     typer.echo("[filter] done")
 
