@@ -274,6 +274,8 @@ def run(
     if modes_used != 1:
         raise typer.BadParameter("Choose exactly one mode: --config OR (--sample/--genome/--bam/--workdir) OR --configs")
 
+    typer.echo(f"[run] mode=inline={inline_ready} config={bool(config)} tsv={bool(configs)}")
+
     def _do_one(cfg: dict):
         _run_pipeline(cfg, threads)  # extract -> filter -> chunks -> assign -> merge
         typer.echo(f"[run] {cfg['sample']} pipeline complete")
