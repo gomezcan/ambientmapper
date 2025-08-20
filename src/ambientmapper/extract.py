@@ -1,10 +1,12 @@
-from __future__ import annotations
+# src/ambientmapper/extract.py
 from pathlib import Path
-import csv
+import csv, pysam
+from .normalization import canonicalize_bc_seq_sample
 
-def bam_to_qc(bam_path: Path, out_path: Path) -> int:
-    import pysam  # lazy
-    n = 0
+def bam_to_qc(bam_path: Path, out_path: Path, sample_hint: str | None = None):
+    """
+    Write per-read QC with normalized BC = '<seq>-<sample>'.
+    """
     with pysam.AlignmentFile(str(bam_path), "rb") as bam, open(out_path, "w", newline="") as out:
         w = csv.writer(out, delimiter="\t")
         for aln in bam.fetch(until_eof=True):
@@ -14,10 +16,15 @@ def bam_to_qc(bam_path: Path, out_path: Path) -> int:
             mapq = int(aln.mapping_quality)
             ascore = aln.get_tag("AS") if aln.has_tag("AS") else ""
             nm = aln.get_tag("NM") if aln.has_tag("NM") else ""
-            bc = aln.get_tag("CB") if aln.has_tag("CB") else (aln.get_tag("BC") if aln.has_tag("BC") else "")
+            bc_raw = ""
+            if aln.has_tag("CB"): bc_raw = aln.get_tag("CB")
+            elif aln.has_tag("BC"): bc_raw = aln.get_tag("BC")
+            # NEW: normalize to seq-sample
+            bc = canonicalize_bc_seq_sample(bc_raw, sample_hint=sample_hint)
+
             xa_count = 0
             if aln.has_tag("XA"):
                 xa = aln.get_tag("XA")
                 xa_count = xa.count(";") if isinstance(xa, str) else 0
-            w.writerow([read, bc, mapq, ascore, nm, xa_count]); n += 1
-    return n
+
+            w.writerow([read, bc, mapq, ascore, nm, xa_count])
