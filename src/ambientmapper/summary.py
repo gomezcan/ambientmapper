@@ -15,32 +15,24 @@ def _load_winners(sample_dir: Path, sample: str) -> "pandas.DataFrame":
 
 def _load_pool_design(pool_tsv: Optional[Path], sample: str, default_genomes: list[str]) -> Tuple[list[str], list[str]]:
     """
-    Returns (inpool_genomes, pools_for_sample).
+    Returns (inpool_genomes, pools_for_sample). For per-pool summary we still
+    use inpool_genomes to mark 'PASS' BCs, but we DO NOT plot In/Out here.
     If pool_tsv is None, inpool = default_genomes (uppercased) and pools = [sample].
-    Expect TSV with at least columns: Genome, Pool; optional: Plate
     """
     import pandas as pd
     if pool_tsv is None:
-        # whole-sample = one pool; in-pool = all genomes listed for this sample
         return [g.upper() for g in default_genomes], [sample]
-
     pdf = pd.read_csv(pool_tsv, sep="\t", header=0)
     cols = {c.lower(): c for c in pdf.columns}
     genome_col = cols.get("genome")
     pool_col   = cols.get("pool")
     if not (genome_col and pool_col):
         raise ValueError("Pool design TSV must include columns: Genome, Pool (Plate optional).")
-
-    # 🔒 enforce: this run's sample IS the pool id
     df = pdf[pdf[pool_col].astype(str).str.upper() == sample.upper()].copy()
     if df.empty:
-        raise ValueError(
-            f"No rows in pool design where Pool == '{sample}'. "
-            "Remember: sample name must equal Pool ID for this run."
-        )
-
+        raise ValueError(f"No rows in pool design where Pool == '{sample}'.")
     inpool = sorted(df[genome_col].astype(str).str.upper().unique())
-    pools  = [sample]  # single active pool for this run
+    pools  = [sample]
     return inpool, pools
 
 def summarize_and_mark(
@@ -49,11 +41,14 @@ def summarize_and_mark(
     inpool_genomes: list[str],
     xa_max: int = 2,
     out_dirname: str = "Plots",
-    contam_thresh_for_plots: float = 0.20,
-    pools_for_sample: list[str] | None = None,  # None => no-pool mode
+    # Grouping controls for plots (per-pool):
+    group_mode: str = "quantile",          # "quantile" | "threshold"
+    contam_quantile: float = 0.20,         # compare bottom q vs top (1-q)
+    contam_thresh_for_plots: float = 0.20, # used if group_mode == "threshold"
 ) -> Dict[str, object]:
     """
-    Build summaries, plots, and read-discard list. Returns paths & counts.
+    Per-pool summary: compare low- vs high-contamination BCs (no InPool/Not_InPool plotting).
+    Builds PDF + PASS BC list + reads-to-discard list. Returns paths & counts.
     """
     import pandas as pd
     import numpy as np
@@ -77,58 +72,64 @@ def summarize_and_mark(
     if xa_max >= 0 and "xacount" in colmap:
         winners = winners[winners[colmap["xacount"]].fillna(0) <= xa_max].copy()
 
-    winners["Pool"]   = sample  # single-pool default
     winners["Genome"] = winners[colmap["genome"]].astype(str).str.upper()
     winners["BC"]     = winners[colmap["bc"]].astype(str)
     winners["AS"]     = pd.to_numeric(winners[colmap["as"]], errors="coerce")
     winners["Read"]   = winners[colmap["read"]].astype(str)
+    winners["Pool"]   = sample  # metadata only
 
     # -------- per-BC genotype scoring (AS_mean) --------
     agg = (winners
-           .groupby(["BC","Genome","Pool"], as_index=False)
+           .groupby(["BC","Genome"], as_index=False)
            .agg(AS_Total=("AS","sum"), n_Read=("Read","count")))
     agg["AS_mean"] = agg["AS_Total"] / agg["n_Read"]
     total_n = agg.groupby("BC", as_index=False)["n_Read"].sum().rename(columns={"n_Read":"Total_n"})
     agg = agg.merge(total_n, on="BC", how="left")
 
-    # Best assignment per BC (break ties by n_Read desc, then Genome lex)
-    genotype_assignment = (agg.sort_values(["BC","AS_mean","n_Read","Genome"],
-                                           ascending=[True, False, False, True])
-                             .groupby("BC", as_index=False).head(1)
-                             .rename(columns={"Genome":"AssignedGenome"}))
+    # Compute AS_mean gap between best and second-best genome per BC (useful diagnostic)
+    # Sort so best first, then take top2 per BC.
+    agg_sorted = agg.sort_values(["BC","AS_mean","n_Read","Genome"], ascending=[True, False, False, True])
+    top1 = agg_sorted.groupby("BC", as_index=False).head(1).rename(columns={"Genome":"AssignedGenome",
+                                                                            "AS_mean":"AS_mean_1"})
+    top2 = (agg_sorted.groupby("BC", as_index=False).nth(1)[["AS_mean"]]
+            .rename(columns={"AS_mean":"AS_mean_2"})).reset_index()
+    assigned = top1.merge(top2, on="BC", how="left")
+    assigned["AS_mean_2"] = assigned["AS_mean_2"].fillna(-np.inf)
+    assigned["AS_gap"] = assigned["AS_mean_1"] - assigned["AS_mean_2"]
 
-    # Contaminated flag relative to in-pool genomes (if pools are meaningful)
-    genotype_assignment["Contaminated"] = np.where(
-        genotype_assignment["AssignedGenome"].isin([g.upper() for g in inpool_genomes]),
+    # Mark 'PASS' BCs relative to in-pool genomes (list = genomes used for this pool/sample)
+    assigned["Contaminated"] = np.where(
+        assigned["AssignedGenome"].isin([g.upper() for g in inpool_genomes]),
         1, 0
     )
 
     # -------- read-level mismatch & BC contamination rate --------
     win_g = winners[["BC","Read","Genome"]]
-    assigned = genotype_assignment[["BC","AssignedGenome","Total_n"]]
-    merged = win_g.merge(assigned, on="BC", how="left")
+    merged = win_g.merge(assigned[["BC","AssignedGenome","Total_n"]], on="BC", how="left")
     merged["mismatch"] = (merged["Genome"] != merged["AssignedGenome"]).astype(int)
     contam = (merged.groupby("BC", as_index=False)
                      .agg(Total_reads=("Read","count"),
                           Mismatch_reads=("mismatch","sum")))
     contam["Contamination_Rate"] = contam["Mismatch_reads"] / contam["Total_reads"]
 
-    # Attach contamination to per-BC AS table
-    agg_bc = agg.merge(contam[["BC","Contamination_Rate","Total_reads"]], on="BC", how="left")
+    # Attach contamination to assignment table
+    agg_bc = assigned.merge(contam[["BC","Contamination_Rate","Total_reads"]], on="BC", how="left")
 
-    # Pools vs no-pool grouping for plots
-    has_pools = bool(pools_for_sample and len(pools_for_sample) > 0)
-    if has_pools:
-        agg_bc = agg_bc.merge(genotype_assignment[["BC","Contaminated","Pool"]], on="BC", how="left")
-        group_mask_in  = agg_bc["Contaminated"].fillna(0).astype(int) == 1
-        group_mask_out = ~group_mask_in
-        label_in, label_out = "InPool", "Not_InPool"
+    # -------- grouping for plots: LowContam vs HighContam only --------
+    if group_mode.lower() == "quantile":
+        q = float(contam_quantile)
+        q = min(max(q, 0.0), 0.49)  # keep sensible
+        c = agg_bc["Contamination_Rate"].fillna(0.0)
+        lo_thr = c.quantile(q) if len(c) else 0.0
+        hi_thr = c.quantile(1.0 - q) if len(c) else 0.0
+        group_low  = agg_bc["Contamination_Rate"] <= lo_thr
+        group_high = agg_bc["Contamination_Rate"] >= hi_thr
+        label_low, label_high = f"LowContam (≤Q{q:.2f})", f"HighContam (≥Q{1.0-q:.2f})"
     else:
-        agg_bc["Group"] = (agg_bc["Contamination_Rate"].fillna(0.0) <= float(contam_thresh_for_plots))\
-                            .map({True: "LowContam", False: "HighContam"})
-        group_mask_in  = agg_bc["Group"] == "LowContam"
-        group_mask_out = agg_bc["Group"] == "HighContam"
-        label_in, label_out = "LowContam", "HighContam"
+        thr = float(contam_thresh_for_plots)
+        group_low  = agg_bc["Contamination_Rate"].fillna(0.0) <= thr
+        group_high = agg_bc["Contamination_Rate"].fillna(0.0) >  thr
+        label_low, label_high = f"LowContam (≤{thr:.2f})", f"HighContam (>{thr:.2f})"
 
     # ---------- ECDF helpers ----------
     def _ecdf(x):
@@ -144,16 +145,23 @@ def summarize_and_mark(
             return r
         return stats.ks_2samp(a, b, alternative="two-sided")
 
-    in_as  = agg_bc.loc[group_mask_in,  "AS_mean"].dropna().values
-    out_as = agg_bc.loc[group_mask_out, "AS_mean"].dropna().values
-    in_n   = agg_bc.loc[group_mask_in,  "Total_n"].dropna().values
-    out_n  = agg_bc.loc[group_mask_out, "Total_n"].dropna().values
+    import numpy as np  # ensure numpy is available for helpers
 
-    ks_as = _safe_ks(in_as, out_as)
-    ks_n  = _safe_ks(in_n,  out_n)
+    # vectors
+    in_as   = agg_bc.loc[group_low,  "AS_mean_1"].dropna().values
+    out_as  = agg_bc.loc[group_high, "AS_mean_1"].dropna().values
+    in_n    = agg_bc.loc[group_low,  "Total_n"].dropna().values
+    out_n   = agg_bc.loc[group_high, "Total_n"].dropna().values
+    in_gap  = agg_bc.loc[group_low,  "AS_gap"].dropna().values
+    out_gap = agg_bc.loc[group_high, "AS_gap"].dropna().values
 
-    x1,y1   = _ecdf(in_as);   x2,y2   = _ecdf(out_as)
-    xn1,yn1 = _ecdf(in_n);    xn2,yn2 = _ecdf(out_n)
+    ks_as  = _safe_ks(in_as,  out_as)
+    ks_n   = _safe_ks(in_n,   out_n)
+    ks_gap = _safe_ks(in_gap, out_gap)
+
+    x1,y1    = _ecdf(in_as);   x2,y2    = _ecdf(out_as)
+    xn1,yn1  = _ecdf(in_n);    xn2,yn2  = _ecdf(out_n)
+    xg1,yg1  = _ecdf(in_gap);  xg2,yg2  = _ecdf(out_gap)
 
     # ---------- PDF ----------
     out_dir = (workdir / sample / out_dirname)
@@ -161,11 +169,11 @@ def summarize_and_mark(
     pdf_path = out_dir / f"{sample}_contamination_correction_summary.pdf"
     pdf = mpdf.PdfPages(str(pdf_path))
 
-    # Plot 1: ECDF AS_mean
+    # Plot 1: ECDF AS_mean (of assigned genome per BC)
     fig1 = plt.figure(figsize=(4,3)); ax = fig1.gca()
-    ax.plot(x1, y1, drawstyle="steps-post", label=label_in)
-    ax.plot(x2, y2, drawstyle="steps-post", label=label_out)
-    ax.set_title("Cum. Dist.\nAS mean"); ax.set_xlabel("AS mean"); ax.set_ylabel("Cumulative probability")
+    ax.plot(x1, y1, drawstyle="steps-post", label=label_low)
+    ax.plot(x2, y2, drawstyle="steps-post", label=label_high)
+    ax.set_title("Cum. Dist.\nAS_mean (assigned)") ; ax.set_xlabel("AS_mean") ; ax.set_ylabel("Cumulative probability")
     ax.legend(loc="lower right", fontsize=8)
     ax.text(0.98, 0.1, f"KS D={ks_as.statistic:.3f}\np={ks_as.pvalue:.2e}",
             transform=ax.transAxes, ha="right", va="bottom", fontsize=8)
@@ -173,68 +181,57 @@ def summarize_and_mark(
 
     # Plot 2: ECDF Total reads per BC
     fig2 = plt.figure(figsize=(4,3)); ax = fig2.gca()
-    ax.plot(xn1, yn1, drawstyle="steps-post", label=label_in)
-    ax.plot(xn2, yn2, drawstyle="steps-post", label=label_out)
-    ax.set_title("Cum. Dist.\nTotal reads per BC"); ax.set_xlabel("Reads"); ax.set_ylabel("Cumulative probability")
+    ax.plot(xn1, yn1, drawstyle="steps-post", label=label_low)
+    ax.plot(xn2, yn2, drawstyle="steps-post", label=label_high)
+    ax.set_title("Cum. Dist.\nReads per BC"); ax.set_xlabel("Reads"); ax.set_ylabel("Cumulative probability")
     ax.legend(loc="lower right", fontsize=8)
     ax.text(0.98, 0.1, f"KS D={ks_n.statistic:.3f}\np={ks_n.pvalue:.2e}",
             transform=ax.transAxes, ha="right", va="bottom", fontsize=8)
     pdf.savefig(fig2); plt.close(fig2)
 
-    # Plot 3: Hexbin contamination vs reads (all BCs)
-    fig3 = plt.figure(figsize=(6,3)); ax = fig3.gca()
-    if not contam.empty:
-        hb = ax.hexbin(contam["Total_reads"], contam["Contamination_Rate"], gridsize=20, mincnt=1)
-        ax.set_xlabel("Reads per BC"); ax.set_ylabel("Contamination rate")
-        ax.set_title("BC contamination vs reads")
-        fig3.colorbar(hb, ax=ax, label="Density")
-    else:
-        ax.text(0.5,0.5,"No BCs", ha="center")
+    # Plot 3: ECDF AS_gap (confidence gap between top-1 and top-2 AS_mean)
+    fig3 = plt.figure(figsize=(4,3)); ax = fig3.gca()
+    ax.plot(xg1, yg1, drawstyle="steps-post", label=label_low)
+    ax.plot(xg2, yg2, drawstyle="steps-post", label=label_high)
+    ax.set_title("Cum. Dist.\nAS_mean gap (top1 − top2)") ; ax.set_xlabel("AS_gap") ; ax.set_ylabel("Cumulative probability")
+    ax.legend(loc="lower right", fontsize=8)
+    ax.text(0.98, 0.1, f"KS D={ks_gap.statistic:.3f}\np={ks_gap.pvalue:.2e}",
+            transform=ax.transAxes, ha="right", va="bottom", fontsize=8)
     pdf.savefig(fig3); plt.close(fig3)
 
-    # Plot 4: heatmap (if multiple pools) else bar chart per AssignedGenome
-    fig4 = plt.figure(figsize=(5,4)); ax = fig4.gca()
-    if has_pools and len(set(pools_for_sample)) > 1:
-        # Build simple heatmap using counts per (AssignedGenome, Pool)
-        heat = (genotype_assignment.groupby(["AssignedGenome","Pool"])
-                                   .size().reset_index(name="n"))
-        genomes = sorted(heat["AssignedGenome"].unique())
-        pools   = sorted(heat["Pool"].unique())
-        mat = np.zeros((len(genomes), len(pools)), dtype=int)
-        g2i = {g:i for i,g in enumerate(genomes)}
-        p2j = {p:j for j,p in enumerate(pools)}
-        for _, row in heat.iterrows():
-            mat[g2i[row["AssignedGenome"]], p2j[row["Pool"]]] = int(row["n"])
-        im = ax.imshow(mat, aspect="auto")
-        ax.set_yticks(range(len(genomes))); ax.set_yticklabels(genomes, fontsize=7)
-        ax.set_xticks(range(len(pools)));  ax.set_xticklabels(pools, fontsize=7, rotation=90)
-        ax.set_title("Barcode (BC) per AssignedGenome × Pool")
-        for i,g in enumerate(genomes):
-            for j,p in enumerate(pools):
-                val = mat[i,j]
-                ax.text(j, i, str(val), ha="center", va="center", fontsize=6,
-                        color=("white" if val else "black"))
-        fig4.colorbar(im, ax=ax, label="BCs")
+    # Plot 4: Hexbin contamination vs reads (all BCs)
+    fig4 = plt.figure(figsize=(6,3)); ax = fig4.gca()
+    if not agg_bc.empty:
+        hb = ax.hexbin(agg_bc["Total_reads"], agg_bc["Contamination_Rate"], gridsize=20, mincnt=1)
+        ax.set_xlabel("Reads per BC"); ax.set_ylabel("Contamination rate")
+        ax.set_title("BC contamination vs reads")
+        fig4.colorbar(hb, ax=ax, label="Density")
     else:
-        counts = (genotype_assignment.groupby("AssignedGenome")
-                  .size().reset_index(name="n").sort_values("n", ascending=False))
-        ax.bar(counts["AssignedGenome"], counts["n"])
-        ax.set_title("Barcodes per AssignedGenome")
-        ax.set_ylabel("BC count")
-        ax.tick_params(axis='x', labelrotation=90, labelsize=7)
+        ax.text(0.5,0.5,"No BCs", ha="center")
     pdf.savefig(fig4); plt.close(fig4)
+
+    # Plot 5: Bar chart of counts per AssignedGenome (per-pool summary)
+    fig5 = plt.figure(figsize=(5,4)); ax = fig5.gca()
+    counts = (assigned.groupby("AssignedGenome")
+              .size().reset_index(name="n").sort_values("n", ascending=False))
+    if not counts.empty:
+        ax.bar(counts["AssignedGenome"], counts["n"])
+    ax.set_title("Barcodes per AssignedGenome")
+    ax.set_ylabel("BC count")
+    ax.tick_params(axis='x', labelrotation=90, labelsize=7)
+    pdf.savefig(fig5); plt.close(fig5)
 
     pdf.close()
 
     # -------- outputs --------
-    # HQ_BC = BCs assigned to an in-pool genome
-    hq = genotype_assignment[genotype_assignment["Contaminated"]==1].copy()
+    # PASS BCs = assigned to a genome that is in the per-pool genome list
+    hq = assigned[assigned["AssignedGenome"].isin([g.upper() for g in inpool_genomes])].copy()
     hq_path = sdir / f"{sample}_BCs_PASS_by_mapping.csv"
-    hq[["BC","AssignedGenome","Total_n","Pool"]].to_csv(hq_path, index=False)
+    hq[["BC","AssignedGenome","Total_n","AS_mean_1","AS_gap"]].to_csv(hq_path, index=False)
 
     # Reads to discard: winner genome != assigned BC genome
     to_filter = winners[["Read","BC","Genome"]].merge(
-        genotype_assignment[["BC","AssignedGenome","Pool"]],
+        assigned[["BC","AssignedGenome"]],
         on="BC", how="left"
     )
     bad = to_filter[to_filter["Genome"] != to_filter["AssignedGenome"]].copy()
@@ -262,5 +259,5 @@ def summarize_cli(config_json: Path, pool_design: Optional[Path] = None, xa_max:
         workdir, sample,
         inpool_genomes=inpool,
         xa_max=xa_max,
-        pools_for_sample=pools if len(pools) > 0 else None,
+        # plotting groups are contamination-based only in per-pool summary
     )
