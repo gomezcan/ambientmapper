@@ -4,7 +4,7 @@ import csv, pysam
 from .normalization import canonicalize_bc_seq_sample_force
 
 
-def bam_to_qc(bam_path: Path, out_path: Path, sample_hint: str | None = None):
+def bam_to_qc(bam_path: Path, out_path: Path, sample_name: str | None = None):
     """
     Write per-read QC with normalized BC = '<seq>-<sample_name>'.
     """
