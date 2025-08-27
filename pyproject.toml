@@ -23,6 +23,7 @@ dependencies = [
 ]
 
 [project.scripts]
+ambientmapper-assign = "ambientmapper.assign_streaming:app"
 ambientmapper = "ambientmapper.cli:app"
 
 [tool.setuptools.packages.find]
