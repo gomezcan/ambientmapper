@@ -44,7 +44,7 @@ pip install -e /path/to/ambientmapper
 pip install "git+https://github.com/gomezcan/ambientmapper.git"
 ```
 
-## Output diractory layout
+## Output directory layout
 all outputs live under: 
 
 ```perl
@@ -64,9 +64,9 @@ You can run **end-to-end** (*extract → filter → chunks → assign → merge*
 ### One Step. Mode A — Inline one sample
 ```bash
 ambientmapper run \
-  --sample SC1_P1 \
+  --sample B73Mo17_rep1 \
   --genome B73,Mo17 \
-  --bam /data/SC1_P1/B73.bam,/data/SC1_P1/Mo17.bam \
+  --bam /data/SC1_P1/B73.bam,/data/B73Mo17_rep1/Mo17.bam \
   --workdir /scratch/ambient_out \
   --min-barcode-freq 5 \
   --chunk-size-cells 1000 \
@@ -102,11 +102,11 @@ ambientmapper run --config configs/SC1_P1.json \
 configs/samples.tsv (tab-separated; one row per **(sample, genome)**)
 
 ```ts
-sample  genome  bam                         workdir
-SC1_P1  B73     /data/SC1_P1/B73.bam       /scratch/ambient_out
-SC1_P1  Mo17    /data/SC1_P1/Mo17.bam      /scratch/ambient_out
-SC1_P2  B73     /data/SC1_P2/B73.bam       /scratch/ambient_out
-SC1_P2  Mo17    /data/SC1_P2/Mo17.bam      /scratch/ambient_out
+sample        genome  bam                         workdir
+B73Mo17_rep1  B73     /data/SC1_P1/B73.bam       /scratch/ambient_out
+SB73Mo17_rep1 Mo17    /data/SC1_P1/Mo17.bam      /scratch/ambient_out
+B73Mo17_rep1  B73     /data/SC1_P2/B73.bam       /scratch/ambient_out
+B73Mo17_rep1  Mo17    /data/SC1_P2/Mo17.bam      /scratch/ambient_out
 ```
 run
 ```bash
@@ -125,10 +125,11 @@ If your library is split into **pools** (e.g. plates/wells with subsets of genot
 Run each pool end-to-end; the summary treats the genomes listed for that sample as the **in-pool** set.
 Then, optionally, run an **inter-pool** comparison across multiple pools.
 
+
 ### 1) Per-pool run (one pool = one sample)
 ```bash
 ambientmapper run \
-  --sample P01_A \
+  --sample B73Mo17_A \
   --genome B73,Mo17 \
   --bam /bam/B73.bam,/bam/Mo17.bam \
   --workdir ./ambient_out \
@@ -138,7 +139,7 @@ ambientmapper run \
   --with-summary \
   --xa-max 2
 ```
-Repeat for other pools (e.g. P01_B, P02_A, …).
+Repeat for other pools (e.g. B73Mo17_A, B73Mo17_B, …).
 
 ### 2) Inter-pool comparison (after multiple pools are run)
 Use a TSV listing all pool runs. **Headers must be lowercase** and include these columns:
@@ -146,12 +147,14 @@ Use a TSV listing all pool runs. **Headers must be lowercase** and include these
 configs/samples.tsv
 
 ```tsv
-sample  genome  bam                 workdir
-P01_A   B73     /bam/B73.bam        ./ambient_out
-P01_A   Mo17    /bam/Mo17.bam       ./ambient_out
-P01_B   B73     /bam/B73.bam        ./ambient_out
-P01_B   W22     /bam/W22.bam        ./ambient_out
+sample      genome   bam                 workdir
+B73Mo17_A   B73     /bam/B73.bam        ./ambient_out
+B73Mo17_A   Mo17    /bam/Mo17.bam       ./ambient_out
+B73Mo17_B   B73     /bam/B73.bam        ./ambient_out
+B73Mo17_B   W22     /bam/W22.bam        ./ambient_out
 ```
+Note: Each sample line corresponds to one genome BAM mapping for that pool.
+
 Now aggregate:
 ```bash
 ambientmapper interpool \
@@ -194,8 +197,14 @@ ambientmapper merge  -c configs/example.json -t 16
 # after ambientmapper run / merge
 ambientmapper summarize -c configs/example.json --xa-max 2
 # (add --pool-design configs/pools.tsv if you have pools)**
-  
 ```
+
+#### Note on stepwise commands ####
+The step-by-step subcommands (`extract`, `filter`, `chunks`, `assign`, `merge`, etc.) currently accept only **Mode A** (`--config JSON`).
+If you prefer inline arguments (Mode B) or TSV (Mode C), please use the top-level `ambientmapper run` command, which supports all three modes.
+Advanced parameter tuning (e.g. `alpha`, `k`, `assign.chunksize`) should be specified inside the JSON config under the "assign" block, and implemeted on the top-level options. 
+  
+
 
 ### What the steps do (brief)
 
@@ -211,9 +220,10 @@ ambientmapper summarize -c configs/example.json --xa-max 2
   Build BC chunk files to cap memory (size controlled by `--chunk-size-cells`).
 
 - **assign**
-  For reads in each chunk, pick the genome “winner” per read by sorting:
-  - AS (desc), then MAPQ (desc), then NM (asc).
-    Writes per-read winners.
+  Modular assign: learn edges (global), learn ECDFs (global), then score each chunk (parallel).
+  - Uses AS, then MAPQ (desc), then NM (asc).
+    Writes remove clear low quality aligments per-read
+  - Note: `ambientmapper-assign` exposes low-level developer commands (learn-edges, learn-ecdfs, score-chunk) for debugging or advanced use.
 
 - **merge**
   Combine per-chunk winners `→ final/<sample>_per_read_winner.tsv.gz.`
@@ -239,7 +249,11 @@ ambientmapper summarize -c configs/example.json --xa-max 2
   - --threads parallelizes per-genome (extract/filter) and per-chunk (assign). Adjust --chunk-size-cells to manage memory.
 
 ## Troubleshooting
-- Reduce --threads or chunk_size_cells if you hit RAM limits.
+- If you hit RAM limits:
+    - Lower `--threads`
+    - Lower `chunk_size_cells` (fewer cells per chunk).
+    - Lower `assign.chunksize` (default 500,000 rows per read_csv call).
+
 - Prefer fast local/scratch disk for workdir.
 - If conda channels cause issues:
 ```
