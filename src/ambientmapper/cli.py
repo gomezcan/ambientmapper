@@ -239,6 +239,9 @@ def assign(
     """
     Modular assign: learn edges (global), learn ECDFs (global), then score each chunk (parallel).
     """
+
+    from .assign_streaming import learn_edges, learn_ecdfs, score_chunk
+
     cfg = json.loads(Path(config).read_text())
     workdir = Path(cfg["workdir"])
     sample  = cfg["sample"]
@@ -257,12 +260,12 @@ def assign(
     exp_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) global models
-    learn_edges.callback(  # type: ignore
+    learn_edges (  # type: ignore
         workdir=workdir, sample=sample, chunks_dir=chunks_dir,
         out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max,
         chunksize=chunksize, k=k
     )
-    learn_ecdfs.callback(  # type: ignore
+    learn_ecdfs (  # type: ignore
         workdir=workdir, sample=sample, chunks_dir=chunks_dir,
         edges_model=edges_npz, out_model=ecdf_npz,
         mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize
@@ -275,7 +278,7 @@ def assign(
         raise typer.Exit(code=2)
 
     def run_one(chf: Path):
-        return score_chunk.callback(  # type: ignore
+        return score_chunk (  # type: ignore
             workdir=workdir, sample=sample, chunk_file=chf, ecdf_model=ecdf_npz,
             out_raw_dir=None, out_filtered_dir=None,
             mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize, alpha=alpha,
