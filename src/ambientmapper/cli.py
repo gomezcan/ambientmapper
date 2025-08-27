@@ -3,8 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import json, csv
+import json, concurrent.futures as cf
 from typing import Dict, List
 import typer
+
+
 
 app = typer.Typer(help="ambientmapper: local-first ambient cleaning pipeline")
 
@@ -88,12 +91,12 @@ def _cfgs_from_tsv(tsv: Path, min_barcode_freq: int, chunk_size_cells: int) -> L
     return cfgs
 
 def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
-    # Lazy import step functions so `ambientmapper --help` stays fast
+    # Lazy imports
     from .extract import bam_to_qc
     from .filtering import filter_qc_file
     from .chunks import make_barcode_chunks
-    from .assign import assign_winners_for_chunk
     from .merge import merge_chunk_outputs
+    from .assign_streaming import learn_edges, learn_ecdfs, score_chunk
 
     d = _cfg_dirs(cfg); _ensure_dirs(d)
     genomes = sorted(cfg["genomes"].items())
@@ -118,20 +121,59 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
         for f in as_completed(futs): f.result()
 
     # 25) chunks
+    typer.echo("[run] chunks: creating per-BC subsets…")
     make_barcode_chunks(d["filtered"], d["chunks"], cfg["sample"], int(cfg["chunk_size_cells"]))
 
-    # 30) assign (parallel over chunks)
-    chunk_files = sorted(d["chunks"].glob(f"{cfg['sample']}_cell_map_ref_chunk_*.txt"))
-    with ProcessPoolExecutor(max_workers=_clamp(threads, 1, len(chunk_files))) as ex:
-        futs = []
-        for ch in chunk_files:
-            out = d["chunks"] / ch.name.replace("_cell_map_ref_chunk_", "_cell_genotype_reads_chunk_")
-            futs.append(ex.submit(assign_winners_for_chunk, d["filtered"], ch, out))
-        for f in as_completed(futs): f.result()
+    # 30) assign (learn global models once, then score chunks in parallel)
+    typer.echo("[run] assign: learning edges/ECDFs & scoring chunks…")
+    aconf      = cfg.get("assign", {}) if isinstance(cfg.get("assign"), dict) else {}
+    alpha      = float(aconf.get("alpha", 0.05))
+    k          = int(aconf.get("k", 10))
+    mapq_min   = int(aconf.get("mapq_min", 20))
+    xa_max     = int(aconf.get("xa_max", 2))
+    chunksize  = int(aconf.get("chunksize", 500_000))  # default 0.5M rows
+    chunks_dir = d["chunks"]
+
+    exp_dir   = d["root"] / "ExplorationReadLevel"
+    edges_npz = exp_dir / "global_edges.npz"
+    ecdf_npz  = exp_dir / "global_ecdf.npz"
+    exp_dir.mkdir(parents=True, exist_ok=True)
+
+    # IMPORTANT: pass workdir that contains <sample>/ (parent of d["root"])
+    pool_workdir = d["root"].parent
+
+    # learn global models (serial)
+    learn_edges(
+        workdir=pool_workdir, sample=cfg["sample"], chunks_dir=chunks_dir,
+        out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max,
+        chunksize=chunksize, k=k
+    )
+    learn_ecdfs(
+        workdir=pool_workdir, sample=cfg["sample"], chunks_dir=chunks_dir,
+        edges_model=edges_npz, out_model=ecdf_npz,
+        mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize
+    )
+
+    # score each chunk (parallel)
+    chunk_files = sorted(chunks_dir.glob(f"{cfg['sample']}_cell_map_ref_chunk_*.txt"))
+    if not chunk_files:
+        typer.echo(f"[assign] No chunk files in {chunks_dir}")
+        return
+
+    def _score_one(chf: Path):
+        return score_chunk(
+            workdir=pool_workdir, sample=cfg["sample"], chunk_file=chf, ecdf_model=ecdf_npz,
+            out_raw_dir=None, out_filtered_dir=None,
+            mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize, alpha=alpha
+        )
+
+    with cf.ThreadPoolExecutor(max_workers=min(threads, len(chunk_files), 36)) as ex:
+        list(ex.map(_score_one, chunk_files))
 
     # 40) merge
     out = d["final"] / f"{cfg['sample']}_per_read_winner.tsv.gz"
     merge_chunk_outputs(d["chunks"], cfg["sample"], out)
+
 
 # ----------------
 # Stepwise commands (optional)
@@ -170,21 +212,62 @@ def chunks(config: Path = typer.Option(..., "--config", "-c", exists=True, reada
     n = make_barcode_chunks(d["filtered"], d["chunks"], cfg["sample"], int(cfg["chunk_size_cells"]))
     typer.echo(f"[chunks] wrote {n} chunk files")
 
+
 @app.command()
-def assign(config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
-           threads: int = typer.Option(4, "--threads", "-t", min=1)):
-    from .assign import assign_winners_for_chunk
-    cfg = json.loads(Path(config).read_text()); d = _cfg_dirs(cfg); _ensure_dirs(d)
-    chunks = sorted(d["chunks"].glob(f"{cfg['sample']}_cell_map_ref_chunk_*.txt"))
-    if not chunks:
-        typer.echo("[assign] no chunk files"); return
-    with ProcessPoolExecutor(max_workers=_clamp(threads, 1, len(chunks))) as ex:
-        futs=[]
-        for ch in chunks:
-            out = d["chunks"]/ch.name.replace("_cell_map_ref_chunk_","_cell_genotype_reads_chunk_")
-            futs.append(ex.submit(assign_winners_for_chunk, d["filtered"], ch, out))
-        for f in as_completed(futs): f.result()
-    typer.echo("[assign] done")
+def assign(
+    config: Path = typer.Option(..., "-c", "--config", exists=True),
+    threads: int = typer.Option(16, "-t", "--threads"),
+):
+    """
+    Modular assign: learn edges (global), learn ECDFs (global), then score each chunk (parallel).
+    """
+    cfg = json.loads(Path(config).read_text())
+    workdir = Path(cfg["workdir"])
+    sample  = cfg["sample"]
+    aconf   = cfg.get("assign", {})
+    alpha      = float(aconf.get("alpha", 0.05))
+    k          = int(aconf.get("k", 10))
+    mapq_min   = int(aconf.get("mapq_min", 20))
+    xa_max     = int(aconf.get("xa_max", 2))
+    chunksize  = int(aconf.get("chunksize", 500_000))  # default 0.5M
+    chunks_dir = Path(workdir) / sample / aconf.get("chunks_dir", "cell_map_ref_chunks")
+
+    # model paths
+    exp_dir   = Path(workdir) / sample / "ExplorationReadLevel"
+    edges_npz = exp_dir / "global_edges.npz"
+    ecdf_npz  = exp_dir / "global_ecdf.npz"
+    exp_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) global models
+    learn_edges.callback(  # type: ignore
+        workdir=workdir, sample=sample, chunks_dir=chunks_dir,
+        out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max,
+        chunksize=chunksize, k=k
+    )
+    learn_ecdfs.callback(  # type: ignore
+        workdir=workdir, sample=sample, chunks_dir=chunks_dir,
+        edges_model=edges_npz, out_model=ecdf_npz,
+        mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize
+    )
+
+    # 2) per-chunk scoring in parallel
+    chunk_files = sorted(chunks_dir.glob("*_cell_map_ref_chunk_*.txt"))
+    if not chunk_files:
+        typer.echo(f"[assign] No chunk files in {chunks_dir}")
+        raise typer.Exit(code=2)
+
+    def run_one(chf: Path):
+        return score_chunk.callback(  # type: ignore
+            workdir=workdir, sample=sample, chunk_file=chf, ecdf_model=ecdf_npz,
+            out_raw_dir=None, out_filtered_dir=None,
+            mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize, alpha=alpha,
+        )
+
+    with cf.ThreadPoolExecutor(max_workers=threads) as ex:
+        list(ex.map(run_one, chunk_files))
+
+    typer.echo(f"[assign] Done. Models in {exp_dir}. Outputs in raw_cell_map_ref_chunks/ and cell_map_ref_chunks/")
+
 
 @app.command()
 def merge(config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True)):
