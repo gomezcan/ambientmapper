@@ -203,7 +203,41 @@ ambientmapper summarize -c configs/example.json --xa-max 2
 The step-by-step subcommands (`extract`, `filter`, `chunks`, `assign`, `merge`, etc.) currently accept only **Mode A** (`--config JSON`).
 If you prefer inline arguments (Mode B) or TSV (Mode C), please use the top-level `ambientmapper run` command, which supports all three modes.
 Advanced parameter tuning (e.g. `alpha`, `k`, `assign.chunksize`) should be specified inside the JSON config under the "assign" block, and implemeted on the top-level options. 
-  
+Note: If nothing is provided, defaults are: `alpha=0.05`, `k=10`, `mapq_min=20`, `xa_max=2`, `chunksize=500000`.
+
+- **Mode A (JSON + override flags):**
+  ```bash
+  ambientmapper run -c configs/example.json \
+  --assign-alpha 0.01 \
+  --assign-k 8 \
+  --assign-mapq-min 30 \
+  --assign-xa-max 1 \
+  --assign-chunksize 250000 \
+  -t 16
+  ```
+
+- **Mode B (inline):**
+  ```
+  ambientmapper run \
+  --sample PoolA \
+  --genome G1,G2 \
+  --bam /bam/G1.bam,/bam/G2.bam \
+  --workdir /scratch/out \
+  --min-barcode-freq 10 \
+  --chunk-size-cells 5000 \
+  --assign-alpha 0.02 \
+  --assign-chunksize 300000 \
+  -t 16
+  ```
+- **Mode C (TSV):**  
+  ```
+  ambientmapper run \
+  --configs configs/samples.tsv \
+  --assign-alpha 0.05 \
+  --assign-k 10 \
+  --assign-chunksize 500000 \
+  -t 32
+  ```
 
 
 ### What the steps do (brief)
