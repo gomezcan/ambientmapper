@@ -90,6 +90,24 @@ def _cfgs_from_tsv(tsv: Path, min_barcode_freq: int, chunk_size_cells: int) -> L
         })
     return cfgs
 
+def _apply_assign_overrides(cfg: Dict[str, object],
+                            alpha: float | None = None,
+                            k: int | None = None,
+                            mapq_min: int | None = None,
+                            xa_max: int | None = None,
+                            chunksize: int | None = None) -> None:
+    """Ensure cfg['assign'] exists and apply CLI overrides if provided."""
+    assign = cfg.get("assign")
+    if not isinstance(assign, dict):
+        assign = {}
+        cfg["assign"] = assign
+    if alpha      is not None: assign["alpha"] = float(alpha)
+    if k          is not None: assign["k"] = int(k)
+    if mapq_min   is not None: assign["mapq_min"] = int(mapq_min)
+    if xa_max     is not None: assign["xa_max"] = int(xa_max)
+    if chunksize  is not None: assign["chunksize"] = int(chunksize)
+
+
 def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     # Lazy imports
     from .extract import bam_to_qc
@@ -338,13 +356,16 @@ def plate(
 def run(
     # mode A: single JSON
     config: Path = typer.Option(None, "--config", "-c", exists=True, readable=True, help="Single JSON config"),
+    
     # mode B: inline one-sample
     sample: str = typer.Option(None, "--sample", help="Sample name"),
     genome: str = typer.Option(None, "--genome", help="Comma-separated genome names (e.g. B73,Mo17)"),
     bam: str = typer.Option(None, "--bam", help="Comma-separated BAM paths, same order as --genome"),
     workdir: Path = typer.Option(None, "--workdir", help="Output root directory"),
+    
     # mode C: many samples from TSV
     configs: Path = typer.Option(None, "--configs", help="TSV with: sample, genome, bam, workdir"),
+    
     # common knobs
     min_barcode_freq: int = typer.Option(10, "--min-barcode-freq"),
     chunk_size_cells: int = typer.Option(5000, "--chunk-size-cells"),
@@ -355,6 +376,13 @@ def run(
     pool_design: Path = typer.Option(None, "--pool-design", exists=True, readable=True,
                                      help="TSV with columns: Genome, Pool [optional: Plate]"),
     xa_max: int = typer.Option(2, "--xa-max", help="Keep winners with XAcount <= xa_max in summary; set -1 to disable"),
+        # NEW: assign overrides (apply in ALL modes if provided)
+    assign_alpha: float = typer.Option(None, "--assign-alpha", help="Override assign.alpha (e.g., 0.05)"),
+    assign_k: int = typer.Option(None, "--assign-k", help="Override assign.k deciles (default 10)"),
+    assign_mapq_min: int = typer.Option(None, "--assign-mapq-min", help="Override assign.mapq_min (default 20)"),
+    assign_xa_max: int = typer.Option(None, "--assign-xa-max", help="Override assign.xa_max (default 2)"),
+    assign_chunksize: int = typer.Option(None, "--assign-chunksize",
+                                         help="Override assign.chunksize rows per read_csv (default 500000)"),
 ):
     """
     Run the pipeline.
@@ -415,20 +443,29 @@ def run(
 
 
     if config:
-        cfg = json.loads(Path(config).read_text())
-        _do_one(cfg)
-        raise typer.Exit()
+    cfg = json.loads(Path(config).read_text())
+    _apply_assign_overrides(cfg,
+        alpha=assign_alpha, k=assign_k, mapq_min=assign_mapq_min,
+        xa_max=assign_xa_max, chunksize=assign_chunksize)
+    _do_one(cfg)
+    raise typer.Exit()
 
     if inline_ready:
-        cfg = _cfg_from_inline(sample, genome, bam, str(workdir), min_barcode_freq, chunk_size_cells)
-        _do_one(cfg)
-        raise typer.Exit()
+    cfg = _cfg_from_inline(sample, genome, bam, str(workdir), min_barcode_freq, chunk_size_cells)
+    _apply_assign_overrides(cfg,
+        alpha=assign_alpha, k=assign_k, mapq_min=assign_mapq_min,
+        xa_max=assign_xa_max, chunksize=assign_chunksize)
+    _do_one(cfg)
+    raise typer.Exit()
 
     if configs:
-        batch = _cfgs_from_tsv(configs, min_barcode_freq, chunk_size_cells)
-        if not batch:
-            typer.echo("[run] no configs found in TSV"); raise typer.Exit(0)
-        for cfg in batch:
-            typer.echo(f"[run] starting {cfg['sample']}")
-            _do_one(cfg)
-        raise typer.Exit()
+    batch = _cfgs_from_tsv(configs, min_barcode_freq, chunk_size_cells)
+    if not batch:
+        typer.echo("[run] no configs found in TSV"); raise typer.Exit(0)
+    for cfg in batch:
+        _apply_assign_overrides(cfg,
+            alpha=assign_alpha, k=assign_k, mapq_min=assign_mapq_min,
+            xa_max=assign_xa_max, chunksize=assign_chunksize)
+        typer.echo(f"[run] starting {cfg['sample']}")
+        _do_one(cfg)
+    raise typer.Exit()
