@@ -441,25 +441,24 @@ def run(
                 f"discard_reads={out['n_discard_reads']}"
             )
 
-
     if config:
-    cfg = json.loads(Path(config).read_text())
-    _apply_assign_overrides(cfg,
-        alpha=assign_alpha, k=assign_k, mapq_min=assign_mapq_min,
-        xa_max=assign_xa_max, chunksize=assign_chunksize)
-    _do_one(cfg)
+        cfg = json.loads(Path(config).read_text())
+        _apply_assign_overrides(cfg,
+            alpha=assign_alpha, k=assign_k, mapq_min=assign_mapq_min,
+            xa_max=assign_xa_max, chunksize=assign_chunksize)
+        _do_one(cfg)
     raise typer.Exit()
 
     if inline_ready:
-    cfg = _cfg_from_inline(sample, genome, bam, str(workdir), min_barcode_freq, chunk_size_cells)
-    _apply_assign_overrides(cfg,
-        alpha=assign_alpha, k=assign_k, mapq_min=assign_mapq_min,
-        xa_max=assign_xa_max, chunksize=assign_chunksize)
-    _do_one(cfg)
+        cfg = _cfg_from_inline(sample, genome, bam, str(workdir), min_barcode_freq, chunk_size_cells)
+        _apply_assign_overrides(cfg,
+            alpha=assign_alpha, k=assign_k, mapq_min=assign_mapq_min,
+            xa_max=assign_xa_max, chunksize=assign_chunksize)
+        _do_one(cfg)
     raise typer.Exit()
 
     if configs:
-    batch = _cfgs_from_tsv(configs, min_barcode_freq, chunk_size_cells)
+        batch = _cfgs_from_tsv(configs, min_barcode_freq, chunk_size_cells)
     if not batch:
         typer.echo("[run] no configs found in TSV"); raise typer.Exit(0)
     for cfg in batch:
