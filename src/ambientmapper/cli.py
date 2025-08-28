@@ -396,7 +396,7 @@ def run(
     configs: Path = typer.Option(None, "--configs", help="TSV with: sample, genome, bam, workdir"),
     
     # common knobs
-    verbose: bool = typer.Option(True, "--verbose", help="Print per-chunk progress")
+    verbose: bool = typer.Option(True, "--verbose", help="Print per-chunk progress"),
     min_barcode_freq: int = typer.Option(10, "--min-barcode-freq"),
     chunk_size_cells: int = typer.Option(5000, "--chunk-size-cells"),
     threads: int = typer.Option(8, "--threads", "-t", min=1),
