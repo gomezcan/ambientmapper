@@ -6,11 +6,21 @@ import numpy as np
 import pandas as pd
 import typer
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import time
+from threading import Lock
 
 app = typer.Typer(add_completion=False)
 
 # ---------- reuse-friendly helpers ----------
+_LOG_LOCK = Lock()
+
+def _log(msg: str, verbose: bool):
+    if not verbose:
+        return
+    with _LOG_LOCK:
+        # stderr by default; keeps stdout clean for pipelines if needed
+        typer.echo(msg)
+        
 def _chunk_bcs(chunk_file: Path) -> set[str]:
     with open(chunk_file, "r") as f:
         return {ln.strip() for ln in f if ln.strip()}
@@ -52,7 +62,8 @@ def _sum_counts_inplace(dst: DeltaHist, src: DeltaHist):
 # --- MAP workers ---
 
 def _map_winner_hist_for_chunk(workdir: Path, sample: str, chunk_file: Path,
-                               mapq_min: int, xa_max: int, chunksize: int) -> tuple[np.ndarray, np.ndarray]:
+                               mapq_min: int, xa_max: int, chunksize: int,
+                               verbose: bool = True) -> tuple[np.ndarray, np.ndarray]:
     """Return (AS_winner_counts, MAPQ_winner_counts) for this chunk."""
     files = _filtered_files(workdir, sample)
     bcs = _chunk_bcs(chunk_file)
@@ -60,6 +71,12 @@ def _map_winner_hist_for_chunk(workdir: Path, sample: str, chunk_file: Path,
     H_MQ = _new_hist_from_spec(_MQ_RANGE)
 
     rb_map: Dict[tuple[str,str], dict] = {}
+    t0 = time.time()
+    last_log = t0
+    genomes_done = 0
+    reads_kept = 0
+
+    _log(f"[edges-map] ▶ start {chunk_file.name}  BCs={len(bcs)}", verbose)
     for fp in files:
         genome = _genome_from_filename(fp)
         for rows in _iter_read_bc_rows(fp, bcs, chunksize, mapq_min, xa_max):
@@ -74,17 +91,31 @@ def _map_winner_hist_for_chunk(workdir: Path, sample: str, chunk_file: Path,
                     XA=float(row.XAcount) if pd.notna(row.XAcount) else float("inf"),
                 )
                 rb_map[key] = acc
+                per_file_reads += 1
+                per_file_kept  += 1
+            
+            # rate-limit: log every ~30s or every 50 chunks
+            now = time.time()
+            if verbose and (now - last_log > 30 or i % 50 == 0):
+                _log(f"[edges-map] … {chunk_file.name} + {fp.name}  chunks={i}  kept≈{per_file_kept:,}", verbose)
+                last_log = now
+        genomes_done += 1
+        reads_kept   += per_file_kept
+        _log(f"[edges-map] ✓ {chunk_file.name} + {fp.name}  kept={per_file_kept:,}", verbose)
 
     for acc in rb_map.values():
         b1 = acc["best1"]
         if b1 is None: continue
         H_AS.add(b1["AS"]); H_MQ.add(b1["MAPQ"])
 
+    dt = time.time() - t0
+    _log_ok(f"[edges-map] ■ done {chunk_file.name}  genomes={genomes_done}  winners={len(rb_map):,}  kept≈{reads_kept:,}  {dt:0.1f}s", verbose)
     return H_AS.counts, H_MQ.counts  # fixed shapes
 
 def _map_delta_hists_for_chunk(workdir: Path, sample: str, chunk_file: Path,
                                as_edges: np.ndarray, mq_edges: np.ndarray, k: int,
-                               mapq_min: int, xa_max: int, chunksize: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                               mapq_min: int, xa_max: int, chunksize: int,
+                               verbose: bool = True) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Return stacked counts for ΔAS and ΔMAPQ per decile.
     Shapes:
@@ -95,11 +126,13 @@ def _map_delta_hists_for_chunk(workdir: Path, sample: str, chunk_file: Path,
     """
     files = _filtered_files(workdir, sample)
     bcs = _chunk_bcs(chunk_file)
-
     H_dAS = [ _new_hist_from_spec((0.0, 100.0, 200)) for _ in range(k) ]
     H_dMQ = [ _new_hist_from_spec((0.0,  60.0, 120)) for _ in range(k) ]
-
     rb_map: Dict[tuple[str,str], dict] = {}
+    
+    t0 = time.time(); last_log = t0
+    _log(f"[ecdf-map] ▶ start {chunk_file.name}  BCs={len(bcs)}", verbose)
+                                   
     for fp in files:
         genome = _genome_from_filename(fp)
         for rows in _iter_read_bc_rows(fp, bcs, chunksize, mapq_min, xa_max):
@@ -114,7 +147,17 @@ def _map_delta_hists_for_chunk(workdir: Path, sample: str, chunk_file: Path,
                     XA=float(row.XAcount) if pd.notna(row.XAcount) else float("inf"),
                 )
                 rb_map[key] = acc
+                per_file_kept += 1
+            
+            now = time.time()
+            if verbose and (now - last_log > 30 or i % 50 == 0):
+                _log(f"[ecdf-map] … {chunk_file.name} + {fp.name}  chunks={i}  kept≈{per_file_kept:,}", verbose)
+                last_log = now
+        
+        _log(f"[ecdf-map] ✓ {chunk_file.name} + {fp.name}  kept={per_file_kept:,}", verbose)
 
+    # fill histograms
+    pairs = 0
     for acc in rb_map.values():
         b1, b2 = acc["best1"], acc.get("best2")
         if b1 is None or b2 is None: continue
@@ -124,7 +167,11 @@ def _map_delta_hists_for_chunk(workdir: Path, sample: str, chunk_file: Path,
         dec_mq = int(assign_decile(np.array([b1["MAPQ"]]), mq_edges)[0]) if mq_edges.size else 1
         if 1 <= dec_as <= k: H_dAS[dec_as-1].add(dAS)
         if 1 <= dec_mq <= k: H_dMQ[dec_mq-1].add(dMQ)
+        pairs += 1
 
+    df = time.time() - t0
+    _log_ok(f"[ecdf-map] ■ done {chunk_file.name}  pairs={pairs:,}  {dt:0.1f}s", verbose)
+                                   
     dAS_counts = np.stack([H.counts for H in H_dAS], axis=0)
     dAS_over   = np.array([H.overflow for H in H_dAS], dtype=np.int64)
     dMQ_counts = np.stack([H.counts for H in H_dMQ], axis=0)
@@ -250,7 +297,7 @@ def learn_edges(
 
     def learn_edges_parallel(workdir: Path, sample: str, chunks_dir: Path,
                          out_model: Path | None, mapq_min: int, xa_max: int, chunksize: int, k: int,
-                         threads: int = 8) -> Path:
+                         threads: int = 8, verbose: bool = True) -> Path:
         """Parallel map-reduce: per-chunk winner histograms → global decile edges."""
         chunk_files = sorted(Path(chunks_dir).glob(f"{sample}_cell_map_ref_chunk_*.txt"))
         if not chunk_files: raise typer.BadParameter(f"No chunk files under {chunks_dir}")
@@ -259,25 +306,23 @@ def learn_edges(
         as_counts = np.zeros(_AS_RANGE[2], dtype=np.int64)
         mq_counts = np.zeros(_MQ_RANGE[2], dtype=np.int64)
 
-    def _worker(chf: Path):
-        return _map_winner_hist_for_chunk(workdir, sample, chf, mapq_min, xa_max, chunksize)
+        def _worker(chf: Path):
+            return _map_winner_hist_for_chunk(workdir, sample, chf, mapq_min, xa_max, chunksize)
         
-    total = len(chunk_files)
-    typer.echo(f"[assign/edges] start: {total} chunks, threads={min(threads, total)}")
-    with ThreadPoolExecutor(max_workers=min(threads, total)) as ex:
-        fut = {ex.submit(_worker, ch): ch for ch in chunk_files}
-        done = 0
-        for f in as_completed(fut):
-            ch = fut[f]
-            try:
+        total = len(chunk_files)
+        _log(f"[assign/edges] start: {total} chunks, threads={min(threads, total)}", verbose)
+        with ThreadPoolExecutor(max_workers=min(threads, total)) as ex:
+            fut = {ex.submit(_worker, ch): ch for ch in chunk_files}
+            done = 0
+            for f in as_completed(fut):
+                ch = fut[f]                
                 as_c, mq_c = f.result()
                 as_counts += as_c; mq_counts += mq_c
-            except Exception as e:
-                typer.echo(f"[assign/edges][ERROR] {ch.name}: {e}")
-                raise
                 done += 1
-                if done % 5 == 0 or done == total:
-                    typer.echo(f"[assign/edges] {done}/{total} chunks")
+                if verbose and (done % 5 == 0 or done == total):
+                    _log(f"[assign/edges] {done}/{total} chunks", verbose)
+        _log_ok(f"[assign/edges] done → {model_path}", verbose)
+        return model_pat
         
     as_edges, mq_edges = _edges_from_hist_counts(as_counts, mq_counts, k)
     model_path = out_model or (Path(workdir)/sample/"ExplorationReadLevel"/"global_edges.npz")
@@ -346,58 +391,51 @@ def learn_ecdfs(
     np.savez_compressed(model_path, **payload)
     typer.echo(f"[assign/ecdf] saved {model_path}")
 
-def learn_ecdfs_parallel(workdir: Path, sample: str, chunks_dir: Path,
-                         edges_model: Path, out_model: Path | None,
-                         mapq_min: int, xa_max: int, chunksize: int, threads: int = 8) -> Path:
-    """Parallel map-reduce: per-chunk per-decile Δ hist → global Δ ECDF hist model."""
-    dat = np.load(edges_model)
-    as_edges, mq_edges, k = dat["as_edges"], dat["mq_edges"], int(dat["k"])
-
+def learn_edges_parallel(
+    workdir: Path, sample: str, chunks_dir: Path,
+    out_model: Path | None, mapq_min: int, xa_max: int, chunksize: int, k: int,
+    threads: int = 8, verbose: bool = True
+) -> Path:
+    """Parallel map-reduce: per-chunk winner histograms → global decile edges."""
     chunk_files = sorted(Path(chunks_dir).glob(f"{sample}_cell_map_ref_chunk_*.txt"))
-    if not chunk_files: raise typer.BadParameter(f"No chunk files under {chunks_dir}")
+    if not chunk_files:
+        raise typer.BadParameter(f"No chunk files under {chunks_dir}")
 
     # reduce buffers
-    Htmp_AS = _new_hist_from_spec((0.0, 100.0, 200))
-    Htmp_MQ = _new_hist_from_spec((0.0, 60.0, 120))
-    dAS_counts = np.zeros((k, Htmp_AS.nbins), dtype=np.int64)
-    dAS_over   = np.zeros((k,), dtype=np.int64)
-    dMQ_counts = np.zeros((k, Htmp_MQ.nbins), dtype=np.int64)
-    dMQ_over   = np.zeros((k,), dtype=np.int64)
+    as_counts = np.zeros(_AS_RANGE[2], dtype=np.int64)
+    mq_counts = np.zeros(_MQ_RANGE[2], dtype=np.int64)
 
     def _worker(chf: Path):
-        return _map_delta_hists_for_chunk(workdir, sample, chf, as_edges, mq_edges, k,
-                                          mapq_min, xa_max, chunksize)
-        total = len(chunk_files)
-        typer.echo(f"[assign/ecdf] start: {total} chunks, threads={min(threads, total)}")
-        with ThreadPoolExecutor(max_workers=min(threads, total)) as ex:
-            fut = {ex.submit(_worker, ch): ch for ch in chunk_files}
-            done = 0
-            for f in as_completed(fut):
-                ch = fut[f]
-                try:
-                    das, daso, dmq, dmqo = f.result()
-                    dAS_counts += das; dAS_over += daso
-                    dMQ_counts += dmq; dMQ_over += dmqo
-                except Exception as e:
-                    typer.echo(f"[assign/ecdf][ERROR] {ch.name}: {e}")
-                    raise
-                done += 1
-                if done % 5 == 0 or done == total:
-                    typer.echo(f"[assign/ecdf] {done}/{total} chunks")
+        # pass verbose if you added per-worker logs inside the mapper
+        return _map_winner_hist_for_chunk(workdir, sample, chf, mapq_min, xa_max, chunksize, verbose=verbose)
 
-        payload = {
-            "k": np.array(k),
-            "as_edges": as_edges, "mq_edges": mq_edges,
-            "dAS_lo": np.array([0.0]), "dAS_hi": np.array([100.0]), "dAS_nbins": np.array([Htmp_AS.nbins]),
-            "dMQ_lo": np.array([0.0]), "dMQ_hi": np.array([ 60.0]), "dMQ_nbins": np.array([Htmp_MQ.nbins]),
-            "dAS_counts": dAS_counts, "dAS_overflow": dAS_over,
-            "dMQ_counts": dMQ_counts, "dMQ_overflow": dMQ_over,
-        }
-        model_path = out_model or (Path(workdir)/sample/"ExplorationReadLevel"/"global_ecdf.npz")
-        model_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(model_path, **payload)
-        return model_path
-                             
+    total = len(chunk_files)
+    _log(f"[assign/edges] start: {total} chunks, threads={min(threads, total)}", verbose)
+
+    with ThreadPoolExecutor(max_workers=min(threads, total)) as ex:
+        fut = {ex.submit(_worker, ch): ch for ch in chunk_files}
+        done = 0
+        for f in as_completed(fut):
+            ch = fut[f]
+            try:
+                as_c, mq_c = f.result()
+                as_counts += as_c
+                mq_counts += mq_c
+            except Exception as e:
+                _log_err(f"[assign/edges][ERROR] {ch.name}: {e}", verbose=True)
+                raise
+            done += 1
+            if verbose and (done % 5 == 0 or done == total):
+                _log(f"[assign/edges] {done}/{total} chunks", verbose)
+
+    # finalize model
+    as_edges, mq_edges = _edges_from_hist_counts(as_counts, mq_counts, k)
+    model_path = out_model or (Path(workdir) / sample / "ExplorationReadLevel" / "global_edges.npz")
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(model_path, as_edges=as_edges, mq_edges= mq_edges, k=k)
+    _log_ok(f"[assign/edges] done → {model_path}", verbose)
+    return model_path
+    
 def edges_from_hist(H: DeltaHist, k: int) -> np.ndarray:
     counts = H.counts.astype(np.int64)
     if counts.sum() == 0: return np.array([])
