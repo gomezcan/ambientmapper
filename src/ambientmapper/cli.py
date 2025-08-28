@@ -276,12 +276,40 @@ def assign(
         typer.echo(f"[assign] No chunk files in {chunks_dir}")
         raise typer.Exit(code=2)
 
-    def run_one(chf: Path):
-        return score_chunk (  # type: ignore
-            workdir=workdir, sample=sample, chunk_file=chf, ecdf_model=ecdf_npz,
-            out_raw_dir=None, out_filtered_dir=None,
-            mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize, alpha=alpha,
-        )
+@@
+-    def run_one(chf: Path):
+-        return score_chunk(
+-            workdir=workdir, sample=sample, chunk_file=chf, ecdf_model=ecdf_npz,
+-            out_raw_dir=None, out_filtered_dir=None,
+-            mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize, alpha=alpha,
+-        )
+-
+-    with cf.ThreadPoolExecutor(max_workers=threads) as ex:
+-        list(ex.map(run_one, chunk_files))
++    typer.echo(f"[assign/score] start: {len(chunk_files)} chunks, threads={min(threads, len(chunk_files))}")
++    with cf.ThreadPoolExecutor(max_workers=min(threads, len(chunk_files))) as ex:
++        fut = {
++            ex.submit(
++                score_chunk,
++                workdir=workdir, sample=sample, chunk_file=chf, ecdf_model=ecdf_npz,
++                out_raw_dir=None, out_filtered_dir=None,
++                mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize, alpha=alpha,
++            ): chf
++            for chf in chunk_files
++        }
++        done = 0; total = len(fut)
++        for f in cf.as_completed(fut):
++            ch = fut[f]
++            try:
++                f.result()
++            except Exception as e:
++                typer.echo(f"[assign/score][ERROR] {ch.name}: {e}")
++                raise
++            done += 1
++            if done % 5 == 0 or done == total:
++                typer.echo(f"[assign/score] {done}/{total} chunks")
++    typer.echo("[assign/score] done")
+
 
     with cf.ThreadPoolExecutor(max_workers=threads) as ex:
         list(ex.map(run_one, chunk_files))
