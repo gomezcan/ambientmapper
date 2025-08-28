@@ -401,15 +401,15 @@ def learn_ecdfs_parallel(workdir: Path, sample: str, chunks_dir: Path,
 def edges_from_hist(H: DeltaHist, k: int) -> np.ndarray:
     counts = H.counts.astype(np.int64)
     if counts.sum() == 0: return np.array([])
-        cum = np.cumsum(counts)
-        tot = int(cum[-1] + H.overflow)
-        targets = (np.linspace(0, 1, k + 1)[1:-1] * tot).astype(int)
-        edges = []
-        for t in targets:
-            idx = int(np.searchsorted(cum, t, side="left"))
-            idx = min(max(idx, 0), H.nbins - 1)
-            edges.append(H.edges[idx])
-        return np.unique(np.array(edges, dtype=float))
+    cum = np.cumsum(counts)
+    tot = int(cum[-1] + H.overflow)
+    targets = (np.linspace(0, 1, k + 1)[1:-1] * tot).astype(int)
+    edges = []
+    for t in targets:
+        idx = int(np.searchsorted(cum, t, side="left"))
+        idx = min(max(idx, 0), H.nbins - 1)
+        edges.append(H.edges[idx])
+    return np.unique(np.array(edges, dtype=float))
 
     as_edges, mq_edges = edges_from_hist(H_AS, k), edges_from_hist(H_MQ, k)
     model_path = out_model or (Path(workdir)/sample/"ExplorationReadLevel"/"global_edges.npz")
