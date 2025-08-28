@@ -5,6 +5,8 @@ from typing import Dict, Tuple, Optional, Iterable
 import numpy as np
 import pandas as pd
 import typer
+from concurrent.futures import ThreadPoolExecutor
+
 
 app = typer.Typer(add_completion=False)
 
@@ -34,6 +36,122 @@ def _pick_best_two_and_worst(acc: dict, genome: str, AS: float, MAPQ: float, NM:
     else:
         b2 = acc.get("best2")
         if b2 is None or cand["key"] < b2["key"]: acc["best2"] = cand
+
+# --- NEW: fixed bin specs so all workers align ---
+_AS_RANGE = (0.0, 200.0, 2000)   # lo, hi, nbins (tune if needed)
+_MQ_RANGE = (0.0,  60.0,  120)
+
+def _new_hist_from_spec(spec):
+    lo, hi, nb = spec
+    return DeltaHist(lo=lo, hi=hi, nbins=nb)
+
+def _sum_counts_inplace(dst: DeltaHist, src: DeltaHist):
+    dst.counts += src.counts
+    dst.overflow += src.overflow
+
+# --- MAP workers ---
+
+def _map_winner_hist_for_chunk(workdir: Path, sample: str, chunk_file: Path,
+                               mapq_min: int, xa_max: int, chunksize: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return (AS_winner_counts, MAPQ_winner_counts) for this chunk."""
+    files = _filtered_files(workdir, sample)
+    bcs = _chunk_bcs(chunk_file)
+    H_AS = _new_hist_from_spec(_AS_RANGE)
+    H_MQ = _new_hist_from_spec(_MQ_RANGE)
+
+    rb_map: Dict[tuple[str,str], dict] = {}
+    for fp in files:
+        genome = _genome_from_filename(fp)
+        for rows in _iter_read_bc_rows(fp, bcs, chunksize, mapq_min, xa_max):
+            for row in rows:
+                key = (str(row.Read), str(row.BC))
+                acc = rb_map.get(key) or {"best1": None, "best2": None, "worst": None, "seen_g": set()}
+                _pick_best_two_and_worst(
+                    acc, genome,
+                    AS=float(row.AS) if pd.notna(row.AS) else float("-inf"),
+                    MAPQ=float(row.MAPQ) if pd.notna(row.MAPQ) else float("-inf"),
+                    NM=float(row.NM) if pd.notna(row.NM) else float("inf"),
+                    XA=float(row.XAcount) if pd.notna(row.XAcount) else float("inf"),
+                )
+                rb_map[key] = acc
+
+    for acc in rb_map.values():
+        b1 = acc["best1"]
+        if b1 is None: continue
+        H_AS.add(b1["AS"]); H_MQ.add(b1["MAPQ"])
+
+    return H_AS.counts, H_MQ.counts  # fixed shapes
+
+def _map_delta_hists_for_chunk(workdir: Path, sample: str, chunk_file: Path,
+                               as_edges: np.ndarray, mq_edges: np.ndarray, k: int,
+                               mapq_min: int, xa_max: int, chunksize: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Return stacked counts for ΔAS and ΔMAPQ per decile.
+    Shapes:
+      dAS_counts: (k, nbins_AS)
+      dAS_overflow: (k,)
+      dMQ_counts: (k, nbins_MQ)
+      dMQ_overflow: (k,)
+    """
+    files = _filtered_files(workdir, sample)
+    bcs = _chunk_bcs(chunk_file)
+
+    H_dAS = [ _new_hist_from_spec((0.0, 100.0, 200)) for _ in range(k) ]
+    H_dMQ = [ _new_hist_from_spec((0.0,  60.0, 120)) for _ in range(k) ]
+
+    rb_map: Dict[tuple[str,str], dict] = {}
+    for fp in files:
+        genome = _genome_from_filename(fp)
+        for rows in _iter_read_bc_rows(fp, bcs, chunksize, mapq_min, xa_max):
+            for row in rows:
+                key = (str(row.Read), str(row.BC))
+                acc = rb_map.get(key) or {"best1": None, "best2": None, "worst": None, "seen_g": set()}
+                _pick_best_two_and_worst(
+                    acc, genome,
+                    AS=float(row.AS) if pd.notna(row.AS) else float("-inf"),
+                    MAPQ=float(row.MAPQ) if pd.notna(row.MAPQ) else float("-inf"),
+                    NM=float(row.NM) if pd.notna(row.NM) else float("inf"),
+                    XA=float(row.XAcount) if pd.notna(row.XAcount) else float("inf"),
+                )
+                rb_map[key] = acc
+
+    for acc in rb_map.values():
+        b1, b2 = acc["best1"], acc.get("best2")
+        if b1 is None or b2 is None: continue
+        dAS = b1["AS"] - b2["AS"]
+        dMQ = b1["MAPQ"] - b2["MAPQ"]
+        dec_as = int(assign_decile(np.array([b1["AS"]]), as_edges)[0]) if as_edges.size else 1
+        dec_mq = int(assign_decile(np.array([b1["MAPQ"]]), mq_edges)[0]) if mq_edges.size else 1
+        if 1 <= dec_as <= k: H_dAS[dec_as-1].add(dAS)
+        if 1 <= dec_mq <= k: H_dMQ[dec_mq-1].add(dMQ)
+
+    dAS_counts = np.stack([H.counts for H in H_dAS], axis=0)
+    dAS_over   = np.array([H.overflow for H in H_dAS], dtype=np.int64)
+    dMQ_counts = np.stack([H.counts for H in H_dMQ], axis=0)
+    dMQ_over   = np.array([H.overflow for H in H_dMQ], dtype=np.int64)
+    return dAS_counts, dAS_over, dMQ_counts, dMQ_over
+
+# --- REDUCE helpers ---
+
+def _edges_from_hist_counts(as_counts: np.ndarray, mq_counts: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+    # rebuild temporary hists to get edges
+    H_AS = _new_hist_from_spec(_AS_RANGE); H_AS.counts = as_counts.copy()
+    H_MQ = _new_hist_from_spec(_MQ_RANGE); H_MQ.counts = mq_counts.copy()
+
+    def edges_from_hist(H: DeltaHist, k: int) -> np.ndarray:
+        counts = H.counts.astype(np.int64)
+        if counts.sum() == 0: return np.array([])
+        cum = np.cumsum(counts)
+        tot = int(cum[-1] + H.overflow)
+        targets = (np.linspace(0, 1, k + 1)[1:-1] * tot).astype(int)
+        edges = []
+        for t in targets:
+            idx = int(np.searchsorted(cum, t, side="left"))
+            idx = min(max(idx, 0), H.nbins - 1)
+            edges.append(H.edges[idx])
+        return np.unique(np.array(edges, dtype=float))
+
+    return edges_from_hist(H_AS, k), edges_from_hist(H_MQ, k)
 
 def compute_decile_edges(values: np.ndarray, k: int = 10) -> np.ndarray:
     vals = np.asarray(values, dtype=float)
@@ -129,24 +247,31 @@ def learn_edges(
             if b1 is None: continue
             H_AS.add(b1["AS"]); H_MQ.add(b1["MAPQ"])
 
-    def edges_from_hist(H: DeltaHist, k: int) -> np.ndarray:
-        counts = H.counts.astype(np.int64)
-        if counts.sum() == 0: return np.array([])
-        cum = np.cumsum(counts)
-        tot = int(cum[-1] + H.overflow)
-        targets = (np.linspace(0, 1, k + 1)[1:-1] * tot).astype(int)
-        edges = []
-        for t in targets:
-            idx = int(np.searchsorted(cum, t, side="left"))
-            idx = min(max(idx, 0), H.nbins - 1)
-            edges.append(H.edges[idx])
-        return np.unique(np.array(edges, dtype=float))
+    def learn_edges_parallel(workdir: Path, sample: str, chunks_dir: Path,
+                         out_model: Path | None, mapq_min: int, xa_max: int, chunksize: int, k: int,
+                         threads: int = 8) -> Path:
+    """Parallel map-reduce: per-chunk winner histograms → global decile edges."""
+    chunk_files = sorted(Path(chunks_dir).glob(f"{sample}_cell_map_ref_chunk_*.txt"))
+    if not chunk_files: raise typer.BadParameter(f"No chunk files under {chunks_dir}")
 
-    as_edges, mq_edges = edges_from_hist(H_AS, k), edges_from_hist(H_MQ, k)
+    # reduce buffers
+    as_counts = np.zeros(_AS_RANGE[2], dtype=np.int64)
+    mq_counts = np.zeros(_MQ_RANGE[2], dtype=np.int64)
+
+    def _worker(chf: Path):
+        return _map_winner_hist_for_chunk(workdir, sample, chf, mapq_min, xa_max, chunksize)
+
+    with ThreadPoolExecutor(max_workers=min(threads, len(chunk_files))) as ex:
+        for as_c, mq_c in ex.map(_worker, chunk_files):
+            as_counts += as_c
+            mq_counts += mq_c
+
+    as_edges, mq_edges = _edges_from_hist_counts(as_counts, mq_counts, k)
     model_path = out_model or (Path(workdir)/sample/"ExplorationReadLevel"/"global_edges.npz")
     model_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(model_path, as_edges=as_edges, mq_edges=mq_edges, k=k)
-    typer.echo(f"[assign/edges] saved {model_path}")
+    return model_path
+
 
 # ---------- Pass B: learn per-decile Δ ECDFs (histograms) ----------
 @app.command()
@@ -207,6 +332,44 @@ def learn_ecdfs(
     np.savez_compressed(model_path, **payload)
     typer.echo(f"[assign/ecdf] saved {model_path}")
 
+    def learn_ecdfs_parallel(workdir: Path, sample: str, chunks_dir: Path,
+                         edges_model: Path, out_model: Path | None,
+                         mapq_min: int, xa_max: int, chunksize: int, threads: int = 8) -> Path:
+    """Parallel map-reduce: per-chunk per-decile Δ hist → global Δ ECDF hist model."""
+    dat = np.load(edges_model)
+    as_edges, mq_edges, k = dat["as_edges"], dat["mq_edges"], int(dat["k"])
+
+    chunk_files = sorted(Path(chunks_dir).glob(f"{sample}_cell_map_ref_chunk_*.txt"))
+    if not chunk_files: raise typer.BadParameter(f"No chunk files under {chunks_dir}")
+
+    # reduce buffers
+    Htmp_AS = _new_hist_from_spec((0.0, 100.0, 200))
+    Htmp_MQ = _new_hist_from_spec((0.0, 60.0, 120))
+    dAS_counts = np.zeros((k, Htmp_AS.nbins), dtype=np.int64)
+    dAS_over   = np.zeros((k,), dtype=np.int64)
+    dMQ_counts = np.zeros((k, Htmp_MQ.nbins), dtype=np.int64)
+    dMQ_over   = np.zeros((k,), dtype=np.int64)
+    
+    def edges_from_hist(H: DeltaHist, k: int) -> np.ndarray:
+        counts = H.counts.astype(np.int64)
+        if counts.sum() == 0: return np.array([])
+        cum = np.cumsum(counts)
+        tot = int(cum[-1] + H.overflow)
+        targets = (np.linspace(0, 1, k + 1)[1:-1] * tot).astype(int)
+        edges = []
+        for t in targets:
+            idx = int(np.searchsorted(cum, t, side="left"))
+            idx = min(max(idx, 0), H.nbins - 1)
+            edges.append(H.edges[idx])
+        return np.unique(np.array(edges, dtype=float))
+
+    as_edges, mq_edges = edges_from_hist(H_AS, k), edges_from_hist(H_MQ, k)
+    model_path = out_model or (Path(workdir)/sample/"ExplorationReadLevel"/"global_edges.npz")
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(model_path, as_edges=as_edges, mq_edges=mq_edges, k=k)
+    typer.echo(f"[assign/edges] saved {model_path}")
+
+
 def _load_ecdf_model(path: Path):
     dat = np.load(path)
     k = int(dat["k"]); as_edges, mq_edges = dat["as_edges"], dat["mq_edges"]
@@ -219,6 +382,28 @@ def _load_ecdf_model(path: Path):
         H.counts = dat["dMQ_counts"][i].astype(np.int64); H.overflow = int(dat["dMQ_overflow"][i]); dMQ.append(H)
     return k, as_edges, mq_edges, dAS, dMQ
 
+    def _worker(chf: Path):
+        return _map_delta_hists_for_chunk(workdir, sample, chf, as_edges, mq_edges, k,
+                                          mapq_min, xa_max, chunksize)
+
+    with ThreadPoolExecutor(max_workers=min(threads, len(chunk_files))) as ex:
+        for das, daso, dmq, dmqo in ex.map(_worker, chunk_files):
+            dAS_counts += das; dAS_over += daso
+            dMQ_counts += dmq; dMQ_over += dmqo
+
+    payload = {
+        "k": np.array(k),
+        "as_edges": as_edges, "mq_edges": mq_edges,
+        "dAS_lo": np.array([0.0]), "dAS_hi": np.array([100.0]), "dAS_nbins": np.array([Htmp_AS.nbins]),
+        "dMQ_lo": np.array([0.0]), "dMQ_hi": np.array([ 60.0]), "dMQ_nbins": np.array([Htmp_MQ.nbins]),
+        "dAS_counts": dAS_counts, "dAS_overflow": dAS_over,
+        "dMQ_counts": dMQ_counts, "dMQ_overflow": dMQ_over,
+    }
+    model_path = out_model or (Path(workdir)/sample/"ExplorationReadLevel"/"global_ecdf.npz")
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(model_path, **payload)
+    return model_path
+    
 # ---------- Pass C: score one chunk -> write *raw.tsv.gz and *filtered.tsv.gz ----------
 @app.command()
 def score_chunk(
