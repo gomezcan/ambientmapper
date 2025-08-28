@@ -276,7 +276,6 @@ def assign(
         typer.echo(f"[assign] No chunk files in {chunks_dir}")
         raise typer.Exit(code=2)
 
-@@
 -    def run_one(chf: Path):
 -        return score_chunk(
 -            workdir=workdir, sample=sample, chunk_file=chf, ecdf_model=ecdf_npz,
