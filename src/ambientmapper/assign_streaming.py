@@ -251,13 +251,13 @@ def learn_edges(
     def learn_edges_parallel(workdir: Path, sample: str, chunks_dir: Path,
                          out_model: Path | None, mapq_min: int, xa_max: int, chunksize: int, k: int,
                          threads: int = 8) -> Path:
-    """Parallel map-reduce: per-chunk winner histograms → global decile edges."""
-    chunk_files = sorted(Path(chunks_dir).glob(f"{sample}_cell_map_ref_chunk_*.txt"))
-    if not chunk_files: raise typer.BadParameter(f"No chunk files under {chunks_dir}")
+        """Parallel map-reduce: per-chunk winner histograms → global decile edges."""
+        chunk_files = sorted(Path(chunks_dir).glob(f"{sample}_cell_map_ref_chunk_*.txt"))
+        if not chunk_files: raise typer.BadParameter(f"No chunk files under {chunks_dir}")
 
-    # reduce buffers
-    as_counts = np.zeros(_AS_RANGE[2], dtype=np.int64)
-    mq_counts = np.zeros(_MQ_RANGE[2], dtype=np.int64)
+        # reduce buffers
+        as_counts = np.zeros(_AS_RANGE[2], dtype=np.int64)
+        mq_counts = np.zeros(_MQ_RANGE[2], dtype=np.int64)
 
     def _worker(chf: Path):
         return _map_winner_hist_for_chunk(workdir, sample, chf, mapq_min, xa_max, chunksize)
