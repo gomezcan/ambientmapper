@@ -199,7 +199,8 @@ def _filtered_files(workdir: Path, sample: str) -> list[Path]:
 
 def _iter_read_bc_rows(fp: Path, bcs: set[str], chunksize: int, mapq_min: int, xa_max: int):
     usecols = ["Read","BC","MAPQ","AS","NM","XAcount"]
-    for c in pd.read_csv(fp, sep="\t", header=0, usecols=usecols, chunksize=chunksize):
+    for c in pd.read_csv(fp, sep="\t", header=0, usecols=usecols, chunksize=chunksize,
+                        dtype={"Read":"string","BC":"string"}, engine="c", low_memory=True, memory_map=False):
         c = c[c["BC"].astype(str).isin(bcs)]
         if c.empty: continue
         for col in ("AS","MAPQ","NM","XAcount"): c[col] = pd.to_numeric(c[col], errors="coerce")
