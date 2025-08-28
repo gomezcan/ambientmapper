@@ -5,7 +5,7 @@ from typing import Dict, Tuple, Optional, Iterable
 import numpy as np
 import pandas as pd
 import typer
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 app = typer.Typer(add_completion=False)
@@ -262,16 +262,35 @@ def learn_edges(
     def _worker(chf: Path):
         return _map_winner_hist_for_chunk(workdir, sample, chf, mapq_min, xa_max, chunksize)
 
-    with ThreadPoolExecutor(max_workers=min(threads, len(chunk_files))) as ex:
-        for as_c, mq_c in ex.map(_worker, chunk_files):
-            as_counts += as_c
-            mq_counts += mq_c
+-    with ThreadPoolExecutor(max_workers=min(threads, len(chunk_files))) as ex:
+-       for as_c, mq_c in ex.map(_worker, chunk_files):
+-            as_counts += as_c
+-            mq_counts += mq_c
 
++    total = len(chunk_files)
++    typer.echo(f"[assign/edges] start: {total} chunks, threads={min(threads, total)}")
++    with ThreadPoolExecutor(max_workers=min(threads, total)) as ex:
++        fut = {ex.submit(_worker, ch): ch for ch in chunk_files}
++        done = 0
++        for f in as_completed(fut):
++            ch = fut[f]
++            try:
++                as_c, mq_c = f.result()
++                as_counts += as_c; mq_counts += mq_c
++            except Exception as e:
++                typer.echo(f"[assign/edges][ERROR] {ch.name}: {e}")
++                raise
++            done += 1
++            if done % 5 == 0 or done == total:
++                typer.echo(f"[assign/edges] {done}/{total} chunks")
     as_edges, mq_edges = _edges_from_hist_counts(as_counts, mq_counts, k)
     model_path = out_model or (Path(workdir)/sample/"ExplorationReadLevel"/"global_edges.npz")
     model_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(model_path, as_edges=as_edges, mq_edges=mq_edges, k=k)
-    return model_path
+-   np.savez_compressed(model_path, as_edges=as_edges, mq_edges=mq_edges, k=k)
+-   return model_path
++   np.savez_compressed(model_path, as_edges=as_edges, mq_edges=mq_edges, k=k)
++   typer.echo(f"[assign/edges] done → {model_path}")
++   return model_path
 
 
 # ---------- Pass B: learn per-decile Δ ECDFs (histograms) ----------
@@ -333,7 +352,7 @@ def learn_ecdfs(
     np.savez_compressed(model_path, **payload)
     typer.echo(f"[assign/ecdf] saved {model_path}")
 
-    def learn_ecdfs_parallel(workdir: Path, sample: str, chunks_dir: Path,
+def learn_ecdfs_parallel(workdir: Path, sample: str, chunks_dir: Path,
                          edges_model: Path, out_model: Path | None,
                          mapq_min: int, xa_max: int, chunksize: int, threads: int = 8) -> Path:
     """Parallel map-reduce: per-chunk per-decile Δ hist → global Δ ECDF hist model."""
@@ -350,10 +369,44 @@ def learn_ecdfs(
     dAS_over   = np.zeros((k,), dtype=np.int64)
     dMQ_counts = np.zeros((k, Htmp_MQ.nbins), dtype=np.int64)
     dMQ_over   = np.zeros((k,), dtype=np.int64)
-    
-    def edges_from_hist(H: DeltaHist, k: int) -> np.ndarray:
-        counts = H.counts.astype(np.int64)
-        if counts.sum() == 0: return np.array([])
+
+    def _worker(chf: Path):
+        return _map_delta_hists_for_chunk(workdir, sample, chf, as_edges, mq_edges, k,
+                                          mapq_min, xa_max, chunksize)
+        total = len(chunk_files)
+        typer.echo(f"[assign/ecdf] start: {total} chunks, threads={min(threads, total)}")
+        with ThreadPoolExecutor(max_workers=min(threads, total)) as ex:
+            fut = {ex.submit(_worker, ch): ch for ch in chunk_files}
+            done = 0
+            for f in as_completed(fut):
+                ch = fut[f]
+                try:
+                    das, daso, dmq, dmqo = f.result()
+                    dAS_counts += das; dAS_over += daso
+                    dMQ_counts += dmq; dMQ_over += dmqo
+                except Exception as e:
+                    typer.echo(f"[assign/ecdf][ERROR] {ch.name}: {e}")
+                    raise
+                done += 1
+                if done % 5 == 0 or done == total:
+                    typer.echo(f"[assign/ecdf] {done}/{total} chunks")
+
+        payload = {
+            "k": np.array(k),
+            "as_edges": as_edges, "mq_edges": mq_edges,
+            "dAS_lo": np.array([0.0]), "dAS_hi": np.array([100.0]), "dAS_nbins": np.array([Htmp_AS.nbins]),
+            "dMQ_lo": np.array([0.0]), "dMQ_hi": np.array([ 60.0]), "dMQ_nbins": np.array([Htmp_MQ.nbins]),
+            "dAS_counts": dAS_counts, "dAS_overflow": dAS_over,
+            "dMQ_counts": dMQ_counts, "dMQ_overflow": dMQ_over,
+        }
+        model_path = out_model or (Path(workdir)/sample/"ExplorationReadLevel"/"global_ecdf.npz")
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(model_path, **payload)
+        return model_path
+                             
+def edges_from_hist(H: DeltaHist, k: int) -> np.ndarray:
+    counts = H.counts.astype(np.int64)
+    if counts.sum() == 0: return np.array([])
         cum = np.cumsum(counts)
         tot = int(cum[-1] + H.overflow)
         targets = (np.linspace(0, 1, k + 1)[1:-1] * tot).astype(int)
