@@ -163,12 +163,13 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     edges_npz = learn_edges_parallel(
         workdir=workdir, sample=sample, chunks_dir=chunks_dir,
         out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max,
-        chunksize=chunksize, k=k, threads=threads
+        chunksize=chunksize, k=k, threads=threads, verbose=verbose
     )
     ecdf_npz = learn_ecdfs_parallel(
         workdir=workdir, sample=sample, chunks_dir=chunks_dir,
         edges_model=edges_npz, out_model=ecdf_npz,
-        mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize, threads=threads
+        mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize, threads=threads,
+        verbose=verbose
     )
 
     # score each chunk (parallel)
@@ -183,9 +184,17 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
             out_raw_dir=None, out_filtered_dir=None,
             mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize, alpha=alpha
         )
-
-    with cf.ThreadPoolExecutor(max_workers=min(threads, len(chunk_files), 36)) as ex:
-        list(ex.map(_score_one, chunk_files))
+    
+    with cf.ThreadPoolExecutor(max_workers=min(threads, len(chunk_files))) as ex:
+        fut = {
+            ex.submit(
+                score_chunk,
+                workdir=workdir, sample=sample, chunk_file=chf, ecdf_model=ecdf_npz,
+                out_raw_dir=None, out_filtered_dir=None,
+                mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize, alpha=alpha,
+                # Pending: add verbose to score_chunk if inner logs require too
+            ): chf for chf in chunk_files
+    }
 
     # 40) merge
     out = d["final"] / f"{cfg['sample']}_per_read_winner.tsv.gz"
@@ -234,6 +243,8 @@ def chunks(config: Path = typer.Option(..., "--config", "-c", exists=True, reada
 def assign(
     config: Path = typer.Option(..., "-c", "--config", exists=True),
     threads: int = typer.Option(16, "-t", "--threads"),
+    verbose: bool = typer.Option(True, "--verbose", help="Print per-chunk progress")
+
 ):
     """
     Modular assign: learn edges (global), learn ECDFs (global), then score each chunk (parallel).
@@ -259,15 +270,16 @@ def assign(
     exp_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) global models
-    learn_edges (  # type: ignore
+    learn_edges_parallel (  # type: ignore
         workdir=workdir, sample=sample, chunks_dir=chunks_dir,
         out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max,
-        chunksize=chunksize, k=k
+        chunksize=chunksize, k=k, verbose=verbose
     )
-    learn_ecdfs (  # type: ignore
+    learn_ecdfs_parallel (  # type: ignore
         workdir=workdir, sample=sample, chunks_dir=chunks_dir,
         edges_model=edges_npz, out_model=ecdf_npz,
-        mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize
+        mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize,
+        verbose=verbose
     )
 
     # 2) per-chunk scoring in parallel
@@ -384,6 +396,7 @@ def run(
     configs: Path = typer.Option(None, "--configs", help="TSV with: sample, genome, bam, workdir"),
     
     # common knobs
+    verbose: bool = typer.Option(True, "--verbose", help="Print per-chunk progress")
     min_barcode_freq: int = typer.Option(10, "--min-barcode-freq"),
     chunk_size_cells: int = typer.Option(5000, "--chunk-size-cells"),
     threads: int = typer.Option(8, "--threads", "-t", min=1),
