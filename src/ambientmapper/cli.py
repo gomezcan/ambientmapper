@@ -7,8 +7,6 @@ import json, concurrent.futures as cf
 from typing import Dict, List
 import typer
 
-
-
 app = typer.Typer(help="ambientmapper: local-first ambient cleaning pipeline")
 
 # ----------------
@@ -113,8 +111,9 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     from .extract import bam_to_qc
     from .filtering import filter_qc_file
     from .chunks import make_barcode_chunks
-    from .merge import merge_chunk_outputs
-    from .assign_streaming import learn_edges, learn_ecdfs, score_chunk
+    from .merge import merge_chunk_outputs    
+    from .assign_streaming import learn_edges_parallel, learn_ecdfs_parallel, score_chunk
+
 
     d = _cfg_dirs(cfg); _ensure_dirs(d)
     genomes = sorted(cfg["genomes"].items())
@@ -160,16 +159,16 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     # IMPORTANT: pass workdir that contains <sample>/ (parent of d["root"])
     pool_workdir = d["root"].parent
 
-    # learn global models (serial)
-    learn_edges(
-        workdir=pool_workdir, sample=cfg["sample"], chunks_dir=chunks_dir,
+    # 1) global models (parallel map-reduce)
+    edges_npz = learn_edges_parallel(
+        workdir=workdir, sample=sample, chunks_dir=chunks_dir,
         out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max,
-        chunksize=chunksize, k=k
+        chunksize=chunksize, k=k, threads=threads
     )
-    learn_ecdfs(
-        workdir=pool_workdir, sample=cfg["sample"], chunks_dir=chunks_dir,
+    ecdf_npz = learn_ecdfs_parallel(
+        workdir=workdir, sample=sample, chunks_dir=chunks_dir,
         edges_model=edges_npz, out_model=ecdf_npz,
-        mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize
+        mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize, threads=threads
     )
 
     # score each chunk (parallel)
