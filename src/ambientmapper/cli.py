@@ -249,8 +249,7 @@ def assign(
     """
     Modular assign: learn edges (global), learn ECDFs (global), then score each chunk (parallel).
     """
-
-    from .assign_streaming import learn_edges, learn_ecdfs, score_chunk
+    from .assign_streaming import learn_edges_parallel, learn_ecdfs_parallel, score_chunk
 
     cfg = json.loads(Path(config).read_text())
     workdir = Path(cfg["workdir"])
