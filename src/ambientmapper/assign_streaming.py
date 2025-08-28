@@ -261,36 +261,28 @@ def learn_edges(
 
     def _worker(chf: Path):
         return _map_winner_hist_for_chunk(workdir, sample, chf, mapq_min, xa_max, chunksize)
-
--    with ThreadPoolExecutor(max_workers=min(threads, len(chunk_files))) as ex:
--       for as_c, mq_c in ex.map(_worker, chunk_files):
--            as_counts += as_c
--            mq_counts += mq_c
-
-+    total = len(chunk_files)
-+    typer.echo(f"[assign/edges] start: {total} chunks, threads={min(threads, total)}")
-+    with ThreadPoolExecutor(max_workers=min(threads, total)) as ex:
-+        fut = {ex.submit(_worker, ch): ch for ch in chunk_files}
-+        done = 0
-+        for f in as_completed(fut):
-+            ch = fut[f]
-+            try:
-+                as_c, mq_c = f.result()
-+                as_counts += as_c; mq_counts += mq_c
-+            except Exception as e:
-+                typer.echo(f"[assign/edges][ERROR] {ch.name}: {e}")
-+                raise
-+            done += 1
-+            if done % 5 == 0 or done == total:
-+                typer.echo(f"[assign/edges] {done}/{total} chunks")
+        total = len(chunk_files)
+        typer.echo(f"[assign/edges] start: {total} chunks, threads={min(threads, total)}")
+        with ThreadPoolExecutor(max_workers=min(threads, total)) as ex:
+            fut = {ex.submit(_worker, ch): ch for ch in chunk_files}
+            done = 0
+            for f in as_completed(fut):
+                ch = fut[f]
+                try:
+                    as_c, mq_c = f.result()
+                    as_counts += as_c; mq_counts += mq_c
+                except Exception as e:
+                    typer.echo(f"[assign/edges][ERROR] {ch.name}: {e}")
+                    raise
+                done += 1
+                if done % 5 == 0 or done == total:
+        typer.echo(f"[assign/edges] {done}/{total} chunks")
     as_edges, mq_edges = _edges_from_hist_counts(as_counts, mq_counts, k)
     model_path = out_model or (Path(workdir)/sample/"ExplorationReadLevel"/"global_edges.npz")
     model_path.parent.mkdir(parents=True, exist_ok=True)
--   np.savez_compressed(model_path, as_edges=as_edges, mq_edges=mq_edges, k=k)
--   return model_path
-+   np.savez_compressed(model_path, as_edges=as_edges, mq_edges=mq_edges, k=k)
-+   typer.echo(f"[assign/edges] done → {model_path}")
-+   return model_path
+   np.savez_compressed(model_path, as_edges=as_edges, mq_edges=mq_edges, k=k)
+   typer.echo(f"[assign/edges] done → {model_path}")
+   return model_path
 
 
 # ---------- Pass B: learn per-decile Δ ECDFs (histograms) ----------
