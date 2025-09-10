@@ -3,9 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import json, csv
-import json, concurrent.futures as cf
+import concurrent.futures as cf
 from typing import Dict, List
 import typer
+
 
 app = typer.Typer(help="ambientmapper: local-first ambient cleaning pipeline")
 
@@ -105,16 +106,14 @@ def _apply_assign_overrides(cfg: Dict[str, object],
     if xa_max     is not None: assign["xa_max"] = int(xa_max)
     if chunksize  is not None: assign["chunksize"] = int(chunksize)
 
-
 def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     # Lazy imports
     from .extract import bam_to_qc
     from .filtering import filter_qc_file
     from .chunks import make_barcode_chunks
-    from .merge import merge_chunk_outputs    
-    from .assign_streaming import learn_edges_parallel, learn_ecdfs_parallel, score_chunk
-
-
+    from .merge import merge_chunk_outputs
+    from .assign_streaming import learn_edges_parallel, learn_ecdfs_batched, score_chunk
+    
     d = _cfg_dirs(cfg); _ensure_dirs(d)
     genomes = sorted(cfg["genomes"].items())
     if not genomes:
@@ -125,7 +124,8 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     with ProcessPoolExecutor(max_workers=_clamp(threads, 1, len(genomes))) as ex:
         futs = [ex.submit(bam_to_qc, Path(bam), d["qc"] / f"{g}_QCMapping.txt", cfg["sample"])
                 for g, bam in genomes]
-        for f in as_completed(futs): f.result()
+        for f in as_completed(futs):
+            f.result()
 
     # 20) filter (parallel over genomes)
     minf = int(cfg["min_barcode_freq"])
@@ -135,7 +135,8 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
             ip = d["qc"] / f"{g}_QCMapping.txt"
             op = d["filtered"] / f"filtered_{g}_QCMapping.txt"
             futs.append(ex.submit(filter_qc_file, ip, op, minf, cfg["sample"]))
-        for f in as_completed(futs): f.result()
+        for f in as_completed(futs):
+            f.result()
 
     # 25) chunks
     typer.echo("[run] chunks: creating per-BC subsets…")
@@ -148,7 +149,8 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     k          = int(aconf.get("k", 10))
     mapq_min   = int(aconf.get("mapq_min", 20))
     xa_max     = int(aconf.get("xa_max", 2))
-    chunksize  = int(aconf.get("chunksize", 500_000))  # default 0.5M rows
+    chunksize  = int(aconf.get("chunksize", 500_000))  # default 0.5M
+    batch_size = int(aconf.get("batch_size", 32))
     chunks_dir = d["chunks"]
 
     exp_dir   = d["root"] / "ExplorationReadLevel"
@@ -156,23 +158,23 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     ecdf_npz  = exp_dir / "global_ecdf.npz"
     exp_dir.mkdir(parents=True, exist_ok=True)
 
-    # IMPORTANT: pass workdir that contains <sample>/ (parent of d["root"])
+    # IMPORTANT: the streaming functions expect a workdir that *contains* <sample>/
     pool_workdir = d["root"].parent
 
-    # 1) global models (parallel map-reduce)
-    edges_npz = learn_edges_parallel(
-        workdir=workdir, sample=sample, chunks_dir=chunks_dir,
+    # 1) global models (map-reduce)
+    learn_edges_parallel(
+        workdir=pool_workdir, sample=cfg["sample"], chunks_dir=chunks_dir,
         out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max,
-        chunksize=chunksize, k=k, threads=threads, verbose=verbose
+        chunksize=chunksize, k=k, threads=threads, verbose=True
     )
-    ecdf_npz = learn_ecdfs_parallel(
-        workdir=workdir, sample=sample, chunks_dir=chunks_dir,
+    learn_ecdfs_batched(
+        workdir=pool_workdir, sample=cfg["sample"], chunks_dir=chunks_dir,
         edges_model=edges_npz, out_model=ecdf_npz,
-        mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize, threads=threads,
-        verbose=verbose
+        mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize,
+        batch_size=batch_size, verbose=True
     )
 
-    # score each chunk (parallel)
+    # 2) score each chunk (parallel)
     chunk_files = sorted(chunks_dir.glob(f"{cfg['sample']}_cell_map_ref_chunk_*.txt"))
     if not chunk_files:
         typer.echo(f"[assign] No chunk files in {chunks_dir}")
@@ -184,21 +186,16 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
             out_raw_dir=None, out_filtered_dir=None,
             mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize, alpha=alpha
         )
-    
+
     with cf.ThreadPoolExecutor(max_workers=min(threads, len(chunk_files))) as ex:
-        fut = {
-            ex.submit(
-                score_chunk,
-                workdir=workdir, sample=sample, chunk_file=chf, ecdf_model=ecdf_npz,
-                out_raw_dir=None, out_filtered_dir=None,
-                mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize, alpha=alpha,
-                # Pending: add verbose to score_chunk if inner logs require too
-            ): chf for chf in chunk_files
-    }
+        for _ in ex.map(_score_one, chunk_files):
+            pass
 
     # 40) merge
     out = d["final"] / f"{cfg['sample']}_per_read_winner.tsv.gz"
     merge_chunk_outputs(d["chunks"], cfg["sample"], out)
+    typer.echo(f"[run] merge → {out}")
+
 
 
 # ----------------
@@ -249,7 +246,7 @@ def assign(
     """
     Modular assign: learn edges (global), learn ECDFs (global), then score each chunk (parallel).
     """
-    from .assign_streaming import learn_edges_parallel, learn_ecdfs_parallel, score_chunk
+    from .assign_streaming import learn_edges_parallel, learn_ecdfs_batched, score_chunk
 
     cfg = json.loads(Path(config).read_text())
     workdir = Path(cfg["workdir"])
@@ -269,11 +266,19 @@ def assign(
     exp_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) global models
-    learn_edges_parallel (  # type: ignore
+    learn_edges_parallel(
         workdir=workdir, sample=sample, chunks_dir=chunks_dir,
         out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max,
-        chunksize=chunksize, k=k, verbose=verbose
+        chunksize=chunksize, k=k, threads=threads, verbose=verbose
     )
+    learn_ecdfs_batched(
+        workdir=workdir, sample=sample, chunks_dir=chunks_dir,
+        edges_model=edges_npz, out_model=ecdf_npz,
+        mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize,
+        batch_size=int(aconf.get("batch_size", 32)),  # allow override via JSON
+        verbose=True
+    )
+        
     learn_ecdfs_parallel (  # type: ignore
         workdir=workdir, sample=sample, chunks_dir=chunks_dir,
         edges_model=edges_npz, out_model=ecdf_npz,
