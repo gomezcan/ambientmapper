@@ -15,7 +15,7 @@ app = typer.Typer(add_completion=False)
 
 __all__ = [
     "learn_edges", "learn_ecdfs", "score_chunk", "assign_streaming_pipeline",
-    "learn_edges_parallel", "learn_ecdfs_parallel",
+    "learn_edges_parallel", "learn_ecdfs_parallel", "learn_ecdfs_batched",
 ]
 
 # ---------- logging helpers ----------
@@ -424,43 +424,141 @@ def learn_ecdfs(
 def learn_edges_parallel(
     workdir: Path, sample: str, chunks_dir: Path,
     out_model: Path | None, mapq_min: int, xa_max: int, chunksize: int, k: int,
-    threads: int = 8, verbose: bool = False
+    batch_size: int = 32, threads: int = 8, verbose: bool = False
 ) -> Path:
-    """Parallel map-reduce: per-chunk winner histograms → global decile edges."""
+    """
+    Parallel *batched* map-reduce: read each genome once per batch of chunk files,
+    route rows by BC → per-chunk accumulators, then reduce winners to global hist counts.
+    """
     chunk_files = sorted(Path(chunks_dir).glob(f"{sample}_cell_map_ref_chunk_*.txt"))
     if not chunk_files:
         raise typer.BadParameter(f"No chunk files under {chunks_dir}")
+    files = _filtered_files(workdir, sample)
 
+    # global hist buffers (fixed specs)
     as_counts = np.zeros(_AS_RANGE[2], dtype=np.int64)
     mq_counts = np.zeros(_MQ_RANGE[2], dtype=np.int64)
 
-    def _worker(chf: Path):
-        return _map_winner_hist_for_chunk(workdir, sample, chf, mapq_min, xa_max, chunksize, verbose=verbose)
+    total_chunks = len(chunk_files)
+    batches = [(i, chunk_files[i:i+batch_size]) for i in range(0, total_chunks, batch_size)]
+    _log(f"[assign/edges] start: {total_chunks} chunks in {len(batches)} batches (batch_size={batch_size})", verbose)
 
-    total = len(chunk_files)
-    _log(f"[assign/edges] start: {total} chunks, threads={min(threads, total)}", verbose)
-    with ThreadPoolExecutor(max_workers=min(threads, total)) as ex:
-        fut = {ex.submit(_worker, ch): ch for ch in chunk_files}
-        done = 0
-        for f in as_completed(fut):
-            ch = fut[f]
-            try:
-                as_c, mq_c = f.result()
-                as_counts += as_c
-                mq_counts += mq_c
-            except Exception as e:
-                _log_err(f"[assign/edges][ERROR] {ch.name}: {e}", verbose=True)
-                raise
-            done += 1
-            if verbose and (done % 5 == 0 or done == total):
-                _log(f"[assign/edges] {done}/{total} chunks", verbose)
+    for bi, batch in enumerate(batches, start=1):
+        # --- build routing for this batch ---
+        bc_to_chunk: dict[str, Path] = {}
+        per_chunk_acc: dict[Path, dict[tuple[str,str], dict]] = {}
+        for ch in batch:
+            per_chunk_acc[ch] = {}
+            for bc in _chunk_bcs(ch):
+                bc_to_chunk[bc] = ch
+        batch_bcs: set[str] = set(bc_to_chunk.keys())
+        if not batch_bcs:
+            _log(f"[assign/edges] batch {bi}/{len(batches)} has no BCs; skip", verbose)
+            continue
 
+        _log(f"[assign/edges] ▶ batch {bi}/{len(batches)}  chunks={len(batch)}  BCs={len(batch_bcs):,}", verbose)
+
+        # --- stream each genome once and route rows to chunk accumulators ---
+        for fp in files:
+            genome = _genome_from_filename(fp)
+            kept_rows = 0
+            for c in pd.read_csv(
+                fp, sep="\t", header=0,
+                usecols=["Read","BC","MAPQ","AS","NM","XAcount"],
+                chunksize=chunksize, dtype={"Read":"string","BC":"string"},
+                engine="c", low_memory=True, memory_map=False
+            ):
+                # route to this batch's BCs early
+                c = c[c["BC"].astype(str).isin(batch_bcs)]
+                if c.empty:
+                    continue
+
+                # numeric + gates
+                for col in ("AS","MAPQ","NM","XAcount"):
+                    c[col] = pd.to_numeric(c[col], errors="coerce")
+                if mapq_min > 0:
+                    c = c[c["MAPQ"].fillna(0) >= mapq_min]
+                if xa_max >= 0:
+                    c = c[c["XAcount"].fillna(0) <= xa_max]
+                if c.empty:
+                    continue
+
+                # one (Read,BC) per genome
+                c = c.drop_duplicates(subset=["Read","BC"], keep="first")
+
+                # route
+                for row in c.itertuples(index=False):
+                    ch_path = bc_to_chunk.get(str(row.BC))
+                    if ch_path is None:
+                        continue
+                    rb = per_chunk_acc[ch_path]
+                    key = (str(row.Read), str(row.BC))
+                    acc = rb.get(key)
+                    if acc is None:
+                        acc = {"best1": None, "best2": None, "worst": None, "seen_g": set()}
+                        rb[key] = acc
+                    _pick_best_two_and_worst(
+                        acc, genome,
+                        AS=float(row.AS) if pd.notna(row.AS) else float("-inf"),
+                        MAPQ=float(row.MAPQ) if pd.notna(row.MAPQ) else float("-inf"),
+                        NM=float(row.NM) if pd.notna(row.NM) else float("inf"),
+                        XA=float(row.XAcount) if pd.notna(row.XAcount) else float("inf"),
+                    )
+                    kept_rows += 1
+
+            _log(f"[assign/edges]    ✓ genome {genome}  kept≈{kept_rows:,}", verbose)
+
+        # --- reduce this batch: add winner (AS,MAPQ) to GLOBAL hist buffers ---
+        lo_as, hi_as, nb_as = _AS_RANGE
+        lo_mq, hi_mq, nb_mq = _MQ_RANGE
+        scale_as = (hi_as - lo_as)
+        scale_mq = (hi_mq - lo_mq)
+
+        batch_winners = 0
+        for rb in per_chunk_acc.values():
+            for acc in rb.values():
+                b1 = acc.get("best1")
+                if not b1:
+                    continue
+                # AS bin
+                asv = b1["AS"]
+                if np.isfinite(asv):
+                    if asv >= hi_as:
+                        idx_as = nb_as - 1
+                    elif asv <= lo_as:
+                        idx_as = 0
+                    else:
+                        idx_as = int((asv - lo_as) / scale_as * nb_as)
+                        idx_as = min(max(idx_as, 0), nb_as - 1)
+                    as_counts[idx_as] += 1
+                # MAPQ bin
+                mqv = b1["MAPQ"]
+                if np.isfinite(mqv):
+                    if mqv >= hi_mq:
+                        idx_mq = nb_mq - 1
+                    elif mqv <= lo_mq:
+                        idx_mq = 0
+                    else:
+                        idx_mq = int((mqv - lo_mq) / scale_mq * nb_mq)
+                        idx_mq = min(max(idx_mq, 0), nb_mq - 1)
+                    mq_counts[idx_mq] += 1
+
+                batch_winners += 1
+
+        _log_ok(f"[assign/edges] ■ batch {bi}/{len(batches)} reduced  winners={batch_winners:,}", verbose)
+
+        # free memory for the batch
+        per_chunk_acc.clear()
+        bc_to_chunk.clear()
+
+    # --- finalize edges and write model ---
     as_edges, mq_edges = _edges_from_hist_counts(as_counts, mq_counts, k)
     model_path = out_model or (Path(workdir) / sample / "ExplorationReadLevel" / "global_edges.npz")
     model_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(model_path, as_edges=as_edges, mq_edges=mq_edges, k=k)
     _log_ok(f"[assign/edges] done → {model_path}", verbose)
     return model_path
+
 
 def learn_ecdfs_parallel(
     workdir: Path, sample: str, chunks_dir: Path,
@@ -518,6 +616,147 @@ def learn_ecdfs_parallel(
     model_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(model_path, **payload)
     _log_ok(f"[assign/ecdf] done → {model_path}", verbose)
+    return model_path
+
+def learn_ecdfs_batched(
+    workdir: Path, sample: str, chunks_dir: Path,
+    edges_model: Path, out_model: Path | None,
+    mapq_min: int, xa_max: int, chunksize: int,
+    batch_size: int = 32, verbose: bool = True
+) -> Path:
+    """
+    Batched map-reduce: read each genome once per batch of chunk files, route rows
+    by BC to per-chunk accumulators, then reduce to global per-decile Δ histograms.
+    Much lower I/O than per-chunk workers when you have hundreds/thousands of chunks.
+    """
+    # 0) load decile edges (for assigning deciles of the winner AS/MAPQ)
+    dat = np.load(edges_model)
+    as_edges, mq_edges, k = dat["as_edges"], dat["mq_edges"], int(dat["k"])
+
+    # 1) global Δ histogram buffers (same binning as your current parallel version)
+    Htmp_AS = _new_hist_from_spec((0.0, 100.0, 200))
+    Htmp_MQ = _new_hist_from_spec((0.0,  60.0, 120))
+    dAS_counts = np.zeros((k, Htmp_AS.nbins), dtype=np.int64)
+    dAS_over   = np.zeros((k,), dtype=np.int64)
+    dMQ_counts = np.zeros((k, Htmp_MQ.nbins), dtype=np.int64)
+    dMQ_over   = np.zeros((k,), dtype=np.int64)
+
+    chunk_files = sorted(Path(chunks_dir).glob(f"{sample}_cell_map_ref_chunk_*.txt"))
+    files = _filtered_files(workdir, sample)
+    if not chunk_files:
+        raise typer.BadParameter(f"No chunk files under {chunks_dir}")
+
+    _log(f"[assign/ecdf-batched] start: {len(chunk_files)} chunks, batch_size={batch_size}", verbose)
+    t0_all = time.time()
+
+    for ofs in range(0, len(chunk_files), batch_size):
+        batch = chunk_files[ofs:ofs + batch_size]
+        t0 = time.time()
+        _log(f"[assign/ecdf-batched] ▶ batch {ofs//batch_size+1}: {len(batch)} chunks", verbose)
+
+        # 2) routing
+        bc_to_chunk: dict[str, Path] = {}
+        per_chunk_acc: dict[Path, dict[tuple[str, str], dict]] = {}
+        for ch in batch:
+            per_chunk_acc[ch] = {}
+            for bc in _chunk_bcs(ch):
+                bc_to_chunk[bc] = ch
+
+        # 3) stream each genome once; route rows to the right batch-chunk accumulator
+        for fp in files:
+            genome = _genome_from_filename(fp)
+            per_file_kept = 0
+            for c in pd.read_csv(
+                fp, sep="\t",
+                usecols=["Read", "BC", "MAPQ", "AS", "NM", "XAcount"],
+                chunksize=chunksize, dtype={"Read": "string", "BC": "string"},
+                engine="c", low_memory=True, memory_map=False
+            ):
+                # keep only BCs present in THIS batch
+                c = c[c["BC"].astype(str).isin(bc_to_chunk.keys())]
+                if c.empty:
+                    continue
+                for col in ("AS", "MAPQ", "NM", "XAcount"):
+                    c[col] = pd.to_numeric(c[col], errors="coerce")
+                if mapq_min > 0:
+                    c = c[c["MAPQ"].fillna(0) >= mapq_min]
+                if xa_max >= 0:
+                    c = c[c["XAcount"].fillna(0) <= xa_max]
+                if c.empty:
+                    continue
+                # at most one (Read,BC) per genome file
+                c = c.drop_duplicates(subset=["Read", "BC"], keep="first")
+
+                for row in c.itertuples(index=False):
+                    ch = bc_to_chunk.get(str(row.BC))
+                    if ch is None:
+                        continue
+                    rb = per_chunk_acc[ch]
+                    key = (str(row.Read), str(row.BC))
+                    acc = rb.get(key)
+                    if acc is None:
+                        acc = {"best1": None, "best2": None, "worst": None, "seen_g": set()}
+                        rb[key] = acc
+                    _pick_best_two_and_worst(
+                        acc, genome,
+                        AS=float(row.AS) if pd.notna(row.AS) else float("-inf"),
+                        MAPQ=float(row.MAPQ) if pd.notna(row.MAPQ) else float("-inf"),
+                        NM=float(row.NM) if pd.notna(row.NM) else float("inf"),
+                        XA=float(row.XAcount) if pd.notna(row.XAcount) else float("inf"),
+                    )
+                    per_file_kept += 1
+            _log(f"[assign/ecdf-batched]   ✓ {fp.name} kept≈{per_file_kept:,}", verbose)
+
+        # 4) reduce THIS batch → add to global Δ histograms
+        pairs = 0
+        for rb in per_chunk_acc.values():
+            for acc in rb.values():
+                b1, b2 = acc["best1"], acc.get("best2")
+                if b1 is None or b2 is None:
+                    continue
+                dAS = b1["AS"] - b2["AS"]
+                dMQ = b1["MAPQ"] - b2["MAPQ"]
+                # assign winner deciles
+                dec_as = int(assign_decile(np.array([b1["AS"]]), as_edges)[0]) if as_edges.size else 1
+                dec_mq = int(assign_decile(np.array([b1["MAPQ"]]), mq_edges)[0]) if mq_edges.size else 1
+                # add ΔAS
+                if 1 <= dec_as <= k:
+                    H = Htmp_AS
+                    if not np.isfinite(dAS):
+                        pass
+                    elif dAS >= H.hi:
+                        dAS_over[dec_as - 1] += 1
+                    else:
+                        idx = int(min(max((dAS - H.lo) / (H.hi - H.lo) * H.nbins, 0), H.nbins - 1))
+                        dAS_counts[dec_as - 1, idx] += 1
+                # add ΔMAPQ
+                if 1 <= dec_mq <= k:
+                    H = Htmp_MQ
+                    if not np.isfinite(dMQ):
+                        pass
+                    elif dMQ >= H.hi:
+                        dMQ_over[dec_mq - 1] += 1
+                    else:
+                        idx = int(min(max((dMQ - H.lo) / (H.hi - H.lo) * H.nbins, 0), H.nbins - 1))
+                        dMQ_counts[dec_mq - 1, idx] += 1
+                pairs += 1
+
+        dt = time.time() - t0
+        _log_ok(f"[assign/ecdf-batched] ■ batch {ofs//batch_size+1} done  pairs={pairs:,}  {dt:0.1f}s", verbose)
+
+    # 5) save model
+    model_path = out_model or (Path(workdir) / sample / "ExplorationReadLevel" / "global_ecdf.npz")
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        model_path,
+        k=np.array(k),
+        as_edges=as_edges, mq_edges=mq_edges,
+        dAS_lo=np.array([Htmp_AS.lo]), dAS_hi=np.array([Htmp_AS.hi]), dAS_nbins=np.array([Htmp_AS.nbins]),
+        dMQ_lo=np.array([Htmp_MQ.lo]), dMQ_hi=np.array([Htmp_MQ.hi]), dMQ_nbins=np.array([Htmp_MQ.nbins]),
+        dAS_counts=dAS_counts, dAS_overflow=dAS_over,
+        dMQ_counts=dMQ_counts, dMQ_overflow=dMQ_over,
+    )
+    _log_ok(f"[assign/ecdf-batched] done → {model_path}  total {time.time()-t0_all:0.1f}s", verbose)
     return model_path
 
 
