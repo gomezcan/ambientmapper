@@ -427,7 +427,7 @@ def learn_edges_parallel(
     batch_size: int = 32, threads: int = 8, verbose: bool = False
 ) -> Path:
     """
-    Parallel *batched* map-reduce: read each genome once per batch of chunk files,
+    Batched map-reduce: read each genome once per batch of chunk files,
     route rows by BC → per-chunk accumulators, then reduce winners to global hist counts.
     """
     chunk_files = sorted(Path(chunks_dir).glob(f"{sample}_cell_map_ref_chunk_*.txt"))
@@ -443,37 +443,40 @@ def learn_edges_parallel(
     batches = [(i, chunk_files[i:i+batch_size]) for i in range(0, total_chunks, batch_size)]
     _log(f"[assign/edges] start: {total_chunks} chunks in {len(batches)} batches (batch_size={batch_size})", verbose)
 
-    for bi, batch in enumerate(batches, start=1):
-        # --- build routing for this batch ---
+    for bi, ch_paths in batches:
         bc_to_chunk: dict[str, Path] = {}
-        per_chunk_acc: dict[Path, dict[tuple[str,str], dict]] = {}
-        for ch in batch:
+        per_chunk_acc: dict[Path, dict[tuple[str, str], dict]] = {}
+
+        # index BCs for this batch and init per-chunk accumulators
+        for ch in ch_paths:
             per_chunk_acc[ch] = {}
             for bc in _chunk_bcs(ch):
                 bc_to_chunk[bc] = ch
         batch_bcs: set[str] = set(bc_to_chunk.keys())
-        if not batch_bcs:
-            _log(f"[assign/edges] batch {bi}/{len(batches)} has no BCs; skip", verbose)
-            continue
 
-        _log(f"[assign/edges] ▶ batch {bi}/{len(batches)}  chunks={len(batch)}  BCs={len(batch_bcs):,}", verbose)
+        _log(f"[assign/edges] ▶ batch {bi}/{len(batches)-1}  chunks={len(ch_paths)}  BCs={len(batch_bcs):,}", verbose)
+
+        # if no BCs, skip work for this batch
+        if not batch_bcs:
+            _log(f"[assign/edges]    (skip batch {bi}: 0 BCs)", verbose)
+            continue
 
         # --- stream each genome once and route rows to chunk accumulators ---
         for fp in files:
-            genome = _genome_from_filename(fp)
             kept_rows = 0
+            genome = _genome_from_filename(fp)
             for c in pd.read_csv(
-                fp, sep="\t", header=0,
+                fp, sep="\t",
                 usecols=["Read","BC","MAPQ","AS","NM","XAcount"],
-                chunksize=chunksize, dtype={"Read":"string","BC":"string"},
-                engine="c", low_memory=True, memory_map=False
+                chunksize=chunksize,
+                dtype={"Read":"string","BC":"string"},
+                engine="c", low_memory=True, memory_map=False,
             ):
-                # route to this batch's BCs early
+                # keep only BCs present in this batch
                 c = c[c["BC"].astype(str).isin(batch_bcs)]
                 if c.empty:
                     continue
-
-                # numeric + gates
+                # numeric coercion + filters
                 for col in ("AS","MAPQ","NM","XAcount"):
                     c[col] = pd.to_numeric(c[col], errors="coerce")
                 if mapq_min > 0:
@@ -482,17 +485,16 @@ def learn_edges_parallel(
                     c = c[c["XAcount"].fillna(0) <= xa_max]
                 if c.empty:
                     continue
-
-                # one (Read,BC) per genome
                 c = c.drop_duplicates(subset=["Read","BC"], keep="first")
 
-                # route
+                # route each (Read,BC) to its chunk accumulator
                 for row in c.itertuples(index=False):
-                    ch_path = bc_to_chunk.get(str(row.BC))
-                    if ch_path is None:
+                    key_bc = str(row.BC)
+                    ch = bc_to_chunk.get(key_bc)
+                    if ch is None:
                         continue
-                    rb = per_chunk_acc[ch_path]
-                    key = (str(row.Read), str(row.BC))
+                    rb = per_chunk_acc[ch]
+                    key = (str(row.Read), key_bc)
                     acc = rb.get(key)
                     if acc is None:
                         acc = {"best1": None, "best2": None, "worst": None, "seen_g": set()}
@@ -505,7 +507,6 @@ def learn_edges_parallel(
                         XA=float(row.XAcount) if pd.notna(row.XAcount) else float("inf"),
                     )
                     kept_rows += 1
-
             _log(f"[assign/edges]    ✓ genome {genome}  kept≈{kept_rows:,}", verbose)
 
         # --- reduce this batch: add winner (AS,MAPQ) to GLOBAL hist buffers ---
@@ -517,8 +518,8 @@ def learn_edges_parallel(
         batch_winners = 0
         for rb in per_chunk_acc.values():
             for acc in rb.values():
-                b1 = acc.get("best1")
-                if not b1:
+                b1 = acc["best1"]
+                if b1 is None:
                     continue
                 # AS bin
                 asv = b1["AS"]
@@ -545,7 +546,7 @@ def learn_edges_parallel(
 
                 batch_winners += 1
 
-        _log_ok(f"[assign/edges] ■ batch {bi}/{len(batches)} reduced  winners={batch_winners:,}", verbose)
+        _log_ok(f"[assign/edges] ■ batch {bi}/{len(batches)-1} reduced  winners={batch_winners:,}", verbose)
 
         # free memory for the batch
         per_chunk_acc.clear()
@@ -558,6 +559,7 @@ def learn_edges_parallel(
     np.savez_compressed(model_path, as_edges=as_edges, mq_edges=mq_edges, k=k)
     _log_ok(f"[assign/edges] done → {model_path}", verbose)
     return model_path
+
 
 
 def learn_ecdfs_parallel(
