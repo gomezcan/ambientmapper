@@ -149,7 +149,7 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     k          = int(aconf.get("k", 10))
     mapq_min   = int(aconf.get("mapq_min", 20))
     xa_max     = int(aconf.get("xa_max", 2))
-    chunksize  = int(aconf.get("chunksize", 500_000))  # default 0.5M
+    chunksize = int(aconf.get("chunksize", cfg.get("chunksize", 500_000))) # default 0.5M
     batch_size = int(aconf.get("batch_size", 32))
     chunks_dir = d["chunks"]
 
