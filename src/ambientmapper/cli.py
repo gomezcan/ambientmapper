@@ -173,7 +173,6 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     learn_edges_parallel(
         workdir=pool_workdir, sample=cfg["sample"], chunks_dir=chunks_dir,
         out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max,
-        out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max        
         chunksize=chunksize, k=k, batch_size=batch_size, 
         threads=threads, verbose=True
     )
