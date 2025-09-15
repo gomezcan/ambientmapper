@@ -55,9 +55,17 @@ def _cfg_from_inline(sample: str, genomes_csv: str, bams_csv: str,
         "workdir": str(Path(workdir).expanduser().resolve()),
     }
 
+def _load_config(config: Path) -> Dict[str, object]:
+    """Load a single-sample JSON config."""
+    cfg = json.loads(Path(config).read_text())
+    if "sample" not in cfg or "workdir" not in cfg or "genomes" not in cfg:
+        raise typer.BadParameter("Config must include: sample, workdir, genomes")
+    return cfg
+
 def _cfgs_from_tsv(tsv: Path, min_barcode_freq: int, chunk_size_cells: int) -> List[Dict[str, object]]:
     groups: Dict[str, Dict[str, str]] = {}
     workdirs: Dict[str, str] = {}
+    
     with open(tsv, "r", newline="") as f:
         r = csv.DictReader(f, delimiter="\t")
         need = {"sample","genome","bam","workdir"}
@@ -146,10 +154,10 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     typer.echo("[run] assign: learning edges/ECDFs & scoring chunks…")
     aconf      = cfg.get("assign", {}) if isinstance(cfg.get("assign"), dict) else {}
     alpha      = float(aconf.get("alpha", 0.05))
-    k          = int(aconf.get("k", 10))
+    k          = int(aconf.get("k", 10))    
     mapq_min   = int(aconf.get("mapq_min", 20))
-    xa_max     = int(aconf.get("xa_max", 2))
-    chunksize = int(aconf.get("chunksize", cfg.get("chunksize", 500_000))) # default 0.5M
+    xa_max     = int(aconf.get("xa_max", 2))    
+    chunksize  = int(aconf.get("chunksize", cfg.get("chunksize", 500_000)))  # default 0.5M    
     batch_size = int(aconf.get("batch_size", 32))
     chunks_dir = d["chunks"]
 
@@ -165,8 +173,11 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     learn_edges_parallel(
         workdir=pool_workdir, sample=cfg["sample"], chunks_dir=chunks_dir,
         out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max,
-        chunksize=chunksize, k=k, threads=threads, verbose=True
+        out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max        
+        chunksize=chunksize, k=k, batch_size=batch_size, 
+        threads=threads, verbose=True
     )
+
     learn_ecdfs_batched(
         workdir=pool_workdir, sample=cfg["sample"], chunks_dir=chunks_dir,
         edges_model=edges_npz, out_model=ecdf_npz,
@@ -184,9 +195,10 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
         return score_chunk(
             workdir=pool_workdir, sample=cfg["sample"], chunk_file=chf, ecdf_model=ecdf_npz,
             out_raw_dir=None, out_filtered_dir=None,
-            mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize, alpha=alpha
+            mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize_val, alpha=alpha
         )
 
+    
     with cf.ThreadPoolExecutor(max_workers=min(threads, len(chunk_files))) as ex:
         for _ in ex.map(_score_one, chunk_files):
             pass
@@ -240,24 +252,48 @@ def chunks(config: Path = typer.Option(..., "--config", "-c", exists=True, reada
 def assign(
     config: Path = typer.Option(..., "-c", "--config", exists=True),
     threads: int = typer.Option(16, "-t", "--threads"),
-    verbose: bool = typer.Option(True, "--verbose", help="Print per-chunk progress")
-
-):
+    chunksize: int | None = typer.Option(
+        None, "--chunksize",
+        help="Override pandas read_csv chunk size (rows per chunk). CLI > assign{} > top-level > default(500000)."
+    ),
+    batch_size: int | None = typer.Option(
+        None, "--batch-size",
+        help="Override batch size for batched winner-edge learning. CLI > assign{} > top-level > default(32)."
+    ),
+    verbose: bool = typer.Option(True, "--verbose/--quiet", help="Print per-chunk progress")
+) -> None:
+    """    
+    Modular assign: learn edges (global), learn ECDFs (global), then score each chunk (parallel)
     """
-    Modular assign: learn edges (global), learn ECDFs (global), then score each chunk (parallel).
-    """
+    
     from .assign_streaming import learn_edges_parallel, learn_ecdfs_batched, score_chunk
-
-    cfg = json.loads(Path(config).read_text())
+    
+    cfg = _load_config(config)
+    d = _cfg_dirs(cfg); _ensure_dirs(d)
     workdir = Path(cfg["workdir"])
-    sample  = cfg["sample"]
-    aconf   = cfg.get("assign", {})
-    alpha      = float(aconf.get("alpha", 0.05))
-    k          = int(aconf.get("k", 10))
-    mapq_min   = int(aconf.get("mapq_min", 20))
-    xa_max     = int(aconf.get("xa_max", 2))
-    chunksize  = int(aconf.get("chunksize", 500_000))  # default 0.5M
-    chunks_dir = Path(workdir) / sample / aconf.get("chunks_dir", "cell_map_ref_chunks")
+    sample = str(cfg["sample"])
+    chunks_dir = d["chunks"]
+    
+    aconf       = cfg.get("assign", {}) if isinstance(cfg.get("assign"), dict) else {}
+    alpha       = float(aconf.get("alpha", 0.05))
+    k           = int(aconf.get("k", 10))
+    mapq_min    = int(aconf.get("mapq_min", 20))
+    xa_max      = int(aconf.get("xa_max", 2))
+    # precedence: CLI > assign{} > top-level > default
+    chunksize_val = int(
+        chunksize
+        if chunksize is not None
+        else aconf.get("chunksize", cfg.get("chunksize", 500_000))
+    )
+    batch_size_val = int(
+        batch_size
+        if batch_size is not None
+        else aconf.get("batch_size", cfg.get("batch_size", 32))
+    )
+    
+    # Optional per-config override of chunks directory
+    if "chunks_dir" in aconf:
+        chunks_dir = Path(workdir) / sample / str(aconf["chunks_dir"])
 
     # model paths
     exp_dir   = Path(workdir) / sample / "ExplorationReadLevel"
@@ -265,29 +301,28 @@ def assign(
     ecdf_npz  = exp_dir / "global_ecdf.npz"
     exp_dir.mkdir(parents=True, exist_ok=True)
 
+    # small log so users can see the effective settings
+    if verbose:
+        typer.echo(f"[assign] effective chunksize={chunksize_val:,}  batch_size={batch_size_val}  threads={threads}")
+
     # 1) global models
     learn_edges_parallel(
         workdir=workdir, sample=sample, chunks_dir=chunks_dir,
         out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max,
-        chunksize=chunksize, k=k, threads=threads, verbose=verbose
+        chunksize=chunksize_val, k=k, batch_size=batch_size_val,
+        threads=threads, verbose=verbose
     )
+    
     learn_ecdfs_batched(
         workdir=workdir, sample=sample, chunks_dir=chunks_dir,
         edges_model=edges_npz, out_model=ecdf_npz,
-        mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize,
-        batch_size=int(aconf.get("batch_size", 32)),  # allow override via JSON
-        verbose=True
+        mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize_val,
+        batch_size=batch_size_val, verbose=verbose,
     )
-        
-    learn_ecdfs_parallel (  # type: ignore
-        workdir=workdir, sample=sample, chunks_dir=chunks_dir,
-        edges_model=edges_npz, out_model=ecdf_npz,
-        mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize,
-        verbose=verbose
-    )
-
+    
     # 2) per-chunk scoring in parallel
     chunk_files = sorted(chunks_dir.glob("*_cell_map_ref_chunk_*.txt"))
+
     if not chunk_files:
         typer.echo(f"[assign] No chunk files in {chunks_dir}")
         raise typer.Exit(code=2)
@@ -299,7 +334,7 @@ def assign(
                 score_chunk,
                 workdir=workdir, sample=sample, chunk_file=chf, ecdf_model=ecdf_npz,
                 out_raw_dir=None, out_filtered_dir=None,
-                mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize, alpha=alpha,
+                mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize_val, alpha=alpha,
             ): chf
             for chf in chunk_files
         }
@@ -312,9 +347,10 @@ def assign(
                 typer.echo(f"[assign/score][ERROR] {ch.name}: {e}")
                 raise
                 done += 1
-            if done % 5 == 0 or done == total:
-                typer.echo(f"[assign/score] {done}/{total} chunks")
-                typer.echo("[assign/score] done")
+                if done % 5 == 0 or done == total:
+                    typer.echo(f"[assign/score] {done}/{total} chunks")
+        typer.echo("[assign/score] done")
+    
     with cf.ThreadPoolExecutor(max_workers=threads) as ex:
         list(ex.map(run_one, chunk_files))
     typer.echo(f"[assign] Done. Models in {exp_dir}. Outputs in raw_cell_map_ref_chunks/ and cell_map_ref_chunks/")
