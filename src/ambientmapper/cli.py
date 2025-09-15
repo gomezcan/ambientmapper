@@ -327,6 +327,7 @@ def assign(
         raise typer.Exit(code=2)
     
     typer.echo(f"[assign/score] start: {len(chunk_files)} chunks, threads={min(threads, len(chunk_files))}")
+    
     with cf.ThreadPoolExecutor(max_workers=min(threads, len(chunk_files))) as ex:
         fut = {
             ex.submit(
@@ -345,13 +346,11 @@ def assign(
             except Exception as e:
                 typer.echo(f"[assign/score][ERROR] {ch.name}: {e}")
                 raise
-                done += 1
+            done += 1
                 if done % 5 == 0 or done == total:
                     typer.echo(f"[assign/score] {done}/{total} chunks")
         typer.echo("[assign/score] done")
-    
-    with cf.ThreadPoolExecutor(max_workers=threads) as ex:
-        list(ex.map(run_one, chunk_files))
+
     typer.echo(f"[assign] Done. Models in {exp_dir}. Outputs in raw_cell_map_ref_chunks/ and cell_map_ref_chunks/")
 
 
