@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Optional
 import time
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -126,7 +126,7 @@ def _filtered_files(workdir: Path, sample: str) -> list[Path]:
         raise FileNotFoundError(f"No filtered_* files under {d}")
     return files
 
-def _iter_read_bc_rows(fp: Path, bcs: set[str], chunksize: int, mapq_min: int, xa_max: int):
+def _iter_read_bc_rows(fp: Path, bcs: set[str], chunksize: Optional[int], mapq_min: int, xa_max: int):
     usecols = ["Read","BC","MAPQ","AS","NM","XAcount"]
     for c in pd.read_csv(
         fp, sep="\t", header=0, usecols=usecols, chunksize=chunksize,
@@ -183,7 +183,7 @@ def _edges_from_hist_counts(as_counts: np.ndarray, mq_counts: np.ndarray, k: int
 # ---------- map workers ----------
 def _map_winner_hist_for_chunk(
     workdir: Path, sample: str, chunk_file: Path,
-    mapq_min: int, xa_max: int, chunksize: int, verbose: bool = True
+    mapq_min: int, xa_max: int, chunksize: Optional[int], verbose: bool = True
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (AS_winner_counts, MAPQ_winner_counts) hist counts for this chunk."""
     files = _filtered_files(workdir, sample)
@@ -423,7 +423,7 @@ def learn_ecdfs(
 # ---------- Parallel map-reduce learners (library-level helpers) ----------
 def learn_edges_parallel(
     workdir: Path, sample: str, chunks_dir: Path,
-    out_model: Path | None, mapq_min: int, xa_max: int, chunksize: int, k: int,
+    out_model: Optional[Path], mapq_min: int, xa_max: int, chunksize: int, k: int,
     batch_size: int = 32, threads: int = 8, verbose: bool = False
 ) -> Path:
     """
@@ -564,7 +564,7 @@ def learn_edges_parallel(
 
 def learn_ecdfs_parallel(
     workdir: Path, sample: str, chunks_dir: Path,
-    edges_model: Path, out_model: Path | None,
+    edges_model: Path, out_model: Optional[Path],
     mapq_min: int, xa_max: int, chunksize: int,
     threads: int = 8, verbose: bool = False
 ) -> Path:
@@ -622,8 +622,8 @@ def learn_ecdfs_parallel(
 
 def learn_ecdfs_batched(
     workdir: Path, sample: str, chunks_dir: Path,
-    edges_model: Path, out_model: Path | None,
-    mapq_min: int, xa_max: int, chunksize: int,
+    edges_model: Path, out_model: Optional[Path],
+    mapq_min: int, xa_max: int, chunksize: Optional[int],
     batch_size: int = 32, verbose: bool = True
 ) -> Path:
     """
