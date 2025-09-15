@@ -347,8 +347,8 @@ def assign(
                 typer.echo(f"[assign/score][ERROR] {ch.name}: {e}")
                 raise
             done += 1
-                if done % 5 == 0 or done == total:
-                    typer.echo(f"[assign/score] {done}/{total} chunks")
+            if done % 5 == 0 or done == total:
+                typer.echo(f"[assign/score] {done}/{total} chunks")
         typer.echo("[assign/score] done")
 
     typer.echo(f"[assign] Done. Models in {exp_dir}. Outputs in raw_cell_map_ref_chunks/ and cell_map_ref_chunks/")
