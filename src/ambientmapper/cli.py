@@ -98,11 +98,11 @@ def _cfgs_from_tsv(tsv: Path, min_barcode_freq: int, chunk_size_cells: int) -> L
     return cfgs
 
 def _apply_assign_overrides(cfg: Dict[str, object],
-                            alpha: float | None = None,
-                            k: int | None = None,
-                            mapq_min: int | None = None,
-                            xa_max: int | None = None,
-                            chunksize: int | None = None) -> None:
+                            alpha: Optional[float] = None,
+                            k: Optional[int] = None,
+                            mapq_min: Optional[int] = None,
+                            xa_max: Optional[int] = None,
+                            chunksize: Optional[int] = None) -> None:
     """Ensure cfg['assign'] exists and apply CLI overrides if provided."""
     assign = cfg.get("assign")
     if not isinstance(assign, dict):
@@ -173,14 +173,14 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     learn_edges_parallel(
         workdir=pool_workdir, sample=cfg["sample"], chunks_dir=chunks_dir,
         out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max,
-        chunksize=chunksize, k=k, batch_size=batch_size, 
+        chunksize=chunksize_val, k=k, batch_size=batch_size, 
         threads=threads, verbose=True
     )
 
     learn_ecdfs_batched(
         workdir=pool_workdir, sample=cfg["sample"], chunks_dir=chunks_dir,
         edges_model=edges_npz, out_model=ecdf_npz,
-        mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize,
+        mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize_val,
         batch_size=batch_size, verbose=True
     )
 
@@ -251,11 +251,11 @@ def chunks(config: Path = typer.Option(..., "--config", "-c", exists=True, reada
 def assign(
     config: Path = typer.Option(..., "-c", "--config", exists=True),
     threads: int = typer.Option(16, "-t", "--threads"),
-    chunksize: int | None = typer.Option(
+    chunksize: Optional[int] = typer.Option(
         None, "--chunksize",
         help="Override pandas read_csv chunk size (rows per chunk). CLI > assign{} > top-level > default(500000)."
     ),
-    batch_size: int | None = typer.Option(
+    batch_size: Optional[int] = typer.Option(
         None, "--batch-size",
         help="Override batch size for batched winner-edge learning. CLI > assign{} > top-level > default(32)."
     ),
@@ -446,11 +446,11 @@ def run(
                                      help="TSV with columns: Genome, Pool [optional: Plate]"),
     xa_max: int = typer.Option(2, "--xa-max", help="Keep winners with XAcount <= xa_max in summary; set -1 to disable"),
         # NEW: assign overrides (apply in ALL modes if provided)
-    assign_alpha: float = typer.Option(None, "--assign-alpha", help="Override assign.alpha (e.g., 0.05)"),
-    assign_k: int = typer.Option(None, "--assign-k", help="Override assign.k deciles (default 10)"),
-    assign_mapq_min: int = typer.Option(None, "--assign-mapq-min", help="Override assign.mapq_min (default 20)"),
-    assign_xa_max: int = typer.Option(None, "--assign-xa-max", help="Override assign.xa_max (default 2)"),
-    assign_chunksize: int = typer.Option(None, "--assign-chunksize",
+    assign_alpha: Optional[float] = typer.Option(None, "--assign-alpha", help="Override assign.alpha (e.g., 0.05)"),
+    assign_k: Optional[int] = typer.Option(None, "--assign-k", help="Override assign.k deciles (default 10)"),
+    assign_mapq_min: Optional[int] = typer.Option(None, "--assign-mapq-min", help="Override assign.mapq_min (default 20)"),
+    assign_xa_max: Optional[int] = typer.Option(None, "--assign-xa-max", help="Override assign.xa_max (default 2)"),
+    assign_chunksize: Optional[int] = typer.Option(None, "--assign-chunksize",
                                          help="Override assign.chunksize rows per read_csv (default 500000)"),
 ):
     """
