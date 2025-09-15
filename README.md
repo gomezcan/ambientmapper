@@ -43,6 +43,7 @@ pip install -e /path/to/ambientmapper
 # or straight from GitHub
 pip install "git+https://github.com/gomezcan/ambientmapper.git"
 ```
+
 ### Uninstall
 ```
 pip uninstall -y ambientmapper
