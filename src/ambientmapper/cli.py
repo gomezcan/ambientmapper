@@ -4,7 +4,7 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import json, csv
 import concurrent.futures as cf
-from typing import Dict, List
+from typing import Dict, List, Optional
 import typer
 
 
