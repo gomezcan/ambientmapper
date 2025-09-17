@@ -439,11 +439,15 @@ def learn_edges_parallel(
     as_counts = np.zeros(_AS_RANGE[2], dtype=np.int64)
     mq_counts = np.zeros(_MQ_RANGE[2], dtype=np.int64)
 
-    total_chunks = len(chunk_files)
+    total_chunks = len(chunk_files)    
     batches = [(i, chunk_files[i:i+batch_size]) for i in range(0, total_chunks, batch_size)]
-    _log(f"[assign/edges] start: {total_chunks} chunks in {len(batches)} batches (batch_size={batch_size})", verbose)
+    total_batches = len(batches)    
+    _log(f"[assign/edges] start: {total_chunks} chunks in {total_batches} batches (batch_size={batch_size})", verbose)
 
-    for bi, ch_paths in batches:
+    import time
+    t_batch = time.time()
+    
+    for bnum, (offset, ch_paths) in enumerate(batches, start=1):
         bc_to_chunk: dict[str, Path] = {}
         per_chunk_acc: dict[Path, dict[tuple[str, str], dict]] = {}
 
@@ -454,7 +458,8 @@ def learn_edges_parallel(
                 bc_to_chunk[bc] = ch
         batch_bcs: set[str] = set(bc_to_chunk.keys())
 
-        _log(f"[assign/edges] ▶ batch {bi}/{len(batches)-1}  chunks={len(ch_paths)}  BCs={len(batch_bcs):,}", verbose)
+        _log(f"[assign/edges] ▶ batch {bnum}/{total_batches}  chunks={len(ch_paths)}  BCs={len(batch_bcs):,}", verbose)
+
 
         # if no BCs, skip work for this batch
         if not batch_bcs:
@@ -545,8 +550,13 @@ def learn_edges_parallel(
                     mq_counts[idx_mq] += 1
 
                 batch_winners += 1
-
-        _log_ok(f"[assign/edges] ■ batch {bi}/{len(batches)-1} reduced  winners={batch_winners:,}", verbose)
+        
+        _log_ok(
+            f"[assign/edges] ■ batch {bnum}/{total_batches} reduced  winners={batch_winners:,} "
+            f"elapsed={time.time() - t_batch:0.1f}s",
+            verbose
+        )
+        t_batch = time.time()
 
         # free memory for the batch
         per_chunk_acc.clear()
@@ -671,23 +681,32 @@ def learn_ecdfs_batched(
             for c in pd.read_csv(
                 fp, sep="\t",
                 usecols=["Read", "BC", "MAPQ", "AS", "NM", "XAcount"],
-                chunksize=chunksize, dtype={"Read": "string", "BC": "string"},
+                chunksize=chunksize, 
+                dtype={
+                    "Read": "string",
+                    "BC": "string",
+                    "AS": "float32",
+                    "MAPQ": "float32",
+                    "NM": "float32",
+                    "XAcount": "float32",
+                },
                 engine="c", low_memory=True, memory_map=False
             ):
                 # keep only BCs present in THIS batch
                 c = c[c["BC"].astype(str).isin(bc_to_chunk.keys())]
                 if c.empty:
                     continue
-                for col in ("AS", "MAPQ", "NM", "XAcount"):
-                    c[col] = pd.to_numeric(c[col], errors="coerce")
+                
                 if mapq_min > 0:
                     c = c[c["MAPQ"].fillna(0) >= mapq_min]
                 if xa_max >= 0:
                     c = c[c["XAcount"].fillna(0) <= xa_max]
                 if c.empty:
                     continue
-                # at most one (Read,BC) per genome file
-                c = c.drop_duplicates(subset=["Read", "BC"], keep="first")
+                
+                # at most one (Read,BC) per genome file                
+                if c.duplicated(subset=["Read","BC"]).any():
+                    c = c.drop_duplicates(subset=["Read","BC"], keep="first")
 
                 for row in c.itertuples(index=False):
                     ch = bc_to_chunk.get(str(row.BC))
