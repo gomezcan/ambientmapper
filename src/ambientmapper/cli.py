@@ -371,7 +371,7 @@ def assign(
 #    typer.echo(f"[merge] wrote {out} rows={n}")
 
 @app.command()
-def merge_summarize(
+def genotyping(
     config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
     assign_glob: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs (parquet/tsv/csv). Defaults to <workdir>/<sample>/cell_map_ref_chunks/**/*"),
     make_report: bool = typer.Option(True, "--report/--no-report"),
@@ -522,7 +522,7 @@ def run(
         _run_pipeline(cfg, threads)
         typer.echo(f"[run] {cfg['sample']} pipeline complete")
         # Always run posterior merge.summarize at the end of the pipeline
-        from .merge import run as posterior_merge_run
+        from .genotyping import genotyping as posterior_merge_run
         assign_glob = str(_cfg_dirs(cfg)["chunks"] / "**" / "*")
         posterior_merge_run(assign=assign_glob, outdir=_cfg_dirs(cfg)["final"], sample=cfg["sample"], make_report=True)
 
