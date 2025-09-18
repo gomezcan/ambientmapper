@@ -119,7 +119,7 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     from .extract import bam_to_qc
     from .filtering import filter_qc_file
     from .chunks import make_barcode_chunks
-    from .merge import merge_chunk_outputs
+    from .merge import run as posterior_merge_ru
     from .assign_streaming import learn_edges_parallel, learn_ecdfs_batched, score_chunk
     
     d = _cfg_dirs(cfg); _ensure_dirs(d)
@@ -157,7 +157,8 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     k          = int(aconf.get("k", 10))    
     mapq_min   = int(aconf.get("mapq_min", 20))
     xa_max     = int(aconf.get("xa_max", 2))    
-    chunksize  = int(aconf.get("chunksize", cfg.get("chunksize", 500_000)))  # default 0.5M    
+    # NOTE: fix NameError bug; keep a consistent var name
+    chunksize_val  = int(aconf.get("chunksize", cfg.get("chunksize", 500_000)))  # default 0.5M
     batch_size = int(aconf.get("batch_size", 32))
     chunks_dir = d["chunks"]
 
@@ -173,7 +174,7 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     learn_edges_parallel(
         workdir=pool_workdir, sample=cfg["sample"], chunks_dir=chunks_dir,
         out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max,
-        chunksize=chunksize_val, k=k, batch_size=batch_size, 
+        chunksize=chunksize_val, k=k, batch_size=batch_size,
         threads=threads, verbose=True
     )
 
@@ -201,11 +202,18 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     with cf.ThreadPoolExecutor(max_workers=min(threads, len(chunk_files))) as ex:
         for _ in ex.map(_score_one, chunk_files):
             pass
-
-    # 40) merge
-    out = d["final"] / f"{cfg['sample']}_per_read_winner.tsv.gz"
-    merge_chunk_outputs(d["chunks"], cfg["sample"], out)
-    typer.echo(f"[run] merge → {out}")
+        
+    # 40) posterior merge + summarize (replaces old winner-merge + summarize)
+    typer.echo("[run] merge.summarize: posterior-aware merge + QC…")
+    # robust default: look for assign outputs in the chunks folder (parquet/tsv/csv)
+    assign_glob = str(d["chunks"] / "**" / "*")
+    posterior_merge_run(
+        assign=assign_glob,
+        outdir=d["final"],
+        sample=cfg["sample"],
+        make_report=True,
+    )
+    typer.echo(f"[run] merge.summarize → {d['final']}")
 
 
 
@@ -354,30 +362,63 @@ def assign(
     typer.echo(f"[assign] Done. Models in {exp_dir}. Outputs in raw_cell_map_ref_chunks/ and cell_map_ref_chunks/")
 
 
+#@app.command()
+#def merge(config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True)):
+#    from .merge import merge_chunk_outputs
+#    cfg = json.loads(Path(config).read_text()); d = _cfg_dirs(cfg); _ensure_dirs(d)
+#    out = d["final"]/f"{cfg['sample']}_per_read_winner.tsv.gz"
+#    n = merge_chunk_outputs(d["chunks"], cfg["sample"], out)
+#    typer.echo(f"[merge] wrote {out} rows={n}")
+
 @app.command()
-def merge(config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True)):
-    from .merge import merge_chunk_outputs
+def merge_summarize(
+    config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
+    assign_glob: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs (parquet/tsv/csv). Defaults to <workdir>/<sample>/cell_map_ref_chunks/**/*"),
+    make_report: bool = typer.Option(True, "--report/--no-report"),
+):
+    """
+    Posterior-aware merge + summarize (replaces legacy winner-merge).
+    """
+    from .merge import run as posterior_merge_run
     cfg = json.loads(Path(config).read_text()); d = _cfg_dirs(cfg); _ensure_dirs(d)
-    out = d["final"]/f"{cfg['sample']}_per_read_winner.tsv.gz"
-    n = merge_chunk_outputs(d["chunks"], cfg["sample"], out)
-    typer.echo(f"[merge] wrote {out} rows={n}")
+    if not assign_glob:
+        assign_glob = str(d["chunks"] / "**" / "*")
+    posterior_merge_run(assign=assign_glob, outdir=d["final"], sample=cfg["sample"], make_report=make_report)
+    typer.echo(f"[merge] outputs in {d['final']}")
+
+
+# @app.command()
+# def summarize(
+#     config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True, help="Sample JSON"),
+#     pool_design: Path = typer.Option(None, "--pool-design", exists=True, readable=True,
+#                                      help="TSV with columns: Genome, Pool [optional: Plate]"),
+#     xa_max: int = typer.Option(2, "--xa-max", help="Keep winners with XAcount <= xa_max; -1 disables"),
+# ):
+#     """
+#     Summarize winner tables, make QC PDF, and produce Reads_to_discard CSV.
+#     """
+#     from .summary import summarize_cli
+#     out = summarize_cli(config_json=config, pool_design=pool_design, xa_max=xa_max)
+#     typer.echo(f"[summarize] PDF: {out['pdf']}")
+#     typer.echo(f"[summarize] HQ_BC: {out['hq_barcodes']}")
+#     typer.echo(f"[summarize] Reads_to_discard: {out['reads_to_discard']}")
+#     typer.echo(f"[summarize] winners={out['n_winners']} hq_bc={out['n_hq_bc']} discard_reads={out['n_discard_reads']}")
 
 @app.command()
 def summarize(
-    config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True, help="Sample JSON"),
-    pool_design: Path = typer.Option(None, "--pool-design", exists=True, readable=True,
-                                     help="TSV with columns: Genome, Pool [optional: Plate]"),
-    xa_max: int = typer.Option(2, "--xa-max", help="Keep winners with XAcount <= xa_max; -1 disables"),
+    config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
+    assign_glob: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs (parquet/tsv/csv)"),
 ):
     """
-    Summarize winner tables, make QC PDF, and produce Reads_to_discard CSV.
+    [Deprecated] Kept for backward compatibility.
+    Calls the new posterior-aware merge.summarize.
     """
-    from .summary import summarize_cli
-    out = summarize_cli(config_json=config, pool_design=pool_design, xa_max=xa_max)
-    typer.echo(f"[summarize] PDF: {out['pdf']}")
-    typer.echo(f"[summarize] HQ_BC: {out['hq_barcodes']}")
-    typer.echo(f"[summarize] Reads_to_discard: {out['reads_to_discard']}")
-    typer.echo(f"[summarize] winners={out['n_winners']} hq_bc={out['n_hq_bc']} discard_reads={out['n_discard_reads']}")
+    from .merge import run as posterior_merge_run
+    cfg = json.loads(Path(config).read_text()); d = _cfg_dirs(cfg); _ensure_dirs(d)
+    if not assign_glob:
+        assign_glob = str(d["chunks"] / "**" / "*")
+    posterior_merge_run(assign=assign_glob, outdir=d["final"], sample=cfg["sample"], make_report=True)
+    typer.echo(f"[summarize] outputs in {d['final']}")
 
 @app.command()
 def interpool(
@@ -438,13 +479,14 @@ def run(
     min_barcode_freq: int = typer.Option(10, "--min-barcode-freq"),
     chunk_size_cells: int = typer.Option(5000, "--chunk-size-cells"),
     threads: int = typer.Option(8, "--threads", "-t", min=1),
-    # NEW: summary options
-    with_summary: bool = typer.Option(False, "--with-summary", 
-                                      help="Produce summary PDF + PASS BCs + Reads_to_discard"),
-    pool_design: Path = typer.Option(None, "--pool-design", exists=True, readable=True,
-                                     help="TSV with columns: Genome, Pool [optional: Plate]"),
-    xa_max: int = typer.Option(2, "--xa-max", help="Keep winners with XAcount <= xa_max in summary; set -1 to disable"),
-        # NEW: assign overrides (apply in ALL modes if provided)
+    
+    #with_summary: bool = typer.Option(False, "--with-summary", help="Produce summary PDF + PASS BCs + Reads_to_discard"),
+    #pool_design: Path = typer.Option(None, "--pool-design", exists=True, readable=True, help="TSV with columns: Genome, Pool [optional: Plate]"),
+    #xa_max: int = typer.Option(2, "--xa-max", help="Keep winners with XAcount <= xa_max in summary; set -1 to disable"),
+    
+    # NEW: posterior-merge options (optional knobs if you want to expose later)    
+    # (Using defaults inside merge.run for now)
+    
     assign_alpha: Optional[float] = typer.Option(None, "--assign-alpha", help="Override assign.alpha (e.g., 0.05)"),
     assign_k: Optional[int] = typer.Option(None, "--assign-k", help="Override assign.k deciles (default 10)"),
     assign_mapq_min: Optional[int] = typer.Option(None, "--assign-mapq-min", help="Override assign.mapq_min (default 20)"),
@@ -479,35 +521,39 @@ def run(
         # run the pipeline
         _run_pipeline(cfg, threads)
         typer.echo(f"[run] {cfg['sample']} pipeline complete")
+        # Always run posterior merge.summarize at the end of the pipeline
+        from .merge import run as posterior_merge_run
+        assign_glob = str(_cfg_dirs(cfg)["chunks"] / "**" / "*")
+        posterior_merge_run(assign=assign_glob, outdir=_cfg_dirs(cfg)["final"], sample=cfg["sample"], make_report=True)
 
-        if with_summary:
-            from .summary import summarize_and_mark, _load_pool_design as load_pool_design
+        # if with_summary:
+        #     from .summary import summarize_and_mark, _load_pool_design as load_pool_design
 
-            # Decide the in-pool genome set:
-            # - If a pool design TSV is provided, use rows matching Pool==sample (or all rows if your loader permits).
-            # - Otherwise, treat the genomes listed in this sample's config as the in-pool list.
-            if pool_design:
-                inpool, _ = load_pool_design(
-                    pool_design, cfg["sample"], default_genomes=list(cfg["genomes"].keys())
-                )
-            else:
-                inpool = [g.upper() for g in cfg["genomes"].keys()]
+        #     # Decide the in-pool genome set:
+        #     # - If a pool design TSV is provided, use rows matching Pool==sample (or all rows if your loader permits).
+        #     # - Otherwise, treat the genomes listed in this sample's config as the in-pool list.
+        #     if pool_design:
+        #         inpool, _ = load_pool_design(
+        #             pool_design, cfg["sample"], default_genomes=list(cfg["genomes"].keys())
+        #         )
+        #     else:
+        #         inpool = [g.upper() for g in cfg["genomes"].keys()]
 
-            # Per-pool summary compares Low/High contamination only; no pools_for_sample arg needed.
-            out = summarize_and_mark(
-                workdir=Path(cfg["workdir"]),
-                sample=cfg["sample"],
-                inpool_genomes=inpool,
-                xa_max=xa_max,
-            )
+        #     # Per-pool summary compares Low/High contamination only; no pools_for_sample arg needed.
+        #     out = summarize_and_mark(
+        #         workdir=Path(cfg["workdir"]),
+        #         sample=cfg["sample"],
+        #         inpool_genomes=inpool,
+        #         xa_max=xa_max,
+        #     )
 
-            typer.echo(f"[summary] PDF: {out['pdf']}")
-            typer.echo(f"[summary] HQ_BC: {out['hq_barcodes']}")
-            typer.echo(f"[summary] Reads_to_discard: {out['reads_to_discard']}")
-            typer.echo(
-                f"[summary] winners={out['n_winners']} hq_bc={out['n_hq_bc']} "
-                f"discard_reads={out['n_discard_reads']}"
-            )
+        #     typer.echo(f"[summary] PDF: {out['pdf']}")
+        #     typer.echo(f"[summary] HQ_BC: {out['hq_barcodes']}")
+        #     typer.echo(f"[summary] Reads_to_discard: {out['reads_to_discard']}")
+        #     typer.echo(
+        #         f"[summary] winners={out['n_winners']} hq_bc={out['n_hq_bc']} "
+        #         f"discard_reads={out['n_discard_reads']}"
+        #     )
 
     if config:
         cfg = json.loads(Path(config).read_text())
