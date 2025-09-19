@@ -98,16 +98,17 @@ class MergeConfig(BaseModel):
 # ------------------------------
 
 def _read_table(path: Path) -> pd.DataFrame:
-  suf = "".join(path.suffixes).lower()
-  # Parquet (plain or gz)
-  if suf.endswith(".parquet") or suf.endswith(".parquet.gz"):
-    return pd.read_parquet(path)
+    suf = "".join(path.suffixes).lower()
+    # Parquet (plain or gz)
+    if suf.endswith(".parquet") or suf.endswith(".parquet.gz"):
+        return pd.read_parquet(path)
     # Delimited (plain or gz)
     if suf.endswith(".csv") or suf.endswith(".csv.gz"):
-      return pd.read_csv(path)
+        return pd.read_csv(path)
     if suf.endswith(".tsv") or suf.endswith(".tsv.gz") or suf.endswith(".txt") or suf.endswith(".txt.gz"):
-      return pd.read_csv(path, sep="\t")
+        return pd.read_csv(path, sep="\t")
     raise ValueError(f"Unsupported file format: {path}")
+
 
 REQUIRED_COLS = {"barcode", "read_id", "genome"}
 SCORE_COLS = ["AS", "MAPQ", "NM"]
@@ -317,7 +318,7 @@ def _select_model_for_barcode(L_block: pd.DataFrame, eta: pd.Series, cfg: MergeC
     # Derive additional QC metrics
     # Compute mass per genome (expected from L) under the best model, ignoring ambient part
     mass = L_block.groupby("genome")["L"].sum().sort_values(ascending=False)
-    top_mass = mass.iloc[0] if len(mass) else 0.0
+    
 
     # default outputs
     out = {
@@ -466,15 +467,14 @@ def _render_qc_report(calls: pd.DataFrame, out_pdf: Path, sample: str) -> None:
 # ------------------------------
 
 def _load_assign_tables(assign_glob: str) -> pd.DataFrame:
-    files = sorted([Path(p) for p in Path().glob(assign_glob)]) if ("*" in assign_glob or "?" in assign_glob or "[" in assign_glob) else [Path(assign_glob)]
+    files = [Path(p) for p in glob.glob(assign_glob, recursive=True)]
     if not files:
         raise FileNotFoundError(f"No assign files found for pattern: {assign_glob}")
     frames = []
     for fp in files:
-        df = _read_table(fp)
-        frames.append(df)
-    df_all = pd.concat(frames, ignore_index=True)
-    return df_all
+        frames.append(_read_table(fp))
+    return pd.concat(frames, ignore_index=True)
+
 
 
 def _topk_genomes_per_barcode(C: pd.DataFrame, k: int) -> Dict[str, List[str]]:
@@ -571,11 +571,22 @@ def genotyping(
     _write_gzip_df(drops_df, outdir / f"{sample}_Reads_to_discard.csv.gz")
     legacy_out.to_csv(outdir / f"{sample}_BCs_PASS_by_mapping.csv", index=False)
 
-    if make_report and len(calls):
-        _render_qc_report(calls, outdir / f"{sample}_qc_report.pdf", sample=sample)
+if make_report and not calls.empty:
+    _render_qc_report(calls, outdir / f"{sample}_qc_report.pdf", sample=sample)
 
-    typer.echo("[5/5] Done.")
-
+# Debugging output: expected counts per genome per barcode
+if not C.empty:
+    mat = (
+        C.pivot(index="barcode", columns="genome", values="C")
+         .sort_index(axis=1)           # nice, stable genome column order
+         .fillna(0.0)
+    )
+    # choose one of these:
+    mat.to_csv(outdir / f"{sample}_expected_counts_by_genome.csv")
+    # or (recommended for big matrices)
+    # mat.to_csv(outdir / f"{sample}_expected_counts_by_genome.csv.gz")
+    
+typer.echo("[5/5] Done.")
 
 if __name__ == "__main__":
     app()
