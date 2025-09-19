@@ -209,7 +209,7 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     typer.echo("[run] merge.summarize: posterior-aware merge + QC…")
     
     # robust default: look for assign outputs in the chunks folder (parquet/tsv/csv)
-      assign_glob = str(_cfg_dirs(cfg)["chunks"] / "**" / "*")
+    assign_glob = str(_cfg_dirs(cfg)["chunks"] / "**" / "*")
     _run_genotyping.callback(assign=assign_glob, 
                              outdir=_cfg_dirs(cfg)["final"], 
                              sample=cfg["sample"], 
