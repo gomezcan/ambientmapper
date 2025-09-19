@@ -121,6 +121,8 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     from .chunks import make_barcode_chunks
     from .merge import run as posterior_merge_ru
     from .assign_streaming import learn_edges_parallel, learn_ecdfs_batched, score_chunk
+    from .genotyping import genotyping as _run_genotyping
+
     
     d = _cfg_dirs(cfg); _ensure_dirs(d)
     genomes = sorted(cfg["genomes"].items())
@@ -205,17 +207,14 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
         
     # 40) posterior merge + summarize (replaces old winner-merge + summarize)
     typer.echo("[run] merge.summarize: posterior-aware merge + QC…")
+    
     # robust default: look for assign outputs in the chunks folder (parquet/tsv/csv)
-    assign_glob = str(d["chunks"] / "**" / "*")
-    posterior_merge_run(
-        assign=assign_glob,
-        outdir=d["final"],
-        sample=cfg["sample"],
-        make_report=True,
-    )
+      assign_glob = str(_cfg_dirs(cfg)["chunks"] / "**" / "*")
+    _run_genotyping.callback(assign=assign_glob, 
+                             outdir=_cfg_dirs(cfg)["final"], 
+                             sample=cfg["sample"], 
+                             make_report=True)
     typer.echo(f"[run] merge.summarize → {d['final']}")
-
-
 
 # ----------------
 # Stepwise commands (optional)
@@ -373,19 +372,23 @@ def assign(
 @app.command()
 def genotyping(
     config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
-    assign_glob: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs (parquet/tsv/csv). Defaults to <workdir>/<sample>/cell_map_ref_chunks/**/*"),
+    assign_glob: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs (parquet/csv/tsv)"),
+    outdir: Optional[Path] = typer.Option(None, "--outdir"),
+    sample: Optional[str] = typer.Option(None, "--sample"),
     make_report: bool = typer.Option(True, "--report/--no-report"),
 ):
     """
-    Posterior-aware merge + summarize (replaces legacy winner-merge).
+    Posterior-aware genotyping (merge + summarize + optional decontam).
     """
-    from .merge import run as posterior_merge_run
-    cfg = json.loads(Path(config).read_text()); d = _cfg_dirs(cfg); _ensure_dirs(d)
-    if not assign_glob:
-        assign_glob = str(d["chunks"] / "**" / "*")
-    posterior_merge_run(assign=assign_glob, outdir=d["final"], sample=cfg["sample"], make_report=make_report)
-    typer.echo(f"[merge] outputs in {d['final']}")
-
+    from .genotyping import genotyping as _run_genotyping
+    cfg = json.loads(Path(config).read_text())
+    d = _cfg_dirs(cfg); _ensure_dirs(d)
+    assign_glob = assign_glob or str(d["chunks"] / "**" / "*")
+    outdir = outdir or d["final"]
+    sample = sample or cfg["sample"]
+    _run_genotyping.callback(  # call the Typer command function directly
+        assign=assign_glob, outdir=outdir, sample=sample, make_report=make_report
+    )
 
 # @app.command()
 # def summarize(
