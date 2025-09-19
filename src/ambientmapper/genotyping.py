@@ -98,18 +98,15 @@ class MergeConfig(BaseModel):
 # ------------------------------
 
 def _read_table(path: Path) -> pd.DataFrame:
-    suf = path.suffix.lower()
-    if suf == ".gz":
-        suf2 = Path(path.stem).suffix.lower()
-        if suf2 == ".csv":
-            return pd.read_csv(path)
-        elif suf2 in (".tsv", ".txt"):
-            return pd.read_csv(path, sep="\t")
-    if suf in (".csv", ".tsv", ".txt"):
-        sep = "," if suf == ".csv" else "\t"
-        return pd.read_csv(path, sep=sep)
-    if suf == ".parquet":
-        return pd.read_parquet(path)
+  suf = "".join(path.suffixes).lower()
+  # Parquet (plain or gz)
+  if suf.endswith(".parquet") or suf.endswith(".parquet.gz"):
+    return pd.read_parquet(path)
+    # Delimited (plain or gz)
+    if suf.endswith(".csv") or suf.endswith(".csv.gz"):
+      return pd.read_csv(path)
+    if suf.endswith(".tsv") or suf.endswith(".tsv.gz") or suf.endswith(".txt") or suf.endswith(".txt.gz"):
+      return pd.read_csv(path, sep="\t")
     raise ValueError(f"Unsupported file format: {path}")
 
 REQUIRED_COLS = {"barcode", "read_id", "genome"}
@@ -150,13 +147,14 @@ def _fuse_support(df_grp: pd.DataFrame, cfg: MergeConfig) -> Tuple[np.ndarray, n
     else:
         S = np.sum(S_parts, axis=0)
 
-    # p-value penalty (ambiguity inside this read)
-    if set(PVAL_COLS).issubset(df_grp.columns):
-        pmin = np.minimum(df_grp["p_as"].to_numpy(dtype=float), df_grp["p_mq"].to_numpy(dtype=float))
-        gamma = np.maximum(cfg.p_eps, 1.0 - pmin)
+    # p-value penalty (ambiguity inside this read)  
+    if "p_as" in df_grp.columns or "p_mq" in df_grp.columns:
+      pa = df_grp["p_as"].to_numpy(dtype=float) if "p_as" in df_grp.columns else np.ones(len(df_grp))
+      pm = df_grp["p_mq"].to_numpy(dtype=float) if "p_mq" in df_grp.columns else np.ones(len(df_grp))
+      pmin = np.minimum(pa, pm)
+      gamma = np.maximum(cfg.p_eps, 1.0 - pmin)
     else:
-        gamma = np.ones(len(df_grp), dtype=float)
-
+      gamma = np.ones(len(df_grp), dtype=float)
     # softmax with temperature beta
     w = np.exp(cfg.beta * S) * gamma
     return S, gamma, w
@@ -175,6 +173,8 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
 
     # sort so groupby is stable & memory friendly
     df = df.sort_values(["barcode", "read_id"]).reset_index(drop=True)
+    df["barcode"] = df["barcode"].astype("category")
+    df["genome"] = df["genome"].astype("category")
 
     records = []
     # Efficient group iteration
@@ -571,7 +571,7 @@ def genotyping(
     _write_gzip_df(drops_df, outdir / f"{sample}_Reads_to_discard.csv.gz")
     legacy_out.to_csv(outdir / f"{sample}_BCs_PASS_by_mapping.csv", index=False)
 
-    if make_report:
+    if make_report and len(calls):
         _render_qc_report(calls, outdir / f"{sample}_qc_report.pdf", sample=sample)
 
     typer.echo("[5/5] Done.")
