@@ -210,9 +210,9 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     
     # robust default: look for assign outputs in the chunks folder (parquet/tsv/csv)
     assign_glob = str(_cfg_dirs(cfg)["chunks"] / "**" / "*")
-    _run_genotyping.callback(assign=assign_glob, 
-                             outdir=_cfg_dirs(cfg)["final"], 
-                             sample=cfg["sample"], 
+    _run_genotyping.callback(assign=assign_glob,
+                             outdir=_cfg_dirs(cfg)["final"],
+                             sample=cfg["sample"],
                              make_report=True)
     typer.echo(f"[run] merge.summarize → {d['final']}")
 
