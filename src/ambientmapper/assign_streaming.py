@@ -305,6 +305,268 @@ def _map_delta_hists_for_chunk(
     return dAS_counts, dAS_over, dMQ_counts, dMQ_over
 
 
+def _edges_batch_worker(
+    bi: int,
+    ch_paths: list[Path],
+    files: list[Path],
+    mapq_min: int,
+    xa_max: int,
+    chunksize: int,
+    k: int,
+    verbose: bool,
+    as_range: tuple[float, float, int],
+    mq_range: tuple[float, float, int],
+    max_reads_per_genome: int | None = None,
+):
+    import numpy as np
+    import pandas as pd
+
+    lo_as, hi_as, nb_as = as_range
+    lo_mq, hi_mq, nb_mq = mq_range
+    scale_as = (hi_as - lo_as)
+    scale_mq = (hi_mq - lo_mq)
+
+    # per-batch hist buffers
+    as_counts = np.zeros(nb_as, dtype=np.int64)
+    mq_counts = np.zeros(nb_mq, dtype=np.int64)
+
+    # Build BC -> chunk map + per-chunk accumulators
+    bc_to_chunk: dict[str, Path] = {}
+    per_chunk_acc: dict[Path, dict[tuple[str, str], dict]] = {}
+    for ch in ch_paths:
+        per_chunk_acc[ch] = {}
+        for bc in _chunk_bcs(ch):
+            bc_to_chunk[bc] = ch
+    batch_bcs = set(bc_to_chunk.keys())
+    if verbose:
+        _log(f"[assign/edges] ▶ batch {bi}  chunks={len(ch_paths)}  BCs={len(batch_bcs):,}", verbose)
+
+    # Stream each genome once
+    for fp in files:
+        kept_rows = 0
+        genome = _genome_from_filename(fp)
+        rows_seen_for_genome = 0
+        for c in pd.read_csv(
+            fp, sep="\t",
+            usecols=["Read","BC","MAPQ","AS","NM","XAcount"],
+            chunksize=chunksize,
+            dtype={"Read":"string","BC":"string"},
+            engine="c", low_memory=True, memory_map=False,
+        ):
+            # Optional cap to speed up model learning
+            if max_reads_per_genome is not None and rows_seen_for_genome >= max_reads_per_genome:
+                break
+
+            c = c[c["BC"].astype(str).isin(batch_bcs)]
+            if c.empty:
+                continue
+
+            for col in ("AS","MAPQ","NM","XAcount"):
+                c[col] = pd.to_numeric(c[col], errors="coerce")
+
+            if mapq_min > 0:
+                c = c[c["MAPQ"].fillna(0) >= mapq_min]
+            if xa_max >= 0:
+                c = c[c["XAcount"].fillna(0) <= xa_max]
+            if c.empty:
+                continue
+
+            c = c.drop_duplicates(subset=["Read","BC"], keep="first")
+
+            # If capped, trim this chunk so total per genome doesn't exceed cap
+            if max_reads_per_genome is not None:
+                remaining = max_reads_per_genome - rows_seen_for_genome
+                if remaining <= 0:
+                    break
+                if len(c) > remaining:
+                    c = c.iloc[:remaining]
+
+            for row in c.itertuples(index=False):
+                key_bc = str(row.BC)
+                ch = bc_to_chunk.get(key_bc)
+                if ch is None:
+                    continue
+                rb = per_chunk_acc[ch]
+                key = (str(row.Read), key_bc)
+                acc = rb.get(key)
+                if acc is None:
+                    acc = {"best1": None, "best2": None, "worst": None, "seen_g": set()}
+                    rb[key] = acc
+                _pick_best_two_and_worst(
+                    acc, genome,
+                    AS=float(row.AS) if pd.notna(row.AS) else float("-inf"),
+                    MAPQ=float(row.MAPQ) if pd.notna(row.MAPQ) else float("-inf"),
+                    NM=float(row.NM) if pd.notna(row.NM) else float("inf"),
+                    XA=float(row.XAcount) if pd.notna(row.XAcount) else float("inf"),
+                )
+                kept_rows += 1
+                rows_seen_for_genome += 1
+
+        if verbose:
+            _log(f"[assign/edges]    ✓ genome {genome}  kept≈{kept_rows:,}", verbose)
+
+    # Reduce winners -> per-batch hist
+    batch_winners = 0
+    for rb in per_chunk_acc.values():
+        for acc in rb.values():
+            b1 = acc["best1"]
+            if b1 is None:
+                continue
+            asv = b1["AS"]
+            if np.isfinite(asv):
+                if asv >= hi_as: idx_as = nb_as - 1
+                elif asv <= lo_as: idx_as = 0
+                else:
+                    idx_as = int((asv - lo_as) / scale_as * nb_as)
+                    idx_as = min(max(idx_as, 0), nb_as - 1)
+                as_counts[idx_as] += 1
+
+            mqv = b1["MAPQ"]
+            if np.isfinite(mqv):
+                if mqv >= hi_mq: idx_mq = nb_mq - 1
+                elif mqv <= lo_mq: idx_mq = 0
+                else:
+                    idx_mq = int((mqv - lo_mq) / scale_mq * nb_mq)
+                    idx_mq = min(max(idx_mq, 0), nb_mq - 1)
+                mq_counts[idx_mq] += 1
+
+            batch_winners += 1
+
+    # Return the partial histograms and counts
+    return bi, as_counts, mq_counts, batch_winners
+
+####
+def _edges_batch_worker(
+    bi: int,
+    ch_paths: list[Path],
+    files: list[Path],
+    mapq_min: int,
+    xa_max: int,
+    chunksize: int,
+    k: int,
+    verbose: bool,
+    as_range: tuple[float, float, int],
+    mq_range: tuple[float, float, int],
+    max_reads_per_genome: int | None = None,
+):
+    import numpy as np
+    import pandas as pd
+
+    lo_as, hi_as, nb_as = as_range
+    lo_mq, hi_mq, nb_mq = mq_range
+    scale_as = (hi_as - lo_as)
+    scale_mq = (hi_mq - lo_mq)
+
+    # per-batch hist buffers
+    as_counts = np.zeros(nb_as, dtype=np.int64)
+    mq_counts = np.zeros(nb_mq, dtype=np.int64)
+
+    # Build BC -> chunk map + per-chunk accumulators
+    bc_to_chunk: dict[str, Path] = {}
+    per_chunk_acc: dict[Path, dict[tuple[str, str], dict]] = {}
+    for ch in ch_paths:
+        per_chunk_acc[ch] = {}
+        for bc in _chunk_bcs(ch):
+            bc_to_chunk[bc] = ch
+    batch_bcs = set(bc_to_chunk.keys())
+    if verbose:
+        _log(f"[assign/edges] ▶ batch {bi}  chunks={len(ch_paths)}  BCs={len(batch_bcs):,}", verbose)
+
+    # Stream each genome once
+    for fp in files:
+        kept_rows = 0
+        genome = _genome_from_filename(fp)
+        rows_seen_for_genome = 0
+        for c in pd.read_csv(
+            fp, sep="\t",
+            usecols=["Read","BC","MAPQ","AS","NM","XAcount"],
+            chunksize=chunksize,
+            dtype={"Read":"string","BC":"string"},
+            engine="c", low_memory=True, memory_map=False,
+        ):
+            # Optional cap to speed up model learning
+            if max_reads_per_genome is not None and rows_seen_for_genome >= max_reads_per_genome:
+                break
+
+            c = c[c["BC"].astype(str).isin(batch_bcs)]
+            if c.empty:
+                continue
+
+            for col in ("AS","MAPQ","NM","XAcount"):
+                c[col] = pd.to_numeric(c[col], errors="coerce")
+
+            if mapq_min > 0:
+                c = c[c["MAPQ"].fillna(0) >= mapq_min]
+            if xa_max >= 0:
+                c = c[c["XAcount"].fillna(0) <= xa_max]
+            if c.empty:
+                continue
+
+            c = c.drop_duplicates(subset=["Read","BC"], keep="first")
+
+            # If capped, trim this chunk so total per genome doesn't exceed cap
+            if max_reads_per_genome is not None:
+                remaining = max_reads_per_genome - rows_seen_for_genome
+                if remaining <= 0:
+                    break
+                if len(c) > remaining:
+                    c = c.iloc[:remaining]
+
+            for row in c.itertuples(index=False):
+                key_bc = str(row.BC)
+                ch = bc_to_chunk.get(key_bc)
+                if ch is None:
+                    continue
+                rb = per_chunk_acc[ch]
+                key = (str(row.Read), key_bc)
+                acc = rb.get(key)
+                if acc is None:
+                    acc = {"best1": None, "best2": None, "worst": None, "seen_g": set()}
+                    rb[key] = acc
+                _pick_best_two_and_worst(
+                    acc, genome,
+                    AS=float(row.AS) if pd.notna(row.AS) else float("-inf"),
+                    MAPQ=float(row.MAPQ) if pd.notna(row.MAPQ) else float("-inf"),
+                    NM=float(row.NM) if pd.notna(row.NM) else float("inf"),
+                    XA=float(row.XAcount) if pd.notna(row.XAcount) else float("inf"),
+                )
+                kept_rows += 1
+                rows_seen_for_genome += 1
+
+        if verbose:
+            _log(f"[assign/edges]    ✓ genome {genome}  kept≈{kept_rows:,}", verbose)
+
+    # Reduce winners -> per-batch hist
+    batch_winners = 0
+    for rb in per_chunk_acc.values():
+        for acc in rb.values():
+            b1 = acc["best1"]
+            if b1 is None:
+                continue
+            asv = b1["AS"]
+            if np.isfinite(asv):
+                if asv >= hi_as: idx_as = nb_as - 1
+                elif asv <= lo_as: idx_as = 0
+                else:
+                    idx_as = int((asv - lo_as) / scale_as * nb_as)
+                    idx_as = min(max(idx_as, 0), nb_as - 1)
+                as_counts[idx_as] += 1
+
+            mqv = b1["MAPQ"]
+            if np.isfinite(mqv):
+                if mqv >= hi_mq: idx_mq = nb_mq - 1
+                elif mqv <= lo_mq: idx_mq = 0
+                else:
+                    idx_mq = int((mqv - lo_mq) / scale_mq * nb_mq)
+                    idx_mq = min(max(idx_mq, 0), nb_mq - 1)
+                mq_counts[idx_mq] += 1
+
+            batch_winners += 1
+
+    # Return the partial histograms and counts
+    return bi, as_counts, mq_counts, batch_winners
+
+
 # ---------- Pass A (CLI): learn global decile edges (serial) ----------
 @app.command()
 def learn_edges(
@@ -422,163 +684,83 @@ def learn_ecdfs(
 
 # ---------- Parallel map-reduce learners (library-level helpers) ----------
 def learn_edges_parallel(
-    workdir: Path, sample: str, chunks_dir: Path,
-    out_model: Optional[Path], mapq_min: int, xa_max: int, chunksize: int, k: int,
-    batch_size: int = 32, threads: int = 8, verbose: bool = False
+    workdir: Path, 
+    sample: str, 
+    chunks_dir: Path,
+    out_model: Optional[Path], 
+    mapq_min: int, 
+    xa_max: int, 
+    chunksize: int, 
+    k: int,
+    batch_size: int = 32, 
+    threads: int = 8, 
+    verbose: bool = False,
+    edges_workers: Optional[int],
+    edges_max_reads: Optional[int], 
 ) -> Path:
     """
-    Batched map-reduce: read each genome once per batch of chunk files,
-    route rows by BC → per-chunk accumulators, then reduce winners to global hist counts.
+    Parallel *batched* map-reduce with concurrent batches:
+    read each genome once per batch, route rows by BC, then reduce winners to hist counts.
     """
+    import numpy as np
+
     chunk_files = sorted(Path(chunks_dir).glob(f"{sample}_cell_map_ref_chunk_*.txt"))
     if not chunk_files:
         raise typer.BadParameter(f"No chunk files under {chunks_dir}")
     files = _filtered_files(workdir, sample)
 
-    # global hist buffers (fixed specs)
+    # global hist buffers
     as_counts = np.zeros(_AS_RANGE[2], dtype=np.int64)
     mq_counts = np.zeros(_MQ_RANGE[2], dtype=np.int64)
 
-    total_chunks = len(chunk_files)    
+    total_chunks = len(chunk_files)
     batches = [(i, chunk_files[i:i+batch_size]) for i in range(0, total_chunks, batch_size)]
-    total_batches = len(batches)    
-    _log(f"[assign/edges] start: {total_chunks} chunks in {total_batches} batches (batch_size={batch_size})", verbose)
+    _log(f"[assign/edges] start: {total_chunks} chunks in {len(batches)} batches (batch_size={batch_size})", verbose)
 
-    import time
-    t_batch = time.time()
-    
-    for bnum, (offset, ch_paths) in enumerate(batches, start=1):
-        bc_to_chunk: dict[str, Path] = {}
-        per_chunk_acc: dict[Path, dict[tuple[str, str], dict]] = {}
+    max_workers = min(edges_workers or threads, len(batches))
+    futures = []
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        for bi, ch_paths in batches:
+            fut = ex.submit(
+                _edges_batch_worker,
+                bi, ch_paths, files,
+                mapq_min, xa_max, chunksize, k, verbose,
+                _AS_RANGE, _MQ_RANGE,
+                edges_max_reads
+            )
+            futures.append(fut)
 
-        # index BCs for this batch and init per-chunk accumulators
-        for ch in ch_paths:
-            per_chunk_acc[ch] = {}
-            for bc in _chunk_bcs(ch):
-                bc_to_chunk[bc] = ch
-        batch_bcs: set[str] = set(bc_to_chunk.keys())
+        for f in as_completed(futures):
+            bi, as_part, mq_part, won = f.result()
+            # reduce partials
+            as_counts += as_part
+            mq_counts += mq_part
+            _log_ok(f"[assign/edges] ■ batch {bi} reduced  winners={won:,}", verbose)
 
-        _log(f"[assign/edges] ▶ batch {bnum}/{total_batches}  chunks={len(ch_paths)}  BCs={len(batch_bcs):,}", verbose)
-
-
-        # if no BCs, skip work for this batch
-        if not batch_bcs:
-            _log(f"[assign/edges]    (skip batch {bi}: 0 BCs)", verbose)
-            continue
-
-        # --- stream each genome once and route rows to chunk accumulators ---
-        for fp in files:
-            kept_rows = 0
-            genome = _genome_from_filename(fp)
-            for c in pd.read_csv(
-                fp, sep="\t",
-                usecols=["Read","BC","MAPQ","AS","NM","XAcount"],
-                chunksize=chunksize,
-                dtype={"Read":"string","BC":"string"},
-                engine="c", low_memory=True, memory_map=False,
-            ):
-                # keep only BCs present in this batch
-                c = c[c["BC"].astype(str).isin(batch_bcs)]
-                if c.empty:
-                    continue
-                # numeric coercion + filters
-                for col in ("AS","MAPQ","NM","XAcount"):
-                    c[col] = pd.to_numeric(c[col], errors="coerce")
-                if mapq_min > 0:
-                    c = c[c["MAPQ"].fillna(0) >= mapq_min]
-                if xa_max >= 0:
-                    c = c[c["XAcount"].fillna(0) <= xa_max]
-                if c.empty:
-                    continue
-                c = c.drop_duplicates(subset=["Read","BC"], keep="first")
-
-                # route each (Read,BC) to its chunk accumulator
-                for row in c.itertuples(index=False):
-                    key_bc = str(row.BC)
-                    ch = bc_to_chunk.get(key_bc)
-                    if ch is None:
-                        continue
-                    rb = per_chunk_acc[ch]
-                    key = (str(row.Read), key_bc)
-                    acc = rb.get(key)
-                    if acc is None:
-                        acc = {"best1": None, "best2": None, "worst": None, "seen_g": set()}
-                        rb[key] = acc
-                    _pick_best_two_and_worst(
-                        acc, genome,
-                        AS=float(row.AS) if pd.notna(row.AS) else float("-inf"),
-                        MAPQ=float(row.MAPQ) if pd.notna(row.MAPQ) else float("-inf"),
-                        NM=float(row.NM) if pd.notna(row.NM) else float("inf"),
-                        XA=float(row.XAcount) if pd.notna(row.XAcount) else float("inf"),
-                    )
-                    kept_rows += 1
-            _log(f"[assign/edges]    ✓ genome {genome}  kept≈{kept_rows:,}", verbose)
-
-        # --- reduce this batch: add winner (AS,MAPQ) to GLOBAL hist buffers ---
-        lo_as, hi_as, nb_as = _AS_RANGE
-        lo_mq, hi_mq, nb_mq = _MQ_RANGE
-        scale_as = (hi_as - lo_as)
-        scale_mq = (hi_mq - lo_mq)
-
-        batch_winners = 0
-        for rb in per_chunk_acc.values():
-            for acc in rb.values():
-                b1 = acc["best1"]
-                if b1 is None:
-                    continue
-                # AS bin
-                asv = b1["AS"]
-                if np.isfinite(asv):
-                    if asv >= hi_as:
-                        idx_as = nb_as - 1
-                    elif asv <= lo_as:
-                        idx_as = 0
-                    else:
-                        idx_as = int((asv - lo_as) / scale_as * nb_as)
-                        idx_as = min(max(idx_as, 0), nb_as - 1)
-                    as_counts[idx_as] += 1
-                # MAPQ bin
-                mqv = b1["MAPQ"]
-                if np.isfinite(mqv):
-                    if mqv >= hi_mq:
-                        idx_mq = nb_mq - 1
-                    elif mqv <= lo_mq:
-                        idx_mq = 0
-                    else:
-                        idx_mq = int((mqv - lo_mq) / scale_mq * nb_mq)
-                        idx_mq = min(max(idx_mq, 0), nb_mq - 1)
-                    mq_counts[idx_mq] += 1
-
-                batch_winners += 1
-        
-        _log_ok(
-            f"[assign/edges] ■ batch {bnum}/{total_batches} reduced  winners={batch_winners:,} "
-            f"elapsed={time.time() - t_batch:0.1f}s",
-            verbose
-        )
-        t_batch = time.time()
-
-        # free memory for the batch
-        per_chunk_acc.clear()
-        bc_to_chunk.clear()
-
-    # --- finalize edges and write model ---
+    # finalize
     as_edges, mq_edges = _edges_from_hist_counts(as_counts, mq_counts, k)
     model_path = out_model or (Path(workdir) / sample / "ExplorationReadLevel" / "global_edges.npz")
     model_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(model_path, as_edges=as_edges, mq_edges=mq_edges, k=k)
     _log_ok(f"[assign/edges] done → {model_path}", verbose)
     return model_path
-
-
-
+    
 def learn_ecdfs_parallel(
-    workdir: Path, sample: str, chunks_dir: Path,
-    edges_model: Path, out_model: Optional[Path],
-    mapq_min: int, xa_max: int, chunksize: int,
-    threads: int = 8, verbose: bool = False
+    workdir: Path,
+    sample: str,
+    chunks_dir: Path,
+    edges_model: Path,
+    out_model: Optional[Path],
+    mapq_min: int,
+    xa_max: int,
+    chunksize: int,
+    threads: int = 8,
+    verbose: bool = False,
+    edges_workers: Optional[int],
 ) -> Path:
     """Parallel map-reduce: per-chunk per-decile Δ histograms → global ECDF model."""
+    max_workers = min(ecdf_workers or threads, len(batches))
+    
     dat = np.load(edges_model)
     as_edges, mq_edges, k = dat["as_edges"], dat["mq_edges"], int(dat["k"])
 
