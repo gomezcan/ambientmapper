@@ -909,8 +909,8 @@ def score_chunk(
             dAS = dMQ = dNM = np.nan
         dec_as = int(assign_decile(np.array([as1]), as_edges)[0]) if as_edges.size else 1
         dec_mq = int(assign_decile(np.array([mq1]), mq_edges)[0]) if mq_edges.size else 1
-        p_as = H_dAS[dec_as-1].tail_p(dAS) if (np.isfinite(dAS)) else np.nan
-        p_mq = H_dMQ[dec_mq-1].tail_p(dMQ) if (np.isfinite(dMQ)) else np.nan
+        p_as = H_dAS[dec_as-1].tail_p(dAS) if np.isfinite(dAS) else np.nan
+        p_mq = H_dMQ[dec_mq-1].tail_p(dMQ) if np.isfinite(dMQ) else np.nan
         clear_by_p  = (np.isfinite(p_as) and p_as <= alpha) or (np.isfinite(p_mq) and p_mq <= alpha)
         clear_by_nm = (np.isfinite(dNM) and dNM > 0)
         single_hit  = b2 is None
@@ -926,10 +926,17 @@ def score_chunk(
             "delta_MAPQ_1_last": (mq1 - (bw["MAPQ"] if bw else np.nan)),
             "delta_NM_1_last": ((bw["NM"] if bw else np.nan) - nm1),
             "n_genomes_considered": len(acc.get("seen_g", [])),
-            "decile_AS": dec_as, "decile_MAPQ": dec_mq, "p_as_decile": p_as, "p_mq_decile": p_mq,
+            "decile_AS": dec_as, "decile_MAPQ": dec_mq, "p_as": p_as, "p_mq": p_mq,
             "assigned_class": klass,
         })
     raw_df = pd.DataFrame(raw_rows)
+    p_lookup = {(r, b): (pa, pm) for r, b, pa, pm in zip(
+        raw_df["Read"].astype(str),
+        raw_df["BC"].astype(str),
+        raw_df["p_as"].astype(float),
+        raw_df["p_mq"].astype(float),
+    )}
+    
     raw_df.to_csv(raw_out, sep="\t", index=False, compression="gzip")
 
     # FILTERED alignment-level rows
@@ -957,11 +964,20 @@ def score_chunk(
             for row in c.itertuples(index=False):
                 r, b = str(row.Read), str(row.BC)
                 klass = class_by.get((r, b), "ambiguous")                
-                if klass == "winner":                    
+                pa, pm = p_lookup.get((r, b), (np.nan, np.nan))
+                base = row._asdict()
+                base.update({
+                    "Genome": genome,
+                    "delta_AS": np.nan,            # (you can drop or fill later)
+                    "assigned_class": klass,
+                    "p_as": pa,
+                    "p_mq": pm,
+                })
+                if klass == "winner":
                     if genome == gwin_by.get((r, b)):
-                        out_rows.append(row._asdict() | {"Genome": genome, "delta_AS": np.nan, "assigned_class": "winner"})
-                else:
-                    out_rows.append(row._asdict() | {"Genome": genome, "delta_AS": np.nan, "assigned_class": "ambiguous"})
+                        out_rows.append(base)
+                    else:
+                        out_rows.append(base)
     pd.DataFrame(out_rows).to_csv(filt_out, sep="\t", index=False, compression="gzip")
 
 
