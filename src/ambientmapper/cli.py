@@ -159,9 +159,11 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     k          = int(aconf.get("k", 10))    
     mapq_min   = int(aconf.get("mapq_min", 20))
     xa_max     = int(aconf.get("xa_max", 2))    
-    # NOTE: fix NameError bug; keep a consistent var name
+    
     chunksize_val  = int(aconf.get("chunksize", cfg.get("chunksize", 500_000)))  # default 0.5M
     batch_size = int(aconf.get("batch_size", 32))
+    edges_workers = aconf.get("edges_workers")  # optional in JSON
+    edges_max_reads = aconf.get("edges_max_reads")
     chunks_dir = d["chunks"]
 
     exp_dir   = d["root"] / "ExplorationReadLevel"
@@ -177,7 +179,9 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
         workdir=pool_workdir, sample=cfg["sample"], chunks_dir=chunks_dir,
         out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max,
         chunksize=chunksize_val, k=k, batch_size=batch_size,
-        threads=threads, verbose=True
+        threads=threads, verbose=True,
+        edges_workers=edges_workers, 
+        edges_max_reads=edges_max_reads
     )
 
     learn_ecdfs_batched(
@@ -258,6 +262,10 @@ def chunks(config: Path = typer.Option(..., "--config", "-c", exists=True, reada
 def assign(
     config: Path = typer.Option(..., "-c", "--config", exists=True),
     threads: int = typer.Option(16, "-t", "--threads"),
+    edges_workers: Optional[int] = typer.Option(None, "--edges-workers",
+        help="Max process workers for learn_edges_parallel (default: = --threads)"),
+    edges_max_reads: Optional[int] = typer.Option(None, "--edges-max-reads",
+        help="Optional cap of reads per genome when learning edges (speeds up on huge files)"),
     chunksize: Optional[int] = typer.Option(
         None, "--chunksize",
         help="Override pandas read_csv chunk size (rows per chunk). CLI > assign{} > top-level > default(500000)."
@@ -316,7 +324,8 @@ def assign(
         workdir=workdir, sample=sample, chunks_dir=chunks_dir,
         out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max,
         chunksize=chunksize_val, k=k, batch_size=batch_size_val,
-        threads=threads, verbose=verbose
+        threads=threads, verbose=verbose,
+        edges_workers=edges_workers, edges_max_reads=edges_max_reads
     )
     
     learn_ecdfs_batched(
@@ -361,14 +370,6 @@ def assign(
     typer.echo(f"[assign] Done. Models in {exp_dir}. Outputs in raw_cell_map_ref_chunks/ and cell_map_ref_chunks/")
 
 
-#@app.command()
-#def merge(config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True)):
-#    from .merge import merge_chunk_outputs
-#    cfg = json.loads(Path(config).read_text()); d = _cfg_dirs(cfg); _ensure_dirs(d)
-#    out = d["final"]/f"{cfg['sample']}_per_read_winner.tsv.gz"
-#    n = merge_chunk_outputs(d["chunks"], cfg["sample"], out)
-#    typer.echo(f"[merge] wrote {out} rows={n}")
-
 @app.command()
 def genotyping(
     config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
@@ -389,23 +390,6 @@ def genotyping(
     _run_genotyping.callback(  # call the Typer command function directly
         assign=assign_glob, outdir=outdir, sample=sample, make_report=make_report
     )
-
-# @app.command()
-# def summarize(
-#     config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True, help="Sample JSON"),
-#     pool_design: Path = typer.Option(None, "--pool-design", exists=True, readable=True,
-#                                      help="TSV with columns: Genome, Pool [optional: Plate]"),
-#     xa_max: int = typer.Option(2, "--xa-max", help="Keep winners with XAcount <= xa_max; -1 disables"),
-# ):
-#     """
-#     Summarize winner tables, make QC PDF, and produce Reads_to_discard CSV.
-#     """
-#     from .summary import summarize_cli
-#     out = summarize_cli(config_json=config, pool_design=pool_design, xa_max=xa_max)
-#     typer.echo(f"[summarize] PDF: {out['pdf']}")
-#     typer.echo(f"[summarize] HQ_BC: {out['hq_barcodes']}")
-#     typer.echo(f"[summarize] Reads_to_discard: {out['reads_to_discard']}")
-#     typer.echo(f"[summarize] winners={out['n_winners']} hq_bc={out['n_hq_bc']} discard_reads={out['n_discard_reads']}")
 
 @app.command()
 def summarize(
@@ -529,59 +513,28 @@ def run(
         assign_glob = str(_cfg_dirs(cfg)["chunks"] / "**" / "*")
         posterior_merge_run(assign=assign_glob, outdir=_cfg_dirs(cfg)["final"], sample=cfg["sample"], make_report=True)
 
-        # if with_summary:
-        #     from .summary import summarize_and_mark, _load_pool_design as load_pool_design
-
-        #     # Decide the in-pool genome set:
-        #     # - If a pool design TSV is provided, use rows matching Pool==sample (or all rows if your loader permits).
-        #     # - Otherwise, treat the genomes listed in this sample's config as the in-pool list.
-        #     if pool_design:
-        #         inpool, _ = load_pool_design(
-        #             pool_design, cfg["sample"], default_genomes=list(cfg["genomes"].keys())
-        #         )
-        #     else:
-        #         inpool = [g.upper() for g in cfg["genomes"].keys()]
-
-        #     # Per-pool summary compares Low/High contamination only; no pools_for_sample arg needed.
-        #     out = summarize_and_mark(
-        #         workdir=Path(cfg["workdir"]),
-        #         sample=cfg["sample"],
-        #         inpool_genomes=inpool,
-        #         xa_max=xa_max,
-        #     )
-
-        #     typer.echo(f"[summary] PDF: {out['pdf']}")
-        #     typer.echo(f"[summary] HQ_BC: {out['hq_barcodes']}")
-        #     typer.echo(f"[summary] Reads_to_discard: {out['reads_to_discard']}")
-        #     typer.echo(
-        #         f"[summary] winners={out['n_winners']} hq_bc={out['n_hq_bc']} "
-        #         f"discard_reads={out['n_discard_reads']}"
-        #     )
-
     if config:
         cfg = json.loads(Path(config).read_text())
         _apply_assign_overrides(cfg,
             alpha=assign_alpha, k=assign_k, mapq_min=assign_mapq_min,
             xa_max=assign_xa_max, chunksize=assign_chunksize)
         _do_one(cfg)
-    raise typer.Exit()
-
-    if inline_ready:
+        return
+    elif inline_ready:
         cfg = _cfg_from_inline(sample, genome, bam, str(workdir), min_barcode_freq, chunk_size_cells)
         _apply_assign_overrides(cfg,
             alpha=assign_alpha, k=assign_k, mapq_min=assign_mapq_min,
             xa_max=assign_xa_max, chunksize=assign_chunksize)
         _do_one(cfg)
-    raise typer.Exit()
-
-    if configs:
+        return
+    elif configs:
         batch = _cfgs_from_tsv(configs, min_barcode_freq, chunk_size_cells)
-    if not batch:
-        typer.echo("[run] no configs found in TSV"); raise typer.Exit(0)
-    for cfg in batch:
-        _apply_assign_overrides(cfg,
-            alpha=assign_alpha, k=assign_k, mapq_min=assign_mapq_min,
-            xa_max=assign_xa_max, chunksize=assign_chunksize)
-        typer.echo(f"[run] starting {cfg['sample']}")
-        _do_one(cfg)
-    raise typer.Exit()
+        if not batch:
+            typer.echo("[run] no configs found in TSV"); return
+        for cfg in batch:
+            _apply_assign_overrides(cfg,
+                alpha=assign_alpha, k=assign_k, mapq_min=assign_mapq_min,
+                xa_max=assign_xa_max, chunksize=assign_chunksize)
+            typer.echo(f"[run] starting {cfg['sample']}")
+            _do_one(cfg)
+        return
