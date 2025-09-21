@@ -59,6 +59,8 @@ import pandas as pd
 import typer
 from pydantic import BaseModel
 from tqdm import tqdm
+import glob
+
 
 # Optional but nice to have for summary plots
 try:
@@ -109,6 +111,51 @@ def _read_table(path: Path) -> pd.DataFrame:
         return pd.read_csv(path, sep="\t")
     raise ValueError(f"Unsupported file format: {path}")
 
+def _coerce_assign_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename columns from assign outputs to the schema expected by genotyping."""
+    rename = {}
+    if "BC" in df.columns: rename["BC"] = "barcode"
+    if "Read" in df.columns: rename["Read"] = "read_id"
+    if "Genome" in df.columns: rename["Genome"] = "genome"
+    if "p_as_decile" in df.columns: rename["p_as_decile"] = "p_as"
+    if "p_mq_decile" in df.columns: rename["p_mq_decile"] = "p_mq"
+    out = df.rename(columns=rename)
+
+    # Normalize types (strings please)
+    for col in ("barcode", "read_id", "genome"):
+        if col in out.columns:
+            out[col] = out[col].astype(str)
+    return out
+
+
+def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Collapse alignment-level evidence to one row per (barcode, read_id, genome).
+    Strategy: AS=max, MAPQ=max, NM=min, and keep p-values if present.
+    """
+    have = set(df.columns)
+    keys = ["barcode", "read_id", "genome"]
+    for k in keys:
+        if k not in have:
+            raise ValueError(f"Expected column '{k}' after schema coercion.")
+
+    agg = {}
+    if "AS" in have: agg["AS"] = "max"
+    if "MAPQ" in have: agg["MAPQ"] = "max"
+    if "NM" in have: agg["NM"] = "min"
+    # p-values are per (read,BC) not per-genome; keep min if multiple show up
+    if "p_as" in have: agg["p_as"] = "min"
+    if "p_mq" in have: agg["p_mq"] = "min"
+
+    if not agg:
+        # we must at least have the keys; return distinct keys
+        return df.drop_duplicates(keys)[keys]
+
+    return (
+        df.groupby(keys, observed=True)
+          .agg(agg)
+          .reset_index()
+    )
 
 REQUIRED_COLS = {"barcode", "read_id", "genome"}
 SCORE_COLS = ["AS", "MAPQ", "NM"]
@@ -467,15 +514,22 @@ def _render_qc_report(calls: pd.DataFrame, out_pdf: Path, sample: str) -> None:
 # ------------------------------
 
 def _load_assign_tables(assign_glob: str) -> pd.DataFrame:
-    files = [Path(p) for p in glob.glob(assign_glob, recursive=True)]
-    if not files:
-        raise FileNotFoundError(f"No assign files found for pattern: {assign_glob}")
-    frames = []
-    for fp in files:
-        frames.append(_read_table(fp))
-    return pd.concat(frames, ignore_index=True)
-
-
+  files = [Path(p) for p in glob.glob(assign_glob, recursive=True)]
+  if not files:
+    raise FileNotFoundError(f"No assign files found for pattern: {assign_glob}")
+  frames = []
+  for fp in files:
+    df = _read_table(fp)
+    df = _coerce_assign_schema(df)
+    # Some assign files may be raw (one row per (read,BC)) or filtered (alignment-level).
+    # Reduce to one row per (barcode, read_id, genome).
+    if {"barcode","read_id","genome"} <= set(df.columns):
+      df = _reduce_alignments_to_per_genome(df)
+      frames.append(df)
+      out = pd.concat(frames, ignore_index=True)
+      # Final sanity filter: keep only rows with the required keys populated
+  out = out.dropna(subset=["barcode","read_id","genome"])
+  return out
 
 def _topk_genomes_per_barcode(C: pd.DataFrame, k: int) -> Dict[str, List[str]]:
     out: Dict[str, List[str]] = {}
@@ -569,24 +623,24 @@ def genotyping(
     outdir.mkdir(parents=True, exist_ok=True)
     _write_gzip_df(calls, outdir / f"{sample}_cells_calls.tsv.gz")
     _write_gzip_df(drops_df, outdir / f"{sample}_Reads_to_discard.csv.gz")
+  #
     legacy_out.to_csv(outdir / f"{sample}_BCs_PASS_by_mapping.csv", index=False)
 
-if make_report and not calls.empty:
-    _render_qc_report(calls, outdir / f"{sample}_qc_report.pdf", sample=sample)
+    # Optional QC PDF
+    if make_report and not calls.empty:
+        _render_qc_report(calls, outdir / f"{sample}_qc_report.pdf", sample=sample)
 
-# Debugging output: expected counts per genome per barcode
-if not C.empty:
-    mat = (
-        C.pivot(index="barcode", columns="genome", values="C")
-         .sort_index(axis=1)           # nice, stable genome column order
-         .fillna(0.0)
-    )
-    # choose one of these:
-    mat.to_csv(outdir / f"{sample}_expected_counts_by_genome.csv")
-    # or (recommended for big matrices)
-    # mat.to_csv(outdir / f"{sample}_expected_counts_by_genome.csv.gz")
-    
-typer.echo("[5/5] Done.")
+    # Optional debugging matrix
+    if not C.empty:
+        mat = (
+            C.pivot(index="barcode", columns="genome", values="C")
+             .sort_index(axis=1)
+             .fillna(0.0)
+        )
+        mat.to_csv(outdir / f"{sample}_expected_counts_by_genome.csv")
+        # or: mat.to_csv(outdir / f"{sample}_expected_counts_by_genome.csv.gz")
+
+    typer.echo("[5/5] Done.")
 
 if __name__ == "__main__":
     app()
