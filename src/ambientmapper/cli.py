@@ -162,8 +162,12 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     
     chunksize_val  = int(aconf.get("chunksize", cfg.get("chunksize", 500_000)))  # default 0.5M
     batch_size = int(aconf.get("batch_size", 32))
-    edges_workers = aconf.get("edges_workers")  # optional in JSON
-    edges_max_reads = aconf.get("edges_max_reads")
+    
+    ew = aconf.get("edges_workers")
+    emr = aconf.get("edges_max_reads")
+    edges_workers = int(ew) if ew is not None else None
+    edges_max_reads = int(emr) if emr is not None else None
+    
     chunks_dir = d["chunks"]
 
     exp_dir   = d["root"] / "ExplorationReadLevel"
@@ -191,8 +195,9 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
         batch_size=batch_size, verbose=True
     )
 
-    # 2) score each chunk (parallel)
-    chunk_files = sorted(chunks_dir.glob(f"{cfg['sample']}_cell_map_ref_chunk_*.txt"))
+    # 2) score each chunk (parallel) 
+    chunk_files = sorted(chunks_dir.glob("*_cell_map_ref_chunk_*.txt"))
+
     if not chunk_files:
         typer.echo(f"[assign] No chunk files in {chunks_dir}")
         return
@@ -317,7 +322,11 @@ def assign(
 
     # small log so users can see the effective settings
     if verbose:
-        typer.echo(f"[assign] effective chunksize={chunksize_val:,}  batch_size={batch_size_val}  threads={threads}")
+        extra = []
+        if edges_workers is not None: extra.append(f"edges_workers={edges_workers}")
+        if edges_max_reads is not None: extra.append(f"edges_max_reads={edges_max_reads:,}")
+        extra_s = ("  " + "  ".join(extra)) if extra else ""
+        typer.echo(f"[assign] effective chunksize={chunksize_val:,}  batch_size={batch_size_val}  threads={threads}{extra_s}")
 
     # 1) global models
     learn_edges_parallel(
