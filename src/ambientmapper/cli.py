@@ -604,7 +604,7 @@ def run(
                                 batch_size=assign_batch_size,
                                 edges_workers=assign_edges_workers,
                                 edges_max_reads=assign_edges_max_reads,
-                                xa_max=assign_xa_max, 
+                                xa_max=assign_xa_max,
                                 chunksize=assign_chunksize,
                                 batch_size=assign_batch_size,
                                 edges_workers=assign_edges_workers,
