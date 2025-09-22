@@ -90,9 +90,16 @@ configs/example.json
     "B73":  "/data/B73Mo17_rep1/B73Mo17_rep1_A1_B73_scifiATAC.mq20.BC.rmdup.mm.bam",
     "Mo17": "/data/B73Mo17_rep1/B73Mo17_rep1_A1_Mo17_scifiATAC.mq20.BC.rmdup.mm.bam"
   },
-  "min_barcode_freq": 10,
-  "chunk_size_cells": 1000,
-  "workdir": "/scratch/ambient_out"
+  "assign": {
+    "alpha": 0.05,
+    "k": 10,
+    "mapq_min": 20,
+    "xa_max": 2,
+    "chunksize": 500000,
+    "batch_size": 32,
+    "edges_workers": 8,
+    "edges_max_reads": 5000000
+  }
 }
 ```
 run
