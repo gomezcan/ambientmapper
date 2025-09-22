@@ -119,16 +119,17 @@ def _apply_assign_overrides(cfg: Dict[str, object],
     if batch_size is not None: assign["batch_size"] = int(batch_size)
     if edges_workers   is not None: assign["edges_workers"] = int(edges_workers)
     if edges_max_reads is not None: assign["edges_max_reads"] = int(edges_max_reads)
+    if edges_max_reads is not None:
+        typer.echo(f"[assign] edges_max_reads cap in effect: {edges_max_reads:,} rows/genome")
+
 
 def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     # Lazy imports
     from .extract import bam_to_qc
     from .filtering import filter_qc_file
-    from .chunks import make_barcode_chunks
-    from .merge import run as posterior_merge_ru
+    from .chunks import make_barcode_chunks    
     from .assign_streaming import learn_edges_parallel, learn_ecdfs_batched, score_chunk
     from .genotyping import genotyping as _run_genotyping
-
     
     d = _cfg_dirs(cfg); _ensure_dirs(d)
     genomes = sorted(cfg["genomes"].items())
@@ -198,7 +199,7 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     chunks_dir = d["chunks"]
     
     # Model paths
-    exp_dir   = Path(workdir) / sample / "ExplorationReadLevel"
+    exp_dir   = d["root"] / "ExplorationReadLevel"
     edges_npz = exp_dir / "global_edges.npz"
     ecdf_npz  = exp_dir / "global_ecdf.npz"
     exp_dir.mkdir(parents=True, exist_ok=True)
@@ -261,7 +262,7 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
         )
 
     
-    with cf.ThreadPoolExecutor(max_workers=min(threads, len(chunk_files))) as ex:
+    with cf.ThreadPoolExecutor(max_workers=min(threads_eff, len(chunk_files))) as ex:
         for _ in ex.map(_score_one, chunk_files):
             pass
         
@@ -324,7 +325,7 @@ def assign(
         help="Optional cap of reads per genome when learning edges (speeds up on huge files)"),
     chunksize: Optional[int] = typer.Option(
         None, "--chunksize",
-        help="Override pandas read_csv chunk size (rows per chunk). CLI > assign{} > top-level > default(500000)."
+        help="Override pandas read_csv chunk size (rows per chunk). CLI > assign{} > top-level > default(1000000)."
     ),
     batch_size: Optional[int] = typer.Option(
         None, "--batch-size",
@@ -349,11 +350,12 @@ def assign(
     k           = int(aconf.get("k", 10))
     mapq_min    = int(aconf.get("mapq_min", 20))
     xa_max      = int(aconf.get("xa_max", 2))
+    
     # precedence: CLI > assign{} > top-level > default
     chunksize_val = int(
         chunksize
         if chunksize is not None
-        else aconf.get("chunksize", cfg.get("chunksize", 500_000))
+        else aconf.get("chunksize", cfg.get("chunksize", 1_000_000))
     )
     batch_size_val = int(
         batch_size
@@ -365,6 +367,23 @@ def assign(
     if "chunks_dir" in aconf:
         chunks_dir = Path(workdir) / sample / str(aconf["chunks_dir"])
 
+    # ----- validation & clamping (mirror _run_pipeline) -----
+    threads_eff = max(1, int(threads))
+    if edges_workers is not None:
+        if edges_workers <= 0:
+            typer.echo("[assign] warn: edges_workers <= 0 → using 1")
+            edges_workers = 1
+        edges_workers = min(edges_workers, threads_eff)
+    if edges_max_reads is not None and edges_max_reads <= 0:
+        typer.echo("[assign] warn: edges_max_reads <= 0 → ignoring cap")
+        edges_max_reads = None
+    if k <= 0:
+        typer.echo("[assign] warn: k<=0 deciles → forcing k=10"); k = 10
+    if chunksize_val <= 0:
+        typer.echo("[assign] warn: chunksize<=0 → forcing 1_000_000"); chunksize_val = 1_000_000
+    if batch_size_val <= 0:
+        typer.echo("[assign] warn: batch_size<=0 → forcing 32"); batch_size_val = 32
+
     # model paths
     exp_dir   = Path(workdir) / sample / "ExplorationReadLevel"
     edges_npz = exp_dir / "global_edges.npz"
@@ -374,18 +393,30 @@ def assign(
     # small log so users can see the effective settings
     if verbose:
         extra = []
-        if edges_workers is not None: extra.append(f"edges_workers={edges_workers}")
+        if edges_workers is not None:   extra.append(f"edges_workers={edges_workers}")
         if edges_max_reads is not None: extra.append(f"edges_max_reads={edges_max_reads:,}")
         extra_s = ("  " + "  ".join(extra)) if extra else ""
-        typer.echo(f"[assign] effective chunksize={chunksize_val:,}  batch_size={batch_size_val}  threads={threads}{extra_s}")
+        typer.echo(
+            "[assign] "
+            f"alpha={alpha} k={k} mapq_min={mapq_min} xa_max={xa_max}  "
+            f"chunksize={chunksize_val:,} batch_size={batch_size_val} threads={threads_eff}{extra_s}"
+        )
 
     # 1) global models
     learn_edges_parallel(
-        workdir=workdir, sample=sample, chunks_dir=chunks_dir,
-        out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max,
-        chunksize=chunksize_val, k=k, batch_size=batch_size_val,
-        threads=threads, verbose=verbose,
-        edges_workers=edges_workers, edges_max_reads=edges_max_reads
+        workdir=workdir,
+        sample=sample,
+        chunks_dir=chunks_dir,
+        out_model=edges_npz,
+        mapq_min=mapq_min,
+        xa_max=xa_max,
+        chunksize=chunksize_val,
+        k=k,
+        batch_size=batch_size_val,
+        threads=threads_eff,
+        verbose=verbose,
+        edges_workers=edges_workers,
+        edges_max_reads=edges_max_reads
     )
     
     learn_ecdfs_batched(
@@ -539,7 +570,7 @@ def run(
     assign_mapq_min: Optional[int] = typer.Option(None, "--assign-mapq-min", help="Override assign.mapq_min (default 20)"),
     assign_xa_max: Optional[int] = typer.Option(None, "--assign-xa-max", help="Override assign.xa_max (default 2)"),
     assign_chunksize: Optional[int] = typer.Option(None, "--assign-chunksize",
-                                         help="Override assign.chunksize rows per read_csv (default 500000)"),
+                                         help="Override assign.chunksize rows per read_csv (default 1000000)"),
     assign_batch_size: Optional[int] = typer.Option(None, "--assign-batch-size",
                                                     help="Override assign.batch_size for learn_edges/ecdf (default 32)"),
     assign_edges_workers: Optional[int] = typer.Option(None, "--assign-edges-workers",
@@ -574,11 +605,7 @@ def run(
         # run the pipeline
         _run_pipeline(cfg, threads)
         typer.echo(f"[run] {cfg['sample']} pipeline complete")
-        # Always run posterior merge.summarize at the end of the pipeline
-        from .genotyping import genotyping as posterior_merge_run
-        assign_glob = str(_cfg_dirs(cfg)["chunks"] / "**" / "*")
-        posterior_merge_run(assign=assign_glob, outdir=_cfg_dirs(cfg)["final"], sample=cfg["sample"], make_report=True)
-
+        
     if config:
         cfg = json.loads(Path(config).read_text())
         _apply_assign_overrides(cfg,
@@ -602,13 +629,9 @@ def run(
                                 xa_max=assign_xa_max, 
                                 chunksize=assign_chunksize,
                                 batch_size=assign_batch_size,
-                                edges_workers=assign_edges_workers,
-                                edges_max_reads=assign_edges_max_reads,
-                                xa_max=assign_xa_max,
-                                chunksize=assign_chunksize,
-                                batch_size=assign_batch_size,
-                                edges_workers=assign_edges_workers,
-                                edges_max_reads=assign_edges_max_reads)
+                                edges_workers=assign_edges_workers,                                
+                                edges_max_reads=assign_edges_max_reads,                                
+                                batch_size=assign_batch_size)
         _do_one(cfg)
         return
     elif configs:
@@ -617,8 +640,16 @@ def run(
             typer.echo("[run] no configs found in TSV"); return
         for cfg in batch:
             _apply_assign_overrides(cfg,
-                alpha=assign_alpha, k=assign_k, mapq_min=assign_mapq_min,
-                xa_max=assign_xa_max, chunksize=assign_chunksize)
+                                    alpha=assign_alpha,
+                                    k=assign_k,
+                                    mapq_min=assign_mapq_min,
+                                    xa_max=assign_xa_max,
+                                    chunksize=assign_chunksize,
+                                    batch_size=assign_batch_size,
+                                    edges_workers=assign_edges_workers,
+                                    edges_max_reads=assign_edges_max_reads
+                                   )
+
             typer.echo(f"[run] starting {cfg['sample']}")
             _do_one(cfg)
         return
