@@ -989,8 +989,8 @@ def score_chunk(
                         # only the winning genome row
                         out_rows.append(base)
                     else:
-                    # keep all genomes for ambiguous
-                    out_rows.append(base)
+                        # keep all genomes for ambiguous
+                        out_rows.append(base)
     pd.DataFrame(out_rows).to_csv(filt_out, sep="\t", index=False, compression="gzip")
 
 
