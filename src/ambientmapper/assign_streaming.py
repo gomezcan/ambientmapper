@@ -631,7 +631,8 @@ def learn_ecdfs_parallel(
     """Parallel map-reduce: per-chunk per-decile Δ histograms → global ECDF model."""
     
     # choose pool size based on chunks available
-    max_workers = min(ecdf_workers or threads,  max(1, len(list(Path(chunks_dir).glob("*_cell_map_ref_chunk_*.txt")))))
+    total_chunks = len(list(Path(chunks_dir).glob(f"{sample}_cell_map_ref_chunk_*.txt")))
+    max_workers = min(ecdf_workers or threads, max(1, total_chunks))
     
     dat = np.load(edges_model)
     as_edges, mq_edges, k = dat["as_edges"], dat["mq_edges"], int(dat["k"])
@@ -642,10 +643,12 @@ def learn_ecdfs_parallel(
 
     Htmp_AS = _new_hist_from_spec((0.0, 100.0, 200))
     Htmp_MQ = _new_hist_from_spec((0.0,  60.0, 120))
-    dAS_counts = np.zeros((k, Htmp_AS.nbins), dtype=np.int64)
+    
     dAS_over   = np.zeros((k,), dtype=np.int64)
-    dMQ_counts = np.zeros((k, Htmp_MQ.nbins), dtype=np.int64)
     dMQ_over   = np.zeros((k,), dtype=np.int64)
+    dMQ_counts = np.zeros((k, Htmp_MQ.nbins), dtype=np.int64)
+    dAS_counts = np.zeros((k, Htmp_AS.nbins), dtype=np.int64)
+    
 
     def _worker(chf: Path):
         return _map_delta_hists_for_chunk(
@@ -730,6 +733,9 @@ def learn_ecdfs_batched(
                 bc_to_chunk[bc] = ch
 
         # 3) stream each genome once; route rows to the right batch-chunk accumulator
+        
+        # keep only BCs present in THIS batch
+        bc_view = set(bc_to_chunk.keys())
         for fp in files:
             genome = _genome_from_filename(fp)
             per_file_kept = 0
@@ -747,8 +753,7 @@ def learn_ecdfs_batched(
                 },
                 engine="c", low_memory=True, memory_map=False
             ):
-                # keep only BCs present in THIS batch
-                bc_view = set(bc_to_chunk.keys()
+                
                 c = c[c["BC"].astype(str).isin(bc_view)]
                 if c.empty:
                     continue
@@ -941,8 +946,12 @@ def score_chunk(
 
     # FILTERED alignment-level rows
     keep_pairs = set(zip(raw_df["Read"].astype(str), raw_df["BC"].astype(str)))
-    class_by = {(r, b): k for r, b, k in zip(raw_df["Read"].astype(str), raw_df["BC"].astype(str), raw_df["assigned_class"])}
-    gwin_by  = {(r, b): g for r, b, g in zip(raw_df["Read"].astype(str), raw_df["BC"].astype(str), raw_df["Genome_winner"])}
+    class_by = {(r, b): k for r, b, k in zip(raw_df["Read"].astype(str),
+                                             raw_df["BC"].astype(str),
+                                             raw_df["assigned_class"])}
+    gwin_by  = {(r, b): g for r, b, g in zip(raw_df["Read"].astype(str),
+                                             raw_df["BC"].astype(str),
+                                             raw_df["Genome_winner"])}
 
 
     out_rows = []
@@ -952,11 +961,13 @@ def score_chunk(
         for c in pd.read_csv(fp, sep="\t", header=0, usecols=usecols2, chunksize=chunksize):
             if c.empty:
                 continue
+            # Restrict to BCs seen in this chunk and (Read,BC) pairs we kept
             c = c[c["BC"].astype(str).isin({bc for _, bc in rb_map.keys()})]
             if c.empty:
                 continue
-            c = c[list(zip(c["Read"].astype(str), c["BC"].astype(str))).__iter__()]
-+           c = c[[(str(r), str(b)) in keep_pairs for r, b in zip(c["Read"], c["BC"])]]
+            pair_col = list(zip(c["Read"].astype(str), c["BC"].astype(str)))
+            c = c[[pair in keep_pairs for pair in pair_col]]
+            
             if c.empty:
                 continue
             for col in ("AS","MAPQ","NM","XAcount"):
@@ -975,9 +986,11 @@ def score_chunk(
                 })
                 if klass == "winner":
                     if genome == gwin_by.get((r, b)):
+                        # only the winning genome row
                         out_rows.append(base)
                     else:
-                        out_rows.append(base)
+                    # keep all genomes for ambiguous
+                    out_rows.append(base)
     pd.DataFrame(out_rows).to_csv(filt_out, sep="\t", index=False, compression="gzip")
 
 
