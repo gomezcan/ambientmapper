@@ -175,7 +175,6 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     edges_workers  = int(ew)  if ew  is not None else None
     edges_max_reads= int(emr) if emr is not None else None
     
-
     # ---- validation & clamping ----
     threads_eff = max(1, int(threads))
     if edges_workers is not None:
@@ -220,6 +219,7 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
         )
 
     # 1) global models (map-reduce)
+    
     learn_edges_parallel(
         workdir=pool_workdir,
         sample=cfg["sample"],
@@ -234,7 +234,7 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
         edges_max_reads=edges_max_reads
     )
 
-    learn_ecdfs_batched(
+    learn_ecdfs_parallel(
         workdir=pool_workdir,
         sample=cfg["sample"],
         chunks_dir=chunks_dir,
@@ -244,6 +244,7 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
         xa_max=xa_max,
         chunksize=chunksize_val,
         batch_size=batch_size,
+        ecdf_workers: edges_workers,
         verbose=True
     )
 
