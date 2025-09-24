@@ -128,7 +128,7 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     from .extract import bam_to_qc
     from .filtering import filter_qc_file
     from .chunks import make_barcode_chunks    
-    from .assign_streaming import learn_edges_parallel, learn_ecdfs_batched, score_chunk
+    from .assign_streaming import learn_edges_parallel, learn_ecdfs_parallel, score_chunk    
     from .genotyping import genotyping as _run_genotyping
     
     d = _cfg_dirs(cfg); _ensure_dirs(d)
@@ -242,9 +242,8 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
         out_model=ecdf_npz,
         mapq_min=mapq_min,
         xa_max=xa_max,
-        chunksize=chunksize_val,
-        batch_size=batch_size,
-        ecdf_workers: edges_workers,
+        chunksize=chunksize_val,        
+        ecdf_workers=edges_workers,
         verbose=True
     )
 
