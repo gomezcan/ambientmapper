@@ -626,14 +626,18 @@ def learn_ecdfs_parallel(
     chunksize: int,
     threads: int = 8,
     verbose: bool = False,
-    edges_workers: Optional[int] = None,
+    ecdf_workers: Optional[int] = None,
 ) -> Path:
     """Parallel map-reduce: per-chunk per-decile Δ histograms → global ECDF model."""
     
-    # choose pool size based on chunks available
-    total_chunks = len(list(Path(chunks_dir).glob(f"{sample}_cell_map_ref_chunk_*.txt")))
-    max_workers = min(ecdf_workers or threads, max(1, total_chunks))
+    chunk_files = sorted(Path(chunks_dir).glob(f"{sample}_cell_map_ref_chunk_*.txt"))
     
+    if not chunk_files:
+        raise typer.BadParameter(f"No chunk files under {chunks_dir}")
+
+    # Clamp workers
+    max_workers = min(int(ecdf_workers or threads), max(1, len(chunk_files)))
+        
     dat = np.load(edges_model)
     as_edges, mq_edges, k = dat["as_edges"], dat["mq_edges"], int(dat["k"])
 
@@ -656,8 +660,10 @@ def learn_ecdfs_parallel(
         )
 
     total = len(chunk_files)
-    _log(f"[assign/ecdf] start: {total} chunks, threads={min(threads, total)}", verbose)
-    with ThreadPoolExecutor(max_workers=min(max_workers, total)) as ex:
+    if verbose:
+        typer.echo(f"[assign/ecdf] start: {len(chunk_files)} chunks, workers={max_workers}")
+        
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
         fut = {ex.submit(_worker, ch): ch for ch in chunk_files}
         done = 0
         for f in as_completed(fut):
