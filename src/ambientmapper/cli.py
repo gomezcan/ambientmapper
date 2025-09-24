@@ -337,7 +337,7 @@ def assign(
     Modular assign: learn edges (global), learn ECDFs (global), then score each chunk (parallel)
     """
     
-    from .assign_streaming import learn_edges_parallel, learn_ecdfs_batched, score_chunk
+    from .assign_streaming import learn_edges_parallel, learn_ecdfs_parallel, score_chunk
     
     cfg = _load_config(config)
     d = _cfg_dirs(cfg); _ensure_dirs(d)
@@ -419,11 +419,18 @@ def assign(
         edges_max_reads=edges_max_reads
     )
     
-    learn_ecdfs_batched(
-        workdir=workdir, sample=sample, chunks_dir=chunks_dir,
-        edges_model=edges_npz, out_model=ecdf_npz,
-        mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize_val,
-        batch_size=batch_size_val, verbose=verbose,
+    learn_ecdfs_parallel(
+        workdir=workdir,
+        sample=sample,
+        chunks_dir=chunks_dir,
+        edges_model=edges_npz,
+        out_model=ecdf_npz,
+        mapq_min=mapq_min,
+        xa_max=xa_max,
+        chunksize=chunksize_val,
+        verbose=verbose,
+        ecdf_workers=edges_workers,
+        threads=threads_eff
     )
     
     # 2) per-chunk scoring in parallel
@@ -433,9 +440,9 @@ def assign(
         typer.echo(f"[assign] No chunk files in {chunks_dir}")
         raise typer.Exit(code=2)
     
-    typer.echo(f"[assign/score] start: {len(chunk_files)} chunks, threads={min(threads, len(chunk_files))}")
+    typer.echo(f"[assign/score] start: {len(chunk_files)} chunks, threads={min(threads_eff, len(chunk_files))}")
     
-    with cf.ThreadPoolExecutor(max_workers=min(threads, len(chunk_files))) as ex:
+    with cf.ThreadPoolExecutor(max_workers=min(threads_eff, len(chunk_files))) as ex::
         fut = {
             ex.submit(
                 score_chunk,
