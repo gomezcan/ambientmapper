@@ -442,7 +442,7 @@ def assign(
     
     typer.echo(f"[assign/score] start: {len(chunk_files)} chunks, threads={min(threads_eff, len(chunk_files))}")
     
-    with cf.ThreadPoolExecutor(max_workers=min(threads_eff, len(chunk_files))) as ex::
+    with cf.ThreadPoolExecutor(max_workers=min(threads_eff, len(chunk_files))) as ex:
         fut = {
             ex.submit(
                 score_chunk,
