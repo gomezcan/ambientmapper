@@ -167,7 +167,7 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
 
     # 30) assign (learn global models once, then score chunks in parallel)
     typer.echo("[run] assign: learning edges/ECDFs & scoring chunks…")
-        aconf = cfg.get("assign", {}) if isinstance(cfg.get("assign"), dict) else {}
+    aconf = cfg.get("assign", {}) if isinstance(cfg.get("assign"), dict) else {}
     alpha    = float(aconf.get("alpha", 0.05))
     k        = int(aconf.get("k", 10))
     mapq_min = int(aconf.get("mapq_min", 20))
