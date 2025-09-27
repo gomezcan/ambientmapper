@@ -396,12 +396,12 @@ def assign(
 
     # log so users can see the effective settings
     if verbose:
-    extra = []
-    if edges_workers is not None: extra.append(f"edges_workers={edges_workers}")
-    if edges_max_reads is not None: extra.append(f"edges_max_reads={edges_max_reads:,}")
-    if ecdf_workers is not None: extra.append(f"ecdf_workers={ecdf_workers}")
-    typer.echo(f"[assign] effective chunksize={chunksize_val:,}  batch_size={batch_size_val}  "
-               f"threads={threads_eff}" + ("  " + "  ".join(extra) if extra else ""))
+        extra = []
+        if edges_workers is not None: extra.append(f"edges_workers={edges_workers}")
+        if edges_max_reads is not None: extra.append(f"edges_max_reads={edges_max_reads:,}")
+        if ecdf_workers is not None: extra.append(f"ecdf_workers={ecdf_workers}")
+        typer.echo(f"[assign] effective chunksize={chunksize_val:,}  batch_size={batch_size_val}  "
+                   f"threads={threads_eff}" + ("  " + "  ".join(extra) if extra else ""))
 
 
     # 1) global models
