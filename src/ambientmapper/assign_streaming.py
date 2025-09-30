@@ -732,8 +732,13 @@ def learn_ecdfs_parallel(
     chunksize: int,
     workers: int = 1,
     verbose: bool = False,
+    ecdf_workers: Optional[int] = None,
 ) -> Path:
     """Parallel map-reduce: per-chunk per-decile Δ histograms → global ECDF model."""
+    
+    # choose pool size
+    max_workers = min(ecdf_workers or threads, max(1, len(chunk_files)))
+    
     chunks_dir = Path(chunks_dir)
     chunk_files = sorted(chunks_dir.glob(f"{sample}_cell_map_ref_chunk_*.txt"))
     if not chunk_files:
@@ -792,8 +797,10 @@ def learn_ecdfs_parallel(
 def learn_ecdfs_batched(
     workdir: Path, sample: str, chunks_dir: Path,
     edges_model: Path, out_model: Optional[Path],
-    mapq_min: int, xa_max: int, chunksize: Optional[int],
-    batch_size: int = 32, verbose: bool = True
+    mapq_min: int, xa_max: int,
+    chunksize: Optional[int],
+    batch_size: int = 32, 
+    verbose: bool = True
 ) -> Path:
     """
     Batched map-reduce: read each genome once per batch of chunk files, route rows
