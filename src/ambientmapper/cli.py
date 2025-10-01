@@ -413,7 +413,8 @@ def assign(
         extra = []
         if edges_workers is not None: extra.append(f"edges_workers={edges_workers}")
         if edges_max_reads is not None: extra.append(f"edges_max_reads={edges_max_reads:,}")
-        if ecdf_workers is not None: extra.append(f"ecdf_workers={ecdf_workers}")
+        if ecdf_workers is not None: extra.append(f"ecdf_workers={min(max(ecdf_workers,1), threads_eff)}")
+
         typer.echo(f"[assign] effective chunksize={chunksize_val:,}  batch_size={batch_size_val}  "
                    f"threads={threads_eff}" + ("  " + "  ".join(extra) if extra else ""))
 
@@ -435,6 +436,10 @@ def assign(
         edges_max_reads=edges_max_reads
     )
     
+    # Validate/clamp ecdf_workers (mirror _run_pipeline)
+    ecdf_workers_eff = ecdf_workers if (ecdf_workers and ecdf_workers > 0) else threads_eff
+    ecdf_workers_eff = min(ecdf_workers_eff, threads_eff)
+
     learn_ecdfs_parallel(
         workdir=workdir,
         sample=sample,
@@ -445,9 +450,7 @@ def assign(
         xa_max=xa_max,
         chunksize=chunksize_val,
         verbose=verbose,
-        ecdf_workers=edges_workers,
-        threads=threads_eff,
-        workers=ecdf_workers or threads_eff,
+        workers=ecdf_workers_eff,
     )
     
     # 2) per-chunk scoring in parallel
