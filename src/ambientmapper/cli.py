@@ -236,19 +236,33 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
 
     # Learn models
     learn_edges_parallel(
-        workdir=pool_workdir, sample=cfg["sample"], chunks_dir=chunks_dir,
-        out_model=edges_npz, mapq_min=mapq_min, xa_max=xa_max,
-        chunksize=chunksize_val, k=k, batch_size=batch_size,
-        threads=threads_eff, verbose=True,
-        edges_workers=edges_workers, edges_max_reads=edges_max_reads
+        workdir=pool_workdir,
+        sample=cfg["sample"],
+        chunks_dir=chunks_dir,
+        out_model=edges_npz,
+        mapq_min=mapq_min,
+        xa_max=xa_max,
+        chunksize=chunksize_val,
+        k=k,
+        batch_size=batch_size,
+        threads=threads_eff,
+        verbose=True,
+        edges_workers=edges_workers,
+        edges_max_reads=edges_max_reads
     )
 
     # NOTE: pass workers= (the API we’ll implement in assign_streaming)
     learn_ecdfs_parallel(
-        workdir=pool_workdir, sample=cfg["sample"], chunks_dir=chunks_dir,
-        edges_model=edges_npz, out_model=ecdf_npz,
-        mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize_val,
-        verbose=True, workers=(ecdf_workers or threads_eff)
+        workdir=pool_workdir, 
+        sample=cfg["sample"],
+        chunks_dir=chunks_dir,
+        edges_model=edges_npz,
+        out_model=ecdf_npz,
+        mapq_min=mapq_min,
+        xa_max=xa_max,
+        chunksize=chunksize_val,
+        verbose=True,
+        workers=(ecdf_workers or threads_eff)
     )
     
     # 2) score each chunk (parallel) 
