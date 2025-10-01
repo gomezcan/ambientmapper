@@ -732,12 +732,8 @@ def learn_ecdfs_parallel(
     chunksize: int,
     workers: int = 1,
     verbose: bool = False,
-    ecdf_workers: Optional[int] = None,
 ) -> Path:
     """Parallel map-reduce: per-chunk per-decile Δ histograms → global ECDF model."""
-    
-    # choose pool size
-    max_workers = min(ecdf_workers or threads, max(1, len(chunk_files)))
     
     chunks_dir = Path(chunks_dir)
     chunk_files = sorted(chunks_dir.glob(f"{sample}_cell_map_ref_chunk_*.txt"))
@@ -754,7 +750,8 @@ def learn_ecdfs_parallel(
     dMQ_over   = np.zeros((k,), dtype=np.int64)
     dMQ_counts = np.zeros((k, Htmp_MQ.nbins), dtype=np.int64)
     dAS_counts = np.zeros((k, Htmp_AS.nbins), dtype=np.int64)
-
+    
+    # decide pool size after we know chunk_files
     max_workers = max(1, min(int(workers), len(chunk_files)))
     if verbose:
         _log(f"[assign/ecdf] start: {len(chunk_files)} chunks, workers={max_workers}", True)
