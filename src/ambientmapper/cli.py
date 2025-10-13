@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import json, csv
-import concurrent.futures as cf
 from typing import Dict, List, Optional
 import typer
 
@@ -291,13 +290,28 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
         )
 
     with ProcessPoolExecutor(max_workers=pool_n) as ex:
-        futures = {ex.submit(_score_one, ch): ch for ch in chunk_files}
+        futures = {
+            ex.submit(
+                score_chunk,
+                workdir=pool_workdir,
+                sample=cfg["sample"],
+                chunk_file=ch,
+                ecdf_model=ecdf_npz,
+                out_raw_dir=None,
+                out_filtered_dir=None,
+                mapq_min=mapq_min,
+                xa_max=xa_max,
+                chunksize=chunksize_val,
+                alpha=alpha,
+            ): ch
+            for ch in chunk_files
+        }
         done = 0; total = len(futures)
-        for fut in as_completed(futures)
+        for fut in as_completed(futures):
             ch = futures[fut]
             fut.result()  # will raise if any worker failed
             done += 1
-            if done % 5 == 0 or done == total
+            if done % 5 == 0 or done == total:
                 typer.echo(f"[assign/score] {done}/{total} chunks")
     typer.echo("[assign/score] done")
         
