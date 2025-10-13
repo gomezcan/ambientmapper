@@ -136,6 +136,7 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
     from .chunks import make_barcode_chunks    
     from .assign_streaming import learn_edges_parallel, learn_ecdfs_parallel, score_chunk    
     from .genotyping import genotyping as _run_genotyping
+    from concurrent.futures import ProcessPoolExecutor, as_completed
     
     d = _cfg_dirs(cfg); _ensure_dirs(d)
     genomes = sorted(cfg["genomes"].items())
@@ -272,17 +273,33 @@ def _run_pipeline(cfg: Dict[str, object], threads: int) -> None:
         typer.echo(f"[assign] No chunk files in {chunks_dir}")
         return
 
+    pool_n = min(threads_eff, len(chunk_files))
+    typer.echo(f"[assign/score] start: {len(chunk_files)} chunks, procs={pool_n}")
+
     def _score_one(chf: Path):
         return score_chunk(
-            workdir=pool_workdir, sample=cfg["sample"], chunk_file=chf, ecdf_model=ecdf_npz,
-            out_raw_dir=None, out_filtered_dir=None,
-            mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize_val, alpha=alpha
+            workdir=pool_workdir,
+            sample=cfg["sample"],
+            chunk_file=chf,
+            ecdf_model=ecdf_npz,
+            out_raw_dir=None,
+            out_filtered_dir=None,
+            mapq_min=mapq_min,
+            xa_max=xa_max,
+            chunksize=chunksize_val,
+            alpha=alpha
         )
 
-    
-    with cf.ThreadPoolExecutor(max_workers=min(threads_eff, len(chunk_files))) as ex:
-        for _ in ex.map(_score_one, chunk_files):
-            pass
+    with ProcessPoolExecutor(max_workers=pool_n) as ex:
+        futures = {ex.submit(_score_one, ch): ch for ch in chunk_files}
+        done = 0; total = len(futures)
+        for fut in as_completed(futures)
+            ch = futures[fut]
+            fut.result()  # will raise if any worker failed
+            done += 1
+            if done % 5 == 0 or done == total
+                typer.echo(f"[assign/score] {done}/{total} chunks")
+    typer.echo("[assign/score] done")
         
     # 40) posterior merge + summarize (replaces old winner-merge + summarize)
     typer.echo("[run] merge.summarize: posterior-aware merge + QC…")
@@ -356,6 +373,8 @@ def assign(
     """
     
     from .assign_streaming import learn_edges_parallel, learn_ecdfs_parallel, score_chunk
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
     
     cfg = _load_config(config)
     d = _cfg_dirs(cfg); _ensure_dirs(d)
@@ -459,10 +478,11 @@ def assign(
     if not chunk_files:
         typer.echo(f"[assign] No chunk files in {chunks_dir}")
         raise typer.Exit(code=2)
+
+    pool_n = min(threads_eff, len(chunk_files))    
+    typer.echo(f"[assign/score] start: {len(chunk_files)} chunks, procs={pool_n}")
     
-    typer.echo(f"[assign/score] start: {len(chunk_files)} chunks, threads={min(threads_eff, len(chunk_files))}")
-    
-    with cf.ThreadPoolExecutor(max_workers=min(threads_eff, len(chunk_files))) as ex:
+    with ProcessPoolExecutor(max_workers=pool_n) as ex:
         fut = {
             ex.submit(
                 score_chunk,
@@ -473,19 +493,13 @@ def assign(
             for chf in chunk_files
         }
         done = 0; total = len(fut)
-        for f in cf.as_completed(fut):
+        for f in as_completed(fut):
             ch = fut[f]
-            try:
-                f.result()
-            except Exception as e:
-                typer.echo(f"[assign/score][ERROR] {ch.name}: {e}")
-                raise
+            f.result()
             done += 1
             if done % 5 == 0 or done == total:
                 typer.echo(f"[assign/score] {done}/{total} chunks")
-        typer.echo("[assign/score] done")
-
-    typer.echo(f"[assign] Done. Models in {exp_dir}. Outputs in raw_cell_map_ref_chunks/ and cell_map_ref_chunks/")
+    typer.echo("[assign/score] done")    
 
 
 @app.command()
