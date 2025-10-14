@@ -182,10 +182,12 @@ def run_assign_ecdf(ctx, part=None):
         workers=ctx.params["assign"].get("ecdf_workers") or int(ctx.params.get("threads", 8)),
     )
 
+# 
 def run_assign_score(ctx, part):
+    if ctx.params.get("verbose", True):
+        typer.echo(f"[score] start {part['id']}")
     _, outs = io_assign_score(ctx, part)
     out_parquet = outs[0]
-    # call your scorer; it writes the parquet out automatically
     score_chunk(
         workdir=ctx.dirs["root"].parent,
         sample=ctx.cfg["sample"],
@@ -198,9 +200,11 @@ def run_assign_score(ctx, part):
         chunksize=int(ctx.params["assign"].get("chunksize", 1_000_000)),
         alpha=float(ctx.params["assign"].get("alpha", 0.05)),
     )
-    # sanity-check: fail fast if nothing was written
     if not out_parquet.exists() or out_parquet.stat().st_size == 0:
         raise RuntimeError(f"score_chunk produced no data: {out_parquet}")
+    if ctx.params.get("verbose", True):
+        typer.echo(f"[score] done  {part['id']}")
+
 
 def run_assign_merge(ctx, part=None):
     """
