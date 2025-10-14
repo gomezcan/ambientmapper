@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import os, time
 from dataclasses import dataclass, field
@@ -81,19 +80,70 @@ def run_step(ctx: Ctx, step: Step, partition: Optional[Dict] = None) -> bool:
     return True
 
 def run_dag(ctx: Ctx, steps: Dict[str, Step], partitions: List[Dict] | None) -> Dict[str, Any]:
+    """
+    Execute steps in topological order.
+
+    Behavior with ctx.skip_to:
+      - For steps BEFORE ctx.skip_to: "validate-only" mode
+          * If all expected outputs exist and are non-empty -> skip
+          * Otherwise -> run the step (to materialize missing outputs)
+      - Starting AT ctx.skip_to (and thereafter): normal execution (resume via sentinels)
+    """
     order = topo_sort(steps)
-    executed = []
-    skipped = []
+    executed: List[str] = []
+    skipped: List[str] = []
+
+    # If no skip_to is provided, we start in "reached" (normal) mode.
+    reached = not bool(ctx.skip_to)
+
+    def _outs_exist(step: Step, part: Optional[Dict]) -> bool:
+        outs = step.outputs_fn(ctx, part)
+        for o in outs:
+            p = Path(o)
+            if (not p.exists()) or (p.stat().st_size == 0):
+                return False
+        return True
+
     for name in order:
         step = steps[name]
-        if not should_run_this_step(ctx, step):
+
+        # respect --only-steps if provided
+        if ctx.only and name not in ctx.only:
             continue
+
+        # PRE-TARGET VALIDATION PASS
+        if not reached:
+            if name == ctx.skip_to:
+                # flip into normal execution from here on
+                reached = True
+            else:
+                # validate-only for pre-target steps
+                if step.is_partitioned:
+                    assert partitions is not None and len(partitions) > 0, "No partitions available for partitioned step"
+                    for part in partitions:
+                        label = f"{name}[{part.get('id','?')}]"
+                        if _outs_exist(step, part):
+                            skipped.append(label)
+                        else:
+                            ran = run_step(ctx, step, partition=part)
+                            (executed if ran else skipped).append(label)
+                else:
+                    if _outs_exist(step, None):
+                        skipped.append(name)
+                    else:
+                        ran = run_step(ctx, step, partition=None)
+                        (executed if ran else skipped).append(name)
+                continue  # move to next step
+
+        # NORMAL EXECUTION (from target onward)
         if step.is_partitioned:
             assert partitions is not None and len(partitions) > 0, "No partitions available for partitioned step"
             for part in partitions:
+                label = f"{name}[{part.get('id','?')}]"
                 ran = run_step(ctx, step, partition=part)
-                (executed if ran else skipped).append(f"{name}[{part.get('id','?')}]")
+                (executed if ran else skipped).append(label)
         else:
             ran = run_step(ctx, step, partition=None)
             (executed if ran else skipped).append(name)
+
     return {"executed": executed, "skipped": skipped}
