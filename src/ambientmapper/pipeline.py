@@ -185,45 +185,50 @@ def run_assign_ecdf(ctx, part=None):
 # 
 def run_assign_score(ctx, part):
     """
-    Score one chunk. We:
-      - verify inputs exist (ECDF model + chunk file)
-      - call score_chunk
-      - accept either <chunk_stem>.scores.parquet or our id-based path
-      - raise a rich error if nothing was produced
+    Score one chunk and ensure we end up with <chunk_stem>.scores.parquet sitting
+    next to the chunk file (DAG-expected path). We:
+      - validate inputs
+      - call score_chunk with an explicit out_raw_dir (chunks dir)
+      - accept a set of common output name/dir patterns and mirror to expected
     """
     from pathlib import Path as _P
-    import typer
+    import os, shutil, glob, typer
+    from .assign_streaming import score_chunk
 
     chatty = bool(ctx.params.get("verbose", True))
+    sample   = ctx.cfg["sample"]
+    workroot = _P(ctx.cfg["workdir"])
+    chunks_d = ctx.dirs["chunks"]  # …/<sample>/cell_map_ref_chunks
+    exp_dir  = ctx.dirs["root"] / "ExplorationReadLevel"
 
-    # expected inputs
-    ecdf_npz = _exp_dir(ctx) / "global_ecdf.npz"
-    chunk_txt = _P(part["path"])
-
-    # quick preflight
-    if not ecdf_npz.exists() or ecdf_npz.stat().st_size == 0:
-        raise RuntimeError(f"ECDF model missing/empty: {ecdf_npz}  "
-                           f"(recompute steps 20_assign.10_edges and 20_assign.20_ecdfs)")
-    if not chunk_txt.exists() or chunk_txt.stat().st_size == 0:
-        raise RuntimeError(f"Chunk file missing/empty: {chunk_txt}")
-
-    # "natural" output name that the scorer is expected to produce
+    ecdf_npz   = exp_dir / "global_ecdf.npz"
+    edges_npz  = exp_dir / "global_edges.npz"
+    chunk_txt  = _P(part["path"])
     natural_out = chunk_txt.with_name(chunk_txt.stem + ".scores.parquet")
 
-    # our DAG’s id-based output (keep for backward compat)
+    # DAG-expected output (keep this as the canonical target)
     _, outs = io_assign_score(ctx, part)
     dag_out = outs[0]
+
+    # Preflight checks
+    if not ecdf_npz.exists() or ecdf_npz.stat().st_size == 0:
+        raise RuntimeError(f"ECDF model missing/empty: {ecdf_npz}")
+    if not edges_npz.exists() or edges_npz.stat().st_size == 0:
+        # not strictly required by scorer, but good to surface early
+        typer.echo(f"[score] warn: edges model looks tiny/empty ({edges_npz})")
+    if not chunk_txt.exists() or chunk_txt.stat().st_size == 0:
+        raise RuntimeError(f"Chunk file missing/empty: {chunk_txt}")
 
     if chatty:
         typer.echo(f"[score] start {part['id']}  →  {natural_out.name}")
 
-    # call scorer (it writes its outputs based on chunk file name)
+    # Run the scorer, **force** outputs into the chunks directory
     score_chunk(
-        workdir=ctx.dirs["root"].parent,
-        sample=ctx.cfg["sample"],
+        workdir=workroot,
+        sample=sample,
         chunk_file=chunk_txt,
         ecdf_model=ecdf_npz,
-        out_raw_dir=None,
+        out_raw_dir=chunk_txt.parent,   # << force it here
         out_filtered_dir=None,
         mapq_min=int(ctx.params["assign"].get("mapq_min", 20)),
         xa_max=int(ctx.params["assign"].get("xa_max", 2)),
@@ -231,34 +236,42 @@ def run_assign_score(ctx, part):
         alpha=float(ctx.params["assign"].get("alpha", 0.05)),
     )
 
-    # Accept whichever path the scorer actually wrote
-    produced = None
-    for candidate in (natural_out, dag_out):
-        if candidate.exists() and candidate.stat().st_size > 0:
-            produced = candidate
-            break
+    # Collect plausible outputs to look for
+    candidates = [
+        natural_out,
+        dag_out,
+        chunk_txt.parent / (chunk_txt.stem + ".parquet"),
+        chunk_txt.parent / (chunk_txt.stem + ".scores.parq"),
+        chunk_txt.parent / (chunk_txt.stem + ".scores.arrow"),
+    ]
+    # Also scan a couple of common subdirs/patterns just in case
+    for pat in (
+        str(chunk_txt.parent / f"{chunk_txt.stem}*.parquet"),
+        str(chunk_txt.parent / f"{chunk_txt.stem}*.parq"),
+        str(chunk_txt.parent / f"{chunk_txt.stem}*.arrow"),
+    ):
+        for p in glob.glob(pat):
+            candidates.append(_P(p))
 
-    # If scorer wrote to natural_out but our DAG expects dag_out, mirror it
-    if produced is natural_out and natural_out != dag_out:
+    produced = next((c for c in candidates if c.exists() and c.stat().st_size > 0), None)
+
+    # Mirror to the DAG-expected path if needed
+    if produced and produced != dag_out:
         try:
-            # hard link first (cheap); fall back to copy if FS forbids links
-            os.link(natural_out, dag_out)
+            os.link(produced, dag_out)
         except Exception:
-            import shutil
-            shutil.copy2(natural_out, dag_out)
+            shutil.copy2(produced, dag_out)
 
-    if not ((dag_out.exists() and dag_out.stat().st_size > 0) or
-            (natural_out.exists() and natural_out.stat().st_size > 0)):
-        # gather extra hints to make the error self-explanatory
-        edges = _exp_dir(ctx) / "global_edges.npz"
+    # Final verdict
+    if not (dag_out.exists() and dag_out.stat().st_size > 0):
         hints = [
-            f"edges exists={edges.exists()} size={edges.stat().st_size if edges.exists() else 0}",
+            f"edges exists={edges_npz.exists()} size={edges_npz.stat().st_size if edges_npz.exists() else 0}",
             f"ecdf exists={ecdf_npz.exists()} size={ecdf_npz.stat().st_size if ecdf_npz.exists() else 0}",
             f"chunk exists={chunk_txt.exists()} size={chunk_txt.stat().st_size if chunk_txt.exists() else 0}",
         ]
         raise RuntimeError(
             "score_chunk produced no data for "
-            f"{chunk_txt.name}. Tried: {natural_out.name}, {dag_out.name}. "
+            f"{chunk_txt.name}. Tried: {', '.join(sorted(set(str(c.name) for c in candidates)))}. "
             "Checks: " + " | ".join(hints)
         )
 
