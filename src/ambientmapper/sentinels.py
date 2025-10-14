@@ -114,7 +114,7 @@ def sentinel_ok(existing: Dict | None, expected_fp: Dict[str, str], outputs: Ite
     if not ok:
         return False
     for p in outputs:
-        if not Path(p).exists():
+        if (not p.exists()) or (p.stat().st_size == 0):
             return False
     return True
 
