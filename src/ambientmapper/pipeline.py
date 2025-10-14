@@ -1,10 +1,11 @@
-
 from __future__ import annotations
 import os, json
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from .dag import Ctx, Step, run_dag
 from .sentinels import read_generation
+from .assign_streaming import learn_edges_parallel, learn_ecdfs_parallel, score_chunk
+
 
 def _touch(p: Path):
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -67,21 +68,25 @@ def io_chunk(ctx, part=None):
     outs = [ctx.dirs['chunks'] / 'manifest.json']
     return ins, outs
 
+def _exp_dir(ctx):  # ExplorationReadLevel
+    d = ctx.dirs["root"] / "ExplorationReadLevel"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+    
 def io_assign_edges(ctx, part=None):
-    ins = [ctx.dirs['chunks'] / 'manifest.json']
-    outs = [ctx.dirs['final'] / 'global_edges.npz']
+    ins  = [ctx.dirs["chunks"] / "manifest.json"]
+    outs = [_exp_dir(ctx) / "global_edges.npz"]
     return ins, outs
 
 def io_assign_ecdf(ctx, part=None):
-    ins = [ctx.dirs['final'] / 'global_edges.npz']
-    outs = [ctx.dirs['final'] / 'global_ecdf.npz']
+    ins  = [_exp_dir(ctx) / "global_edges.npz"]
+    outs = [_exp_dir(ctx) / "global_ecdf.npz"]
     return ins, outs
 
 def io_assign_score(ctx, part):
-    from pathlib import Path as _P
-    ch_path = _P(part['path'])
-    ins = [ctx.dirs['final'] / 'global_edges.npz', ctx.dirs['final'] / 'global_ecdf.npz', ch_path]
-    out = ctx.dirs['chunks'] / f"{_P(part['id']).name}.scores.parquet"
+    ch_path = Path(part["path"])
+    out = ctx.dirs["chunks"] / f"{Path(part['id']).name}.scores.parquet"
+    ins = [_exp_dir(ctx) / "global_edges.npz", _exp_dir(ctx) / "global_ecdf.npz", ch_path]
     return ins, [out]
 
 def io_assign_merge(ctx, part=None):
@@ -144,15 +149,58 @@ def run_chunk(ctx: Ctx, part=None):
 
 def run_assign_edges(ctx, part=None):
     _, outs = io_assign_edges(ctx)
-    _noop_runner(outs)
+    edges_npz = outs[0]
+    learn_edges_parallel(
+        workdir=ctx.dirs["root"].parent,
+        sample=ctx.cfg["sample"],
+        chunks_dir=ctx.dirs["chunks"],
+        out_model=edges_npz,
+        mapq_min=int(ctx.params["assign"].get("mapq_min", 20)),
+        xa_max=int(ctx.params["assign"].get("xa_max", 2)),
+        chunksize=int(ctx.params["assign"].get("chunksize", 1_000_000)),
+        k=int(ctx.params["assign"].get("k", 10)),
+        batch_size=int(ctx.params["assign"].get("batch_size", 32)),
+        threads=int(ctx.params.get("threads", 8)),
+        verbose=bool(ctx.params.get("verbose", True)),
+        edges_workers=ctx.params["assign"].get("edges_workers"),
+        edges_max_reads=ctx.params["assign"].get("edges_max_reads"),
+    )
 
 def run_assign_ecdf(ctx, part=None):
     _, outs = io_assign_ecdf(ctx)
-    _noop_runner(outs)
+    ecdf_npz = outs[0]
+    learn_ecdfs_parallel(
+        workdir=ctx.dirs["root"].parent,
+        sample=ctx.cfg["sample"],
+        chunks_dir=ctx.dirs["chunks"],
+        edges_model=_exp_dir(ctx) / "global_edges.npz",
+        out_model=ecdf_npz,
+        mapq_min=int(ctx.params["assign"].get("mapq_min", 20)),
+        xa_max=int(ctx.params["assign"].get("xa_max", 2)),
+        chunksize=int(ctx.params["assign"].get("chunksize", 1_000_000)),
+        verbose=bool(ctx.params.get("verbose", True)),
+        workers=ctx.params["assign"].get("ecdf_workers") or int(ctx.params.get("threads", 8)),
+    )
 
 def run_assign_score(ctx, part):
     _, outs = io_assign_score(ctx, part)
-    _noop_runner(outs)
+    out_parquet = outs[0]
+    # call your scorer; it writes the parquet out automatically
+    score_chunk(
+        workdir=ctx.dirs["root"].parent,
+        sample=ctx.cfg["sample"],
+        chunk_file=Path(part["path"]),
+        ecdf_model=_exp_dir(ctx) / "global_ecdf.npz",
+        out_raw_dir=None,
+        out_filtered_dir=None,
+        mapq_min=int(ctx.params["assign"].get("mapq_min", 20)),
+        xa_max=int(ctx.params["assign"].get("xa_max", 2)),
+        chunksize=int(ctx.params["assign"].get("chunksize", 1_000_000)),
+        alpha=float(ctx.params["assign"].get("alpha", 0.05)),
+    )
+    # sanity-check: fail fast if nothing was written
+    if not out_parquet.exists() or out_parquet.stat().st_size == 0:
+        raise RuntimeError(f"score_chunk produced no data: {out_parquet}")
 
 def run_assign_merge(ctx, part=None):
     _, outs = io_assign_merge(ctx)
