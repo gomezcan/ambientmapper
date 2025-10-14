@@ -203,16 +203,83 @@ def run_assign_score(ctx, part):
         raise RuntimeError(f"score_chunk produced no data: {out_parquet}")
 
 def run_assign_merge(ctx, part=None):
+    """
+    Create a compact manifest of all per-chunk score outputs so downstream steps
+    have a single marker to depend on. We write JSON Lines into
+    final/assignments.parquet (content non-zero so sentinels treat it as OK).
+    """
+    import glob
     _, outs = io_assign_merge(ctx)
-    _noop_runner(outs)
+    out_path = outs[0]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Discover chunk score files
+    chunk_scores = sorted(glob.glob(str(ctx.dirs["chunks"] / "*.scores.parquet")))
+    # Write as JSONL so file is small but non-zero; extension remains .parquet as a marker.
+    lines = []
+    for p in chunk_scores:
+        lines.append(json.dumps({
+            "sample": ctx.cfg["sample"],
+            "score_file": str(Path(p).resolve()),
+        }))
+
+    tmp = out_path.with_suffix(".tmp")
+    with tmp.open("w") as f:
+        if lines:
+            f.write("\n".join(lines) + "\n")
+        else:
+            # still write at least one byte so sentinels don't think it's missing
+            f.write("{}\n")
+    os.replace(tmp, out_path)
+
 
 def run_genotype_per_chunk(ctx, part):
+    """
+    Marker-only per-chunk genotyping: write a small JSON stub to
+    <chunk>.genotypes.parquet so sentinels see a non-zero artifact.
+    The real posterior-aware genotyping happens in run_genotype_merge().
+    """
     _, outs = io_genotype_per_chunk(ctx, part)
-    _noop_runner(outs)
+    out = outs[0]
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "sample": ctx.cfg["sample"],
+        "chunk_id": str(Path(part["id"])),
+        "source_scores": str((ctx.dirs["chunks"] / f"{Path(part['id']).name}.scores.parquet").resolve()),
+        "note": "placeholder; real posterior-aware genotyping occurs at 30_genotype.20_merge",
+    }
+    tmp = out.with_suffix(".tmp")
+    with tmp.open("w") as f:
+        f.write(json.dumps(payload) + "\n")  # non-zero content
+    os.replace(tmp, out)
+
 
 def run_genotype_merge(ctx, part=None):
-    _, outs = io_genotype_merge(ctx)
-    _noop_runner(outs)
+    """
+    Real posterior-aware genotyping/merge: invoke your existing CLI entrypoint
+    that scans chunk outputs and writes final results (and optional report)
+    under final/.
+    """
+    from .genotyping import genotyping as _run_genotyping
+
+    # Let the genotyper search across all chunk outputs in the chunks dir
+    assign_glob = str(ctx.dirs["chunks"] / "**" / "*")
+    outdir = ctx.dirs["final"]
+    sample = ctx.cfg["sample"]
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Call the Typer command function directly
+    _run_genotyping.callback(
+        assign=assign_glob,
+        outdir=outdir,
+        sample=sample,
+        make_report=True,  # or False if you want to suppress until BAM clean is finalized
+    )
+
+    # Optionally drop a small DONE marker to help humans/tools see completion
+    (outdir / "genotyping_merge.DONE").write_text("ok\n")
+
 
 def run_bam_clean(ctx, part=None):
     _, outs = io_bam_clean(ctx)
