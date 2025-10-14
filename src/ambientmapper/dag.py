@@ -3,6 +3,8 @@ import os, time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Iterable, Any
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import typer
 from .sentinels import (
     sentinel_path, load_sentinel, write_sentinel,
@@ -169,7 +171,7 @@ def run_dag(ctx: Ctx, steps: Dict[str, Step], partitions: List[Dict] | None) -> 
                         (executed if ran else skipped).append(label)
                     except Exception as e:
                         # surface the first error quickly with context
-                        raise RuntimeError(f"{name} failed on {label}") from e
+                        raise RuntimeError(f"{name} failed on {label}: {e}") from e
                     finally:
                         done += 1
                         if chatty and (done % 50 == 0 or done == len(futs)):
