@@ -26,15 +26,31 @@ def _dirs(cfg: Dict[str, Any]) -> Dict[str, Path]:
         'qc': root / 'qc',
     }
 
-def read_manifest(dirs: Dict[str, Path]):
-    m = dirs['chunks'] / 'manifest.json'
-    if not m.exists():
-        return []
-    data = json.loads(m.read_text())
-    parts = []
-    for ch in data.get('chunks', []):
-        parts.append({'id': ch['id'], 'path': str((dirs['chunks'] / Path(ch['path']).name).resolve())})
-    return parts
+# --- replace read_manifest(...) with a robust discovery ---
+def discover_partitions(dirs: Dict[str, Path]) -> List[Dict[str, Any]]:
+    """
+    Prefer a valid manifest.json; if entries are missing on disk, fall back to globbing
+    *_cell_map_ref_chunk_*.txt in the chunks directory.
+    """
+    parts: List[Dict[str, Any]] = []
+    man = dirs["chunks"] / "manifest.json"
+    if man.exists():
+        try:
+            data = json.loads(man.read_text())
+            for ch in data.get("chunks", []):
+                # always resolve relative to chunks dir
+                p = dirs["chunks"] / Path(ch["path"]).name
+                if p.exists():
+                    parts.append({"id": ch.get("id", p.stem), "path": str(p)})
+        except Exception:
+            parts = []  # corrupt manifest → ignore
+
+    if parts:  # valid manifest covered everything we need
+        return parts
+
+    # Fallback: glob the actual txt chunks your tool writes
+    txts = sorted(dirs["chunks"].glob("*_cell_map_ref_chunk_*.txt"))
+    return [{"id": f.stem, "path": str(f)} for f in txts]
 
 def io_extract(ctx, part=None):
     ins = [Path(p) for p in ctx.cfg.get('fastqs', [])]
@@ -97,16 +113,34 @@ def run_filter(ctx, part=None):
     _, outs = io_filter(ctx)
     _noop_runner(outs)
 
-def run_chunk(ctx, part=None):
+# --- update run_chunk(...) to write a correct manifest if txt chunks already exist ---
+def run_chunk(ctx: Ctx, part=None):
     _, outs = io_chunk(ctx)
     outs[0].parent.mkdir(parents=True, exist_ok=True)
-    manifest = {
-        'version': 1,
-        'n_chunks': 3,
-        'chunks': [{'id': f'chunk_{i:04d}', 'path': f'chunk_{i:04d}.parquet'} for i in range(1,4)],
-        'derived_from': {'filtered_inputs_sha256': 'placeholder', 'upstream_generation': ctx.generation_id},
-    }
+    # If user already produced chunk txt files, reflect those exactly.
+    txts = sorted(ctx.dirs["chunks"].glob("*_cell_map_ref_chunk_*.txt"))
+    if txts:
+        manifest = {
+            "version": 1,
+            "n_chunks": len(txts),
+            "chunks": [{"id": f.stem, "path": f.name} for f in txts],
+            "derived_from": {
+                "filtered_inputs_sha256": "unknown",
+                "upstream_generation": ctx.generation_id
+            },
+        }
+    else:
+        # last-resort tiny dummy so the DAG can proceed in empty sandboxes
+        manifest = {
+            "version": 1,
+            "n_chunks": 1,
+            "chunks": [{"id": "chunk_0001", "path": "chunk_0001.txt"}],
+            "derived_from": {"filtered_inputs_sha256": "placeholder", "upstream_generation": ctx.generation_id},
+        }
+        (ctx.dirs["chunks"] / "chunk_0001.txt").touch(exist_ok=True)
+
     outs[0].write_text(json.dumps(manifest, indent=2))
+
 
 def run_assign_edges(ctx, part=None):
     _, outs = io_assign_edges(ctx)
@@ -223,20 +257,21 @@ def build_steps() -> Dict[str, Step]:
         ),
     }
 
+# --- and in run_pipeline(...), swap read_manifest(...) for discover_partitions(...) ---    
 def run_pipeline(cfg: Dict[str, Any], params: Dict[str, Any], version: str = '0.4.0',
                  resume: bool = True, force: List[str] | None = None, skip_to: str = '', only: List[str] | None = None):
     dirs = _dirs(cfg)
     gen = read_generation(dirs['root'])
     ctx = Ctx(cfg=cfg, params=params, dirs=dirs, version=version, resume=resume,
               force=(force or []), skip_to=skip_to, only=(only or []), generation_id=gen)
+    
     steps = build_steps()
-    partitions = read_manifest(dirs)
+    partitions = discover_partitions(dirs)
     if not partitions:
-        # fallback: dummy single chunk so pipeline can run
-        from pathlib import Path as _P
-        dummy = dirs['chunks'] / 'chunk_0001.parquet'
+        # still nothing? create a dummy chunk to avoid crashes
+        dummy = dirs["chunks"] / "chunk_0001.txt"
         dummy.parent.mkdir(parents=True, exist_ok=True)
         dummy.touch(exist_ok=True)
-        partitions = [{'id': 'chunk_0001', 'path': str(dummy)}]
+        partitions = [{"id": dummy.stem, "path": str(dummy)}]
     result = run_dag(ctx, steps, partitions=partitions)
     return result
