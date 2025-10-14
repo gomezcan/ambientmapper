@@ -27,6 +27,64 @@ def _dirs(cfg: Dict[str, Any]) -> Dict[str, Path]:
         'qc': root / 'qc',
     }
 
+def _exp_dir(ctx):
+    d = ctx.dirs["root"] / "ExplorationReadLevel"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def io_assign_edges(ctx, part=None):
+    ins  = [ctx.dirs["chunks"] / "manifest.json"]
+    outs = [_exp_dir(ctx) / "global_edges.npz"]
+    return ins, outs
+
+def io_assign_ecdf(ctx, part=None):
+    ins  = [_exp_dir(ctx) / "global_edges.npz"]
+    outs = [_exp_dir(ctx) / "global_ecdf.npz"]
+    return ins, outs
+
+def io_assign_score(ctx, part):
+    ch = Path(part["path"])
+    out = ctx.dirs["chunks"] / f"{ch.stem}.scores.parquet"
+    ins = [_exp_dir(ctx) / "global_edges.npz", _exp_dir(ctx) / "global_ecdf.npz", ch]
+    return ins, [out]
+
+def io_assign_merge(ctx, part=None):
+    ins  = [ctx.dirs["chunks"] / "manifest.json"]
+    outs = [ctx.dirs["final"] / "assignments.parquet"]  # marker file
+    return ins, outs
+
+def io_genotype_per_chunk(ctx, part):
+    stem = Path(part["id"]).name
+    scores = ctx.dirs["chunks"] / f"{stem}.scores.parquet"
+    out    = ctx.dirs["chunks"] / f"{stem}.genotypes.parquet"  # marker file
+    return [scores], [out]
+
+def io_genotype_merge(ctx, part=None):
+    ins  = [ctx.dirs["chunks"] / "manifest.json"]
+    outs = [ctx.dirs["final"] / "genotypes.parquet"]
+    return ins, outs
+
+def io_bam_clean(ctx, part=None):
+    ins  = [ctx.dirs["final"] / "genotypes.parquet"]
+    outs = [ctx.dirs["final"] / "bam_cleaned.DONE"]
+    return ins, outs
+
+
+def io_extract(ctx, part=None):
+    ins  = [Path(p) for p in ctx.cfg.get('fastqs', [])]
+    outs = [ctx.dirs['extracted'] / 'reads_000.parquet']
+    return ins, outs
+
+def io_filter(ctx, part=None):
+    ins  = [ctx.dirs['extracted'] / 'reads_000.parquet']
+    outs = [ctx.dirs['filtered'] / 'reads_000.filtered.parquet']
+    return ins, outs
+
+def io_chunk(ctx, part=None):
+    ins  = [ctx.dirs['filtered'] / 'reads_000.filtered.parquet']
+    outs = [ctx.dirs['chunks'] / 'manifest.json']
+    return ins, outs
+    
 # --- replace read_manifest(...) with a robust discovery ---
 def discover_partitions(dirs: Dict[str, Path]) -> List[Dict[str, Any]]:
     """
@@ -53,63 +111,40 @@ def discover_partitions(dirs: Dict[str, Path]) -> List[Dict[str, Any]]:
     txts = sorted(dirs["chunks"].glob("*_cell_map_ref_chunk_*.txt"))
     return [{"id": f.stem, "path": str(f)} for f in txts]
 
-def io_extract(ctx, part=None):
-    ins = [Path(p) for p in ctx.cfg.get('fastqs', [])]
-    outs = [ctx.dirs['extracted'] / 'reads_000.parquet']
-    return ins, outs
+# ----- top-level adapters (no lambdas anywhere in build_steps)
+def in_extract(ctx, part=None):  return io_extract(ctx)[0]
+def out_extract(ctx, part=None): return io_extract(ctx)[1]
 
-def io_filter(ctx, part=None):
-    ins = [ctx.dirs['extracted'] / 'reads_000.parquet']
-    outs = [ctx.dirs['filtered'] / 'reads_000.filtered.parquet']
-    return ins, outs
+def in_filter(ctx, part=None):   return io_filter(ctx)[0]
+def out_filter(ctx, part=None):  return io_filter(ctx)[1]
 
-def io_chunk(ctx, part=None):
-    ins = [ctx.dirs['filtered'] / 'reads_000.filtered.parquet']
-    outs = [ctx.dirs['chunks'] / 'manifest.json']
-    return ins, outs
+def in_chunk(ctx, part=None):    return io_chunk(ctx)[0]
+def out_chunk(ctx, part=None):   return io_chunk(ctx)[1]
 
-def _exp_dir(ctx):  # ExplorationReadLevel
-    d = ctx.dirs["root"] / "ExplorationReadLevel"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-    
-def io_assign_edges(ctx, part=None):
-    ins  = [ctx.dirs["chunks"] / "manifest.json"]
-    outs = [_exp_dir(ctx) / "global_edges.npz"]
-    return ins, outs
+def in_assign_edges(ctx, part=None):  return io_assign_edges(ctx)[0]
+def out_assign_edges(ctx, part=None): return io_assign_edges(ctx)[1]
 
-def io_assign_ecdf(ctx, part=None):
-    ins  = [_exp_dir(ctx) / "global_edges.npz"]
-    outs = [_exp_dir(ctx) / "global_ecdf.npz"]
-    return ins, outs
+def in_assign_ecdf(ctx, part=None):   return io_assign_ecdf(ctx)[0]
+def out_assign_ecdf(ctx, part=None):  return io_assign_ecdf(ctx)[1]
 
-def io_assign_score(ctx, part):
-    ch_path = Path(part["path"])
-    out = ctx.dirs["chunks"] / f"{Path(part['id']).name}.scores.parquet"
-    ins = [_exp_dir(ctx) / "global_edges.npz", _exp_dir(ctx) / "global_ecdf.npz", ch_path]
-    return ins, [out]
+def in_assign_score(ctx, part):       return io_assign_score(ctx, part)[0]
+def out_assign_score(ctx, part):      return io_assign_score(ctx, part)[1]
 
-def io_assign_merge(ctx, part=None):
-    ins = [ctx.dirs['chunks'] / 'manifest.json']
-    outs = [ctx.dirs['final'] / 'assignments.parquet']
-    return ins, outs
+def in_assign_merge(ctx, part=None):  return io_assign_merge(ctx)[0]
+def out_assign_merge(ctx, part=None): return io_assign_merge(ctx)[1]
 
-def io_genotype_per_chunk(ctx, part):
-    from pathlib import Path as _P
-    scores = ctx.dirs['chunks'] / f"{_P(part['id']).name}.scores.parquet"
-    out = ctx.dirs['chunks'] / f"{_P(part['id']).name}.genotypes.parquet"
-    return [scores], [out]
+def in_geno_per_chunk(ctx, part):     return io_genotype_per_chunk(ctx, part)[0]
+def out_geno_per_chunk(ctx, part):    return io_genotype_per_chunk(ctx, part)[1]
 
-def io_genotype_merge(ctx, part=None):
-    ins = [ctx.dirs['chunks'] / 'manifest.json']
-    outs = [ctx.dirs['final'] / 'genotypes.parquet']
-    return ins, outs
+def in_geno_merge(ctx, part=None):    return io_genotype_merge(ctx)[0]
+def out_geno_merge(ctx, part=None):   return io_genotype_merge(ctx)[1]
 
-def io_bam_clean(ctx, part=None):
-    ins = [ctx.dirs['final'] / 'genotypes.parquet']
-    outs = [ctx.dirs['final'] / 'bam_cleaned.DONE']
-    return ins, outs
+def in_bam_clean(ctx, part=None):     return io_bam_clean(ctx)[0]
+def out_bam_clean(ctx, part=None):    return io_bam_clean(ctx)[1]
 
+
+
+# ----- runners updated to the new IO shape
 def run_extract(ctx, part=None):
     _, outs = io_extract(ctx)
     _noop_runner(outs)
@@ -332,7 +367,6 @@ def run_genotype_per_chunk(ctx, part):
         f.write(json.dumps(payload) + "\n")  # non-zero content
     os.replace(tmp, out)
 
-
 def run_genotype_merge(ctx, part=None):
     """
     Real posterior-aware genotyping/merge: invoke your existing CLI entrypoint
@@ -363,92 +397,34 @@ def run_bam_clean(ctx, part=None):
     _, outs = io_bam_clean(ctx)
     _noop_runner(outs)
 
+# ----- build_steps with adapters (no lambdas)
 def build_steps() -> Dict[str, Step]:
     return {
-        '00_extract': Step(
-            name='00_extract',
-            requires=[],
-            is_partitioned=False,
-            inputs_fn=lambda ctx, _: io_extract(ctx)[0],
-            outputs_fn=lambda ctx, _: io_extract(ctx)[1],
-            runner_fn=run_extract,
-            bump_generation=True,
-        ),
-        '05_filter': Step(
-            name='05_filter',
-            requires=['00_extract'],
-            is_partitioned=False,
-            inputs_fn=lambda ctx, _: io_filter(ctx)[0],
-            outputs_fn=lambda ctx, _: io_filter(ctx)[1],
-            runner_fn=run_filter,
-            bump_generation=True,
-        ),
-        '10_chunk': Step(
-            name='10_chunk',
-            requires=['05_filter'],
-            is_partitioned=False,
-            inputs_fn=lambda ctx, _: io_chunk(ctx)[0],
-            outputs_fn=lambda ctx, _: io_chunk(ctx)[1],
-            runner_fn=run_chunk,
-            bump_generation=True,
-        ),
-        '20_assign.10_edges': Step(
-            name='20_assign.10_edges',
-            requires=['10_chunk'],
-            is_partitioned=False,
-            inputs_fn=lambda ctx, _: io_assign_edges(ctx)[0],
-            outputs_fn=lambda ctx, _: io_assign_edges(ctx)[1],
-            runner_fn=run_assign_edges,
-        ),
-        '20_assign.20_ecdfs': Step(
-            name='20_assign.20_ecdfs',
-            requires=['20_assign.10_edges'],
-            is_partitioned=False,
-            inputs_fn=lambda ctx, _: io_assign_ecdf(ctx)[0],
-            outputs_fn=lambda ctx, _: io_assign_ecdf(ctx)[1],
-            runner_fn=run_assign_ecdf,
-        ),
-        '20_assign.30_score': Step(
-            name='20_assign.30_score',
-            requires=['20_assign.20_ecdfs'],
-            is_partitioned=True,
-            inputs_fn=lambda ctx, part: io_assign_score(ctx, part)[0],
-            outputs_fn=lambda ctx, part: io_assign_score(ctx, part)[1],
-            runner_fn=run_assign_score,
-        ),
-        '20_assign.40_merge': Step(
-            name='20_assign.40_merge',
-            requires=['20_assign.30_score'],
-            is_partitioned=False,
-            inputs_fn=lambda ctx, _: io_assign_merge(ctx)[0],
-            outputs_fn=lambda ctx, _: io_assign_merge(ctx)[1],
-            runner_fn=run_assign_merge,
-        ),
-        '30_genotype.10_per_chunk': Step(
-            name='30_genotype.10_per_chunk',
-            requires=['20_assign.40_merge'],
-            is_partitioned=True,
-            inputs_fn=lambda ctx, part: io_genotype_per_chunk(ctx, part)[0],
-            outputs_fn=lambda ctx, part: io_genotype_per_chunk(ctx, part)[1],
-            runner_fn=run_genotype_per_chunk,
-        ),
-        '30_genotype.20_merge': Step(
-            name='30_genotype.20_merge',
-            requires=['30_genotype.10_per_chunk'],
-            is_partitioned=False,
-            inputs_fn=lambda ctx, _: io_genotype_merge(ctx)[0],
-            outputs_fn=lambda ctx, _: io_genotype_merge(ctx)[1],
-            runner_fn=run_genotype_merge,
-        ),
-        '35_bamclean': Step(
-            name='35_bamclean',
-            requires=['30_genotype.20_merge'],
-            is_partitioned=False,
-            inputs_fn=lambda ctx, _: io_bam_clean(ctx)[0],
-            outputs_fn=lambda ctx, _: io_bam_clean(ctx)[1],
-            runner_fn=run_bam_clean,
-        ),
+        '00_extract': Step('00_extract', [], False, in_extract, out_extract, run_extract, bump_generation=True),
+        '05_filter':  Step('05_filter',  ['00_extract'], False, in_filter, out_filter, run_filter, bump_generation=True),
+        '10_chunk':   Step('10_chunk',   ['05_filter'],  False, in_chunk, out_chunk, run_chunk, bump_generation=True),
+
+        '20_assign.10_edges': Step('20_assign.10_edges', ['10_chunk'], False,
+                                   in_assign_edges, out_assign_edges, run_assign_edges),
+        '20_assign.20_ecdfs': Step('20_assign.20_ecdfs', ['20_assign.10_edges'], False,
+                                   in_assign_ecdf, out_assign_ecdf, run_assign_ecdf),
+
+        '20_assign.30_score': Step('20_assign.30_score', ['20_assign.20_ecdfs'], True,
+                                   in_assign_score, out_assign_score, run_assign_score),
+
+        '20_assign.40_merge': Step('20_assign.40_merge', ['20_assign.30_score'], False,
+                                   in_assign_merge, out_assign_merge, run_assign_merge),
+
+        '30_genotype.10_per_chunk': Step('30_genotype.10_per_chunk', ['20_assign.40_merge'], True,
+                                         in_geno_per_chunk, out_geno_per_chunk, run_genotype_per_chunk),
+
+        '30_genotype.20_merge': Step('30_genotype.20_merge', ['30_genotype.10_per_chunk'], False,
+                                     in_geno_merge, out_geno_merge, run_genotype_merge),
+
+        '35_bamclean': Step('35_bamclean', ['30_genotype.20_merge'], False,
+                            in_bam_clean, out_bam_clean, run_bam_clean),
     }
+
 
 # --- and in run_pipeline(...), swap read_manifest(...) for discover_partitions(...) ---    
 def run_pipeline(cfg: Dict[str, Any], params: Dict[str, Any], version: str = '0.4.0',
