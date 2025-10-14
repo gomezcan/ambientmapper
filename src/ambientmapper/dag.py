@@ -3,6 +3,7 @@ import os, time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Iterable, Any
+import typer
 from .sentinels import (
     sentinel_path, load_sentinel, write_sentinel,
     make_payload, fingerprint, read_generation, bump_generation, sentinel_ok,
@@ -93,7 +94,10 @@ def run_dag(ctx: Ctx, steps: Dict[str, Step], partitions: List[Dict] | None) -> 
     executed: List[str] = []
     skipped: List[str] = []
 
-    # If no skip_to is provided, we start in "reached" (normal) mode.
+    # use CLI --verbose or default True
+    chatty = bool(ctx.params.get("verbose", True))
+
+    # If no skip_to is provided, start in normal mode.
     reached = not bool(ctx.skip_to)
 
     def _outs_exist(step: Step, part: Optional[Dict]) -> bool:
@@ -111,39 +115,60 @@ def run_dag(ctx: Ctx, steps: Dict[str, Step], partitions: List[Dict] | None) -> 
         if ctx.only and name not in ctx.only:
             continue
 
-        # PRE-TARGET VALIDATION PASS
+        # -------------------------
+        # PRE-TARGET VALIDATION
+        # -------------------------
         if not reached:
             if name == ctx.skip_to:
-                # flip into normal execution from here on
                 reached = True
             else:
                 # validate-only for pre-target steps
                 if step.is_partitioned:
                     assert partitions is not None and len(partitions) > 0, "No partitions available for partitioned step"
-                    for part in partitions:
+                    if chatty:
+                        typer.echo(f"[dag] validate {name} (n_parts={len(partitions)})")
+                    for idx, part in enumerate(partitions, start=1):
                         label = f"{name}[{part.get('id','?')}]"
                         if _outs_exist(step, part):
                             skipped.append(label)
                         else:
                             ran = run_step(ctx, step, partition=part)
                             (executed if ran else skipped).append(label)
+                        if chatty and (idx % 50 == 0 or idx == len(partitions)):
+                            typer.echo(f"[dag]   {name}: {idx}/{len(partitions)} checked")
                 else:
                     if _outs_exist(step, None):
                         skipped.append(name)
                     else:
+                        if chatty:
+                            typer.echo(f"[dag] → {name} (pre-target, materializing)")
                         ran = run_step(ctx, step, partition=None)
                         (executed if ran else skipped).append(name)
-                continue  # move to next step
+                        if chatty:
+                            typer.echo(f"[dag] ✓ {name}")
+                continue  # next step
 
-        # NORMAL EXECUTION (from target onward)
+        # -------------------------
+        # NORMAL EXECUTION
+        # -------------------------
         if step.is_partitioned:
             assert partitions is not None and len(partitions) > 0, "No partitions available for partitioned step"
-            for part in partitions:
+            if chatty:
+                typer.echo(f"[dag] → {name} (n_parts={len(partitions)})")
+            for idx, part in enumerate(partitions, start=1):
                 label = f"{name}[{part.get('id','?')}]"
                 ran = run_step(ctx, step, partition=part)
                 (executed if ran else skipped).append(label)
+                if chatty and (idx % 50 == 0 or idx == len(partitions)):
+                    typer.echo(f"[dag]   {name}: {idx}/{len(partitions)}")
+            if chatty:
+                typer.echo(f"[dag] ✓ {name}")
         else:
+            if chatty:
+                typer.echo(f"[dag] → {name}")
             ran = run_step(ctx, step, partition=None)
             (executed if ran else skipped).append(name)
+            if chatty:
+                typer.echo(f"[dag] ✓ {name}")
 
     return {"executed": executed, "skipped": skipped}
