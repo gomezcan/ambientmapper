@@ -184,15 +184,45 @@ def run_assign_ecdf(ctx, part=None):
 
 # 
 def run_assign_score(ctx, part):
-    if ctx.params.get("verbose", True):
-        typer.echo(f"[score] start {part['id']}")
+    """
+    Score one chunk. We:
+      - verify inputs exist (ECDF model + chunk file)
+      - call score_chunk
+      - accept either <chunk_stem>.scores.parquet or our id-based path
+      - raise a rich error if nothing was produced
+    """
+    from pathlib import Path as _P
+    import typer
+
+    chatty = bool(ctx.params.get("verbose", True))
+
+    # expected inputs
+    ecdf_npz = _exp_dir(ctx) / "global_ecdf.npz"
+    chunk_txt = _P(part["path"])
+
+    # quick preflight
+    if not ecdf_npz.exists() or ecdf_npz.stat().st_size == 0:
+        raise RuntimeError(f"ECDF model missing/empty: {ecdf_npz}  "
+                           f"(recompute steps 20_assign.10_edges and 20_assign.20_ecdfs)")
+    if not chunk_txt.exists() or chunk_txt.stat().st_size == 0:
+        raise RuntimeError(f"Chunk file missing/empty: {chunk_txt}")
+
+    # "natural" output name that the scorer is expected to produce
+    natural_out = chunk_txt.with_name(chunk_txt.stem + ".scores.parquet")
+
+    # our DAG’s id-based output (keep for backward compat)
     _, outs = io_assign_score(ctx, part)
-    out_parquet = outs[0]
+    dag_out = outs[0]
+
+    if chatty:
+        typer.echo(f"[score] start {part['id']}  →  {natural_out.name}")
+
+    # call scorer (it writes its outputs based on chunk file name)
     score_chunk(
         workdir=ctx.dirs["root"].parent,
         sample=ctx.cfg["sample"],
-        chunk_file=Path(part["path"]),
-        ecdf_model=_exp_dir(ctx) / "global_ecdf.npz",
+        chunk_file=chunk_txt,
+        ecdf_model=ecdf_npz,
         out_raw_dir=None,
         out_filtered_dir=None,
         mapq_min=int(ctx.params["assign"].get("mapq_min", 20)),
@@ -200,10 +230,41 @@ def run_assign_score(ctx, part):
         chunksize=int(ctx.params["assign"].get("chunksize", 1_000_000)),
         alpha=float(ctx.params["assign"].get("alpha", 0.05)),
     )
-    if not out_parquet.exists() or out_parquet.stat().st_size == 0:
-        raise RuntimeError(f"score_chunk produced no data: {out_parquet}")
-    if ctx.params.get("verbose", True):
+
+    # Accept whichever path the scorer actually wrote
+    produced = None
+    for candidate in (natural_out, dag_out):
+        if candidate.exists() and candidate.stat().st_size > 0:
+            produced = candidate
+            break
+
+    # If scorer wrote to natural_out but our DAG expects dag_out, mirror it
+    if produced is natural_out and natural_out != dag_out:
+        try:
+            # hard link first (cheap); fall back to copy if FS forbids links
+            os.link(natural_out, dag_out)
+        except Exception:
+            import shutil
+            shutil.copy2(natural_out, dag_out)
+
+    if not ((dag_out.exists() and dag_out.stat().st_size > 0) or
+            (natural_out.exists() and natural_out.stat().st_size > 0)):
+        # gather extra hints to make the error self-explanatory
+        edges = _exp_dir(ctx) / "global_edges.npz"
+        hints = [
+            f"edges exists={edges.exists()} size={edges.stat().st_size if edges.exists() else 0}",
+            f"ecdf exists={ecdf_npz.exists()} size={ecdf_npz.stat().st_size if ecdf_npz.exists() else 0}",
+            f"chunk exists={chunk_txt.exists()} size={chunk_txt.stat().st_size if chunk_txt.exists() else 0}",
+        ]
+        raise RuntimeError(
+            "score_chunk produced no data for "
+            f"{chunk_txt.name}. Tried: {natural_out.name}, {dag_out.name}. "
+            "Checks: " + " | ".join(hints)
+        )
+
+    if chatty:
         typer.echo(f"[score] done  {part['id']}")
+
 
 
 def run_assign_merge(ctx, part=None):
