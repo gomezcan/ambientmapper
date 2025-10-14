@@ -80,6 +80,10 @@ def run_step(ctx: Ctx, step: Step, partition: Optional[Dict] = None) -> bool:
         ctx.generation_id = bump_generation(ctx.dirs["root"], reason=f"{step.name} completed")
     return True
 
+def _run_step_worker(ctx: Ctx, step: Step, part: Optional[Dict]) -> bool:
+    """Top-level worker wrapper so ProcessPoolExecutor can pickle it."""
+    return run_step(ctx, step, partition=part)
+    
 def run_dag(ctx: Ctx, steps: Dict[str, Step], partitions: List[Dict] | None) -> Dict[str, Any]:
     """
     Execute steps in topological order.
@@ -122,31 +126,25 @@ def run_dag(ctx: Ctx, steps: Dict[str, Step], partitions: List[Dict] | None) -> 
             if name == ctx.skip_to:
                 reached = True
             else:
-                # validate-only for pre-target steps
                 if step.is_partitioned:
-                    assert partitions is not None and len(partitions) > 0, "No partitions available for partitioned step"
-                    if chatty:
-                        typer.echo(f"[dag] validate {name} (n_parts={len(partitions)})")
-                    for idx, part in enumerate(partitions, start=1):
+                    assert partitions and len(partitions) > 0, "No partitions available for partitioned step"
+                    for part in partitions:
                         label = f"{name}[{part.get('id','?')}]"
                         if _outs_exist(step, part):
                             skipped.append(label)
                         else:
+                            typer.echo(f"[dag] → {name} (pre-target, materializing)")
                             ran = run_step(ctx, step, partition=part)
                             (executed if ran else skipped).append(label)
-                        if chatty and (idx % 50 == 0 or idx == len(partitions)):
-                            typer.echo(f"[dag]   {name}: {idx}/{len(partitions)} checked")
                 else:
                     if _outs_exist(step, None):
                         skipped.append(name)
                     else:
-                        if chatty:
-                            typer.echo(f"[dag] → {name} (pre-target, materializing)")
+                        typer.echo(f"[dag] → {name} (pre-target, materializing)")
                         ran = run_step(ctx, step, partition=None)
                         (executed if ran else skipped).append(name)
-                        if chatty:
-                            typer.echo(f"[dag] ✓ {name}")
-                continue  # next step
+                continue
+
 
         # -------------------------
         # NORMAL EXECUTION
@@ -155,20 +153,30 @@ def run_dag(ctx: Ctx, steps: Dict[str, Step], partitions: List[Dict] | None) -> 
             assert partitions is not None and len(partitions) > 0, "No partitions available for partitioned step"
             if chatty:
                 typer.echo(f"[dag] → {name} (n_parts={len(partitions)})")
-            for idx, part in enumerate(partitions, start=1):
-                label = f"{name}[{part.get('id','?')}]"
-                ran = run_step(ctx, step, partition=part)
-                (executed if ran else skipped).append(label)
-                if chatty and (idx % 50 == 0 or idx == len(partitions)):
-                    typer.echo(f"[dag]   {name}: {idx}/{len(partitions)}")
-            if chatty:
-                typer.echo(f"[dag] ✓ {name}")
+            
+            max_workers = int(ctx.params.get("threads", os.cpu_count() or 1))
+            max_workers = max(1, min(max_workers, len(partitions)))
+            
+            # submit all parts
+            with ProcessPoolExecutor(max_workers=max_workers) as ex:
+                futs = {ex.submit(_run_step_worker, ctx, step, part): part for part in partitions}
+                done = 0
+                for fut in as_completed(futs):
+                    part = futs[fut]
+                    label = f"{name}[{part.get('id','?')}]"
+                    try:
+                        ran = fut.result()
+                        (executed if ran else skipped).append(label)
+                    except Exception as e:
+                        # surface the first error quickly with context
+                        raise RuntimeError(f"{name} failed on {label}") from e
+                    finally:
+                        done += 1
+                        if chatty and (done % 50 == 0 or done == len(futs)):
+                            typer.echo(f"[dag]   {name}: {done}/{len(futs)}")
         else:
-            if chatty:
-                typer.echo(f"[dag] → {name}")
+            typer.echo(f"[dag] → {name}") if ctx.params.get("verbose", True) else None
             ran = run_step(ctx, step, partition=None)
             (executed if ran else skipped).append(name)
-            if chatty:
-                typer.echo(f"[dag] ✓ {name}")
 
     return {"executed": executed, "skipped": skipped}
