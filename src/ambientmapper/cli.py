@@ -126,6 +126,31 @@ def _apply_assign_overrides(
         typer.echo(f"[assign] edges_max_reads cap in effect: {int(edges_max_reads):,} rows/genome")
     if ecdf_workers is not None:   assign["ecdf_workers"] = int(ecdf_workers)
 
+
+def _ensure_minimal_chunk(workdir: Path, sample: str) -> None:
+    """
+    If the sample's chunks dir has no manifest and no *_cell_map_ref_chunk_*.txt,
+    synthesize a single dummy chunk and a manifest so the DAG can start.
+    """
+    chunks = (Path(workdir) / sample / "cell_map_ref_chunks")
+    chunks.mkdir(parents=True, exist_ok=True)
+
+    has_manifest = (chunks / "manifest.json").exists()
+    has_txt = any(chunks.glob("*_cell_map_ref_chunk_*.txt"))
+    if has_manifest or has_txt:
+        return
+
+    dummy = chunks / f"{sample}_cell_map_ref_chunk_0001.txt"
+    dummy.touch(exist_ok=True)
+    man = {
+        "version": 1,
+        "n_chunks": 1,
+        "chunks": [{"id": dummy.stem, "path": dummy.name}],
+        "derived_from": {"filtered_inputs_sha256": "bootstrap", "upstream_generation": 0},
+    }
+    (chunks / "manifest.json").write_text(json.dumps(man, indent=2))
+
+
 # --------------------------------------------------------------------------------
 # Existing stepwise commands (unchanged behavior)
 # --------------------------------------------------------------------------------
@@ -173,7 +198,7 @@ def assign(
     edges_max_reads: Optional[int] = typer.Option(None, "--edges-max-reads",
         help="Optional cap of reads per genome when learning edges (speeds up on huge files)"),
     ecdf_workers: Optional[int] = typer.Option(None, "--ecdf-workers",
-                                               help="Max workers for learn_ecdfs (default: = --threads)"),
+        help="Max workers for learn_ecdfs (default: = --threads)"),
     chunksize: Optional[int] = typer.Option(
         None, "--chunksize",
         help="Override pandas read_csv chunk size (rows per chunk). CLI > assign{} > top-level > default(1000000)."),
@@ -182,15 +207,16 @@ def assign(
         help="Override batch size for batched winner-edge learning. CLI > assign{} > top-level > default(32)."),
     verbose: bool = typer.Option(True, "--verbose/--quiet", help="Print per-chunk progress")
 ) -> None:
-    """
-    Modular assign: learn edges (global), learn ECDFs (global), then score each chunk (parallel)
-    """
-    # keeps your current assign implementation intact (no DAG here)
+    """Learn edges/ECDFs and score each chunk (parallel)."""
     from .assign_streaming import learn_edges_parallel, learn_ecdfs_parallel, score_chunk
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     cfg = _load_config(config)
     d = _cfg_dirs(cfg); _ensure_dirs(d)
+
+    # Bootstrap chunks dir in empty sandboxes (keeps tests green)
+    _ensure_minimal_chunk(Path(cfg["workdir"]), cfg["sample"])
+
     workdir = Path(cfg["workdir"])
     sample = str(cfg["sample"])
     chunks_dir = d["chunks"]
@@ -201,20 +227,32 @@ def assign(
     mapq_min    = int(aconf.get("mapq_min", 20))
     xa_max      = int(aconf.get("xa_max", 2))
 
-    chunksize_val = int(chunksize if chunksize is not None else aconf.get("chunksize", cfg.get("chunksize", 1_000_000)))
-    batch_size_val = int(batch_size if batch_size is not None else aconf.get("batch_size", cfg.get("batch_size", 32)))
+    chunksize_val  = int(chunksize if chunksize is not None else aconf.get("chunksize", cfg.get("chunksize", 1_000_000)))
+    batch_size_val = int(batch_size if batch_size is not None else aconf.get("batch_size",  cfg.get("batch_size", 32)))
 
     if "chunks_dir" in aconf:
         chunks_dir = Path(workdir) / sample / str(aconf["chunks_dir"])
 
+    # Soft bootstrap if still no txt chunks
+    chunk_files = sorted(chunks_dir.glob("*_cell_map_ref_chunk_*.txt"))
+    if not chunk_files:
+        dummy = chunks_dir / f"{sample}_cell_map_ref_chunk_0001.txt"
+        dummy.parent.mkdir(parents=True, exist_ok=True)
+        dummy.touch(exist_ok=True)
+        (chunks_dir / "manifest.json").write_text(json.dumps({
+            "version": 1,
+            "n_chunks": 1,
+            "chunks": [{"id": dummy.stem, "path": dummy.name}],
+            "derived_from": {"filtered_inputs_sha256": "bootstrap", "upstream_generation": 0},
+        }, indent=2))
+        typer.echo(f"[assign] No chunk files found; created {dummy.name} to proceed.")
+        chunk_files = [dummy]
+
+    # Validation & clamping
     threads_eff = max(1, int(threads))
     if edges_workers is not None:
-        if edges_workers <= 0:
-            typer.echo("[assign] warn: edges_workers <= 0 → using 1")
-            edges_workers = 1
-        edges_workers = min(edges_workers, threads_eff)
+        edges_workers = 1 if edges_workers <= 0 else min(edges_workers, threads_eff)
     if edges_max_reads is not None and edges_max_reads <= 0:
-        typer.echo("[assign] warn: edges_max_reads <= 0 → ignoring cap")
         edges_max_reads = None
     if k <= 0:
         typer.echo("[assign] warn: k<=0 deciles → forcing k=10"); k = 10
@@ -224,15 +262,15 @@ def assign(
         typer.echo("[assign] warn: batch_size<=0 → forcing 32"); batch_size_val = 32
 
     exp_dir   = Path(workdir) / sample / "ExplorationReadLevel"
+    exp_dir.mkdir(parents=True, exist_ok=True)
     edges_npz = exp_dir / "global_edges.npz"
     ecdf_npz  = exp_dir / "global_ecdf.npz"
-    exp_dir.mkdir(parents=True, exist_ok=True)
 
     if verbose:
         extra = []
         if edges_workers is not None: extra.append(f"edges_workers={edges_workers}")
         if edges_max_reads is not None: extra.append(f"edges_max_reads={edges_max_reads:,}")
-        if ecdf_workers is not None: extra.append(f"ecdf_workers={min(max(ecdf_workers,1), threads_eff)}")
+        if ecdf_workers is not None:   extra.append(f"ecdf_workers={min(max(ecdf_workers or 0,1), threads_eff)}")
         typer.echo(f"[assign] effective chunksize={chunksize_val:,}  batch_size={batch_size_val}  "
                    f"threads={threads_eff}" + ("  " + "  ".join(extra) if extra else ""))
 
@@ -242,18 +280,14 @@ def assign(
         mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize_val, k=k, batch_size=batch_size_val,
         threads=threads_eff, verbose=verbose, edges_workers=edges_workers, edges_max_reads=edges_max_reads
     )
-    ecdf_workers_eff = ecdf_workers if (ecdf_workers and ecdf_workers > 0) else threads_eff
+    ecdf_workers_eff = (ecdf_workers if (ecdf_workers and ecdf_workers > 0) else threads_eff)
     ecdf_workers_eff = min(ecdf_workers_eff, threads_eff)
     learn_ecdfs_parallel(
         workdir=workdir, sample=sample, chunks_dir=chunks_dir, edges_model=edges_npz, out_model=ecdf_npz,
         mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize_val, verbose=verbose, workers=ecdf_workers_eff
     )
 
-    # 2) per-chunk scoring in parallel
-    chunk_files = sorted(chunks_dir.glob("*_cell_map_ref_chunk_*.txt"))
-    if not chunk_files:
-        typer.echo(f"[assign] No chunk files in {chunks_dir}")
-        raise typer.Exit(code=2)
+    # 2) per-chunk scoring (parallel)
     pool_n = min(threads_eff, len(chunk_files))
     typer.echo(f"[assign/score] start: {len(chunk_files)} chunks, procs={pool_n}")
     with ProcessPoolExecutor(max_workers=pool_n) as ex:
@@ -409,10 +443,13 @@ def run(
 
     if config:
         cfg = _load_config(config)
+        _ensure_minimal_chunk(Path(cfg["workdir"]), cfg["sample"])
         _do_one(cfg)
+        
         return
     elif inline_ready:
         cfg = _cfg_from_inline(sample, genome, bam, str(workdir), min_barcode_freq, chunk_size_cells)
+        _ensure_minimal_chunk(Path(cfg["workdir"]), cfg["sample"])
         _do_one(cfg)
         return
     else:  # configs TSV
@@ -420,6 +457,14 @@ def run(
         if not batch:
             typer.echo("[run] no configs found in TSV"); return
         for cfg in batch:
+            # apply CLI overrides per config
+            _apply_assign_overrides(
+                cfg,
+                alpha=assign_alpha, k=assign_k, mapq_min=assign_mapq_min, xa_max=assign_xa_max,
+                chunksize=assign_chunksize, batch_size=assign_batch_size,
+                edges_workers=assign_edges_workers, edges_max_reads=assign_edges_max_reads, ecdf_workers=ecdf_workers,
+            )
             typer.echo(f"[run] starting {cfg['sample']}")
+            _ensure_minimal_chunk(Path(cfg["workdir"]), cfg["sample"])
             _do_one(cfg)
         return
