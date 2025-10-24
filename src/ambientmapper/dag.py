@@ -100,10 +100,7 @@ def run_dag(ctx: Ctx, steps: Dict[str, Step], partitions: List[Dict] | None) -> 
     executed: List[str] = []
     skipped: List[str] = []
 
-    # use CLI --verbose or default True
     chatty = bool(ctx.params.get("verbose", True))
-
-    # If no skip_to is provided, start in normal mode.
     reached = not bool(ctx.skip_to)
 
     def _outs_exist(step: Step, part: Optional[Dict]) -> bool:
@@ -117,7 +114,6 @@ def run_dag(ctx: Ctx, steps: Dict[str, Step], partitions: List[Dict] | None) -> 
     for name in order:
         step = steps[name]
 
-        # respect --only-steps if provided
         if ctx.only and name not in ctx.only:
             continue
 
@@ -147,7 +143,6 @@ def run_dag(ctx: Ctx, steps: Dict[str, Step], partitions: List[Dict] | None) -> 
                         (executed if ran else skipped).append(name)
                 continue
 
-
         # -------------------------
         # NORMAL EXECUTION
         # -------------------------
@@ -155,11 +150,27 @@ def run_dag(ctx: Ctx, steps: Dict[str, Step], partitions: List[Dict] | None) -> 
             assert partitions is not None and len(partitions) > 0, "No partitions available for partitioned step"
             if chatty:
                 typer.echo(f"[dag] → {name} (n_parts={len(partitions)})")
-            
+
+            # Canary: run first N parts serially to fail fast on misconfig
+            canary_n = int(os.environ.get("AMM_CANARY_N", "0"))
+            if canary_n > 0 and name == ctx.skip_to:
+                test_parts = partitions[:min(canary_n, len(partitions))]
+                ok = 0
+                for part in test_parts:
+                    label = f"{name}[{part.get('id','?')}]"
+                    try:
+                        ran = run_step(ctx, step, partition=part)
+                        (executed if ran else skipped).append(label)
+                        if ran:
+                            ok += 1
+                    except Exception as e:
+                        raise RuntimeError(f"{name} canary failed on {label}") from e
+                if ok == 0:
+                    raise RuntimeError(f"{name} canary: 0/{len(test_parts)} produced output; aborting.")
+
             max_workers = int(ctx.params.get("threads", os.cpu_count() or 1))
             max_workers = max(1, min(max_workers, len(partitions)))
-            
-            # submit all parts
+
             with ProcessPoolExecutor(max_workers=max_workers) as ex:
                 futs = {ex.submit(_run_step_worker, ctx, step, part): part for part in partitions}
                 done = 0
@@ -170,14 +181,14 @@ def run_dag(ctx: Ctx, steps: Dict[str, Step], partitions: List[Dict] | None) -> 
                         ran = fut.result()
                         (executed if ran else skipped).append(label)
                     except Exception as e:
-                        # surface the first error quickly with context
                         raise RuntimeError(f"{name} failed on {label}: {e}") from e
                     finally:
                         done += 1
                         if chatty and (done % 50 == 0 or done == len(futs)):
                             typer.echo(f"[dag]   {name}: {done}/{len(futs)}")
         else:
-            typer.echo(f"[dag] → {name}") if ctx.params.get("verbose", True) else None
+            if chatty:
+                typer.echo(f"[dag] → {name}")
             ran = run_step(ctx, step, partition=None)
             (executed if ran else skipped).append(name)
 
