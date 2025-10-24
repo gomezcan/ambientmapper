@@ -217,6 +217,37 @@ def run_assign_ecdf(ctx, part=None):
         workers=ctx.params["assign"].get("ecdf_workers") or int(ctx.params.get("threads", 8)),
     )
 
+
+def _maybe_make_stripped_chunk(src_path: Path, sample: str) -> Path:
+    """Strip trailing '-<sample>' if present; return path to use."""
+    try:
+        with src_path.open() as f:
+            probe = [next(f).strip() for _ in range(100)]
+    except StopIteration:
+        probe = []
+    except Exception:
+        return src_path
+
+    # Only act if at least one line ends with '-<sample>'
+    has_suffix = any(ln.endswith(f"-{sample}") for ln in probe if ln and not ln.startswith("#"))
+    if not has_suffix:
+        return src_path
+
+    stripped = src_path.with_suffix(src_path.suffix + ".stripped")
+    try:
+        with src_path.open() as fin, stripped.open("w") as fout:
+            for ln in fin:
+                s = ln.strip()
+                if not s or s.startswith("#"):
+                    continue
+                if s.endswith(f"-{sample}"):
+                    s = s[: -(len(sample) + 1)]  # drop "-<sample>"
+                fout.write(s + "\n")
+        return stripped
+    except Exception:
+        return src_path
+
+
 # 
 def run_assign_score(ctx, part):
     """
@@ -238,22 +269,36 @@ def run_assign_score(ctx, part):
 
     ecdf_npz   = exp_dir / "global_ecdf.npz"
     edges_npz  = exp_dir / "global_edges.npz"
-    chunk_txt  = _P(part["path"])
+        
+    chunk_txt_src = _P(part["path"])
+    chunk_txt = _maybe_make_stripped_chunk(chunk_txt_src, sample)
+
     natural_out = chunk_txt.with_name(chunk_txt.stem + ".scores.parquet")
 
     # DAG-expected output (keep this as the canonical target)
     _, outs = io_assign_score(ctx, part)
     dag_out = outs[0]
 
+
+    # Fast-skip if output already exists and is non-empty
+    try:
+        if dag_out.exists() and dag_out.stat().st_size > 0:
+            if chatty:
+                typer.echo(f"[score] skip  {part['id']} (exists)")
+            return
+    except Exception:
+        pass
+        
     # Preflight checks
     if not ecdf_npz.exists() or ecdf_npz.stat().st_size == 0:
         raise RuntimeError(f"ECDF model missing/empty: {ecdf_npz}")
     if not edges_npz.exists() or edges_npz.stat().st_size == 0:
         # not strictly required by scorer, but good to surface early
         typer.echo(f"[score] warn: edges model looks tiny/empty ({edges_npz})")
+    
     if not chunk_txt.exists() or chunk_txt.stat().st_size == 0:
         raise RuntimeError(f"Chunk file missing/empty: {chunk_txt}")
-
+    
     if chatty:
         typer.echo(f"[score] start {part['id']}  →  {natural_out.name}")
 
@@ -306,7 +351,10 @@ def run_assign_score(ctx, part):
         ]
         raise RuntimeError(
             "score_chunk produced no data for "
-            f"{chunk_txt.name}. Tried: {', '.join(sorted(set(str(c.name) for c in candidates)))}. "
+            f"{chunk_txt_src.name} (used: {chunk_txt.name}). Tried: "
+            f"{', '.join(sorted(set(str(c.name) for c in candidates)))}. "
+            "Possible cause: barcodes include a '-SAMPLE' suffix not present in BAM; "
+            "a stripped temp file is used automatically now. "
             "Checks: " + " | ".join(hints)
         )
 
