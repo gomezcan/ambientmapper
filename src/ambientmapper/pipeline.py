@@ -227,7 +227,7 @@ def run_assign_score(ctx, part):
       - accept a set of common output name/dir patterns and mirror to expected
     """
     from pathlib import Path as _P
-    import os, shutil, glob, typer
+    import os, shutil, glob, typer, re
     from .assign_streaming import score_chunk
 
     chatty = bool(ctx.params.get("verbose", True))
