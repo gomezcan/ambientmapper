@@ -270,9 +270,15 @@ def run_assign_score(ctx, part):
     ecdf_npz   = exp_dir / "global_ecdf.npz"
     edges_npz  = exp_dir / "global_edges.npz"
         
-    chunk_txt_src = _P(part["path"])
-    chunk_txt = _maybe_make_stripped_chunk(chunk_txt_src, sample)
-
+    chunk_txt = _P(part["path"])
+    #chunk_txt = _maybe_make_stripped_chunk(chunk_txt_src, sample)
+    if os.environ.get("AMM_STRIP_BC_SUFFIX", "0") == "1":
+        chunk_txt = _P(part["path"])
+        if bool(ctx.params.get("verbose", True)):
+            typer.echo(f"[score] stripping barcode suffixes for {chunk_txt.name} → {chunk_txt.name}")
+    else:
+        chunk_txt = _P(part["path"])
+    
     natural_out = chunk_txt.with_name(chunk_txt.stem + ".scores.parquet")
 
     # DAG-expected output (keep this as the canonical target)
@@ -351,7 +357,7 @@ def run_assign_score(ctx, part):
         ]
         raise RuntimeError(
             "score_chunk produced no data for "
-            f"{chunk_txt_src.name} (used: {chunk_txt.name}). Tried: "
+            f"{chunk_txt.name} (used: {chunk_txt.name}). Tried: "
             f"{', '.join(sorted(set(str(c.name) for c in candidates)))}. "
             "Possible cause: barcodes include a '-SAMPLE' suffix not present in BAM; "
             "a stripped temp file is used automatically now. "
