@@ -665,7 +665,6 @@ def genotyping(
         ambient_const=ambient_const, min_reads=min_reads,
         tau_drop=tau_drop, topk_genomes=topk_genomes, sample=sample,
     )
-
     typer.echo("[1/5] Loading assign outputs…")
     df = _load_assign_tables(assign)
     missing = REQUIRED_COLS - set(df.columns)
@@ -686,7 +685,7 @@ def genotyping(
     # Evaluate models per barcode
     rows = []
     drops = []
-        typer.echo("[4/5] Per-cell model selection & calls…")
+    typer.echo("[4/5] Per-cell model selection & calls…")
     topk = _topk_genomes_per_barcode(C, cfg.topk_genomes)
 
     # Build tasks for each barcode
@@ -720,8 +719,6 @@ def genotyping(
                 pd.DataFrame(columns=["barcode","read_id","top_genome","assigned_genome",
                                       "L_top","L_assigned","posterior_odds","reason"]).astype({"barcode": str}))
 
-
-
     # Legacy-compatible summary (PASS_by_mapping), keep but now enriched
     legacy = calls.copy()
     legacy["AssignedGenome"] = legacy["genome_1"].fillna("")
@@ -731,7 +728,7 @@ def genotyping(
     outdir.mkdir(parents=True, exist_ok=True)
     _write_gzip_df(calls, outdir / f"{sample}_cells_calls.tsv.gz")
     _write_gzip_df(drops_df, outdir / f"{sample}_Reads_to_discard.csv.gz")
-  #
+    
     legacy_out.to_csv(outdir / f"{sample}_BCs_PASS_by_mapping.csv", index=False)
 
     # Optional QC PDF
