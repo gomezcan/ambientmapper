@@ -421,7 +421,22 @@ def genotyping(
     typer.echo(f"[genotyping] assign_glob={assign_glob}")
     typer.echo(f"[genotyping] threads={threads}  report={'on' if make_report else 'off'}")
 
-    _run_genotyping(assign=assign_glob, outdir=outdir, sample=sample, make_report=make_report, threads=threads)
+    _run_genotyping.callback(
+    assign=assign_glob,
+    outdir=outdir,
+    sample=sample,
+    make_report=make_report,
+    threads=int(threads),
+    # explicit numeric defaults to avoid OptionInfo leaking into pydantic:
+    beta=0.5,
+    w_as=1.0,
+    w_mapq=0.5,
+    w_nm=0.25,
+    ambient_const=1e-3,
+    min_reads=100,
+    tau_drop=8.0,
+    topk_genomes=3,
+)
 
 @app.command()
 def summarize(
