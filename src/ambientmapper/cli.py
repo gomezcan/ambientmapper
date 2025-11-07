@@ -315,6 +315,7 @@ def genotyping(
     outdir: Optional[Path] = typer.Option(None, "--outdir"),
     sample: Optional[str] = typer.Option(None, "--sample"),
     make_report: bool = typer.Option(True, "--report/--no-report"),
+    threads: int = typer.Option(1, help="Parallel workers for per-cell model selection."),
 ):
     """Posterior-aware genotyping (merge + summarize + optional post-steps)."""
     from .genotyping import genotyping as _run_genotyping
