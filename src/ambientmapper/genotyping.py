@@ -53,6 +53,7 @@ import math
 import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -121,10 +122,17 @@ def _coerce_assign_schema(df: pd.DataFrame) -> pd.DataFrame:
     if "p_mq_decile" in df.columns: rename["p_mq_decile"] = "p_mq"
     out = df.rename(columns=rename)
 
-    # Normalize types (strings please)
     for col in ("barcode", "read_id", "genome"):
         if col in out.columns:
             out[col] = out[col].astype(str)
+
+    # If p_* are deciles in 1..10, scale to 0..1
+    for pcol in ("p_as", "p_mq"):
+        if pcol in out.columns:
+            out[pcol] = pd.to_numeric(out[pcol], errors="coerce")
+            if out[pcol].max(skipna=True) and out[pcol].max(skipna=True) > 1.0:
+                out[pcol] = out[pcol] / 10.0
+
     return out
 
 
@@ -157,6 +165,31 @@ def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
           .reset_index()
     )
 
+def _process_one(args):
+    bc, L_block, cand, eta_dict, cfg_dict = args
+    # Rehydrate config and ambient profile
+    cfg = MergeConfig(**cfg_dict)
+    eta = pd.Series(eta_dict)
+
+    read_count = L_block["read_id"].nunique()
+    if read_count < cfg.min_reads:
+        res = {
+            "barcode": bc, "call": "ambiguous", "genome_1": None, "genome_2": None,
+            "alpha": np.nan, "rho": np.nan, "purity": 0.0, "minor": 0.0, "bic_best": np.nan,
+            "bic_single": np.nan, "bic_doublet": np.nan, "delta_bic": np.nan,
+            "n_reads": read_count, "n_effective": float(L_block["L"].sum()),
+            "concordance": np.nan, "indistinguishable_set": "", "notes": "low_reads"
+        }
+        return res, pd.DataFrame()
+
+    best = _select_model_for_barcode(L_block, eta, cfg, cand)
+    best["barcode"] = bc
+    best["notes"] = ""
+
+    drops = _reads_to_discard(L_block, best, cfg)
+    return best, drops
+
+
 REQUIRED_COLS = {"barcode", "read_id", "genome"}
 SCORE_COLS = ["AS", "MAPQ", "NM"]
 PVAL_COLS = ["p_as", "p_mq"]
@@ -175,35 +208,27 @@ def _zscore_series(x: np.ndarray) -> np.ndarray:
         return (x - med) / s
     return (x - med) / (1.4826 * mad)
 
-
 def _fuse_support(df_grp: pd.DataFrame, cfg: MergeConfig) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Given rows for one read (same barcode+read_id) across genomes,
     return arrays aligned to df_grp rows: fused score S, gamma penalty, softmax weights.
     """
-    # Extract available score columns and z-score within the read across genomes
     S_parts = []
-    if "AS" in df_grp:
+    if "AS" in df_grp.columns:
         S_parts.append(cfg.w_as * _zscore_series(df_grp["AS"].to_numpy(dtype=float)))
-    if "MAPQ" in df_grp:
+    if "MAPQ" in df_grp.columns:
         S_parts.append(cfg.w_mapq * _zscore_series(df_grp["MAPQ"].to_numpy(dtype=float)))
-    if "NM" in df_grp:
-        # lower better → negate
-        S_parts.append(-cfg.w_nm * _zscore_series(df_grp["NM"].to_numpy(dtype=float)))
-    if not S_parts:
-        # Fallback: all equal support if no numeric scores given
-        S = np.zeros(len(df_grp), dtype=float)
-    else:
-        S = np.sum(S_parts, axis=0)
+    if "NM" in df_grp.columns:
+        S_parts.append(-cfg.w_nm * _zscore_series(df_grp["NM"].to_numpy(dtype=float)))  # lower is better
+    S = np.sum(S_parts, axis=0) if S_parts else np.zeros(len(df_grp), dtype=float)
 
-    # p-value penalty (ambiguity inside this read)  
     if "p_as" in df_grp.columns or "p_mq" in df_grp.columns:
-      pa = df_grp["p_as"].to_numpy(dtype=float) if "p_as" in df_grp.columns else np.ones(len(df_grp))
-      pm = df_grp["p_mq"].to_numpy(dtype=float) if "p_mq" in df_grp.columns else np.ones(len(df_grp))
-      pmin = np.minimum(pa, pm)
-      gamma = np.maximum(cfg.p_eps, 1.0 - pmin)
+        pa = df_grp["p_as"].to_numpy(dtype=float) if "p_as" in df_grp.columns else np.ones(len(df_grp))
+        pm = df_grp["p_mq"].to_numpy(dtype=float) if "p_mq" in df_grp.columns else np.ones(len(df_grp))
+        pmin = np.minimum(pa, pm)
+        gamma = np.maximum(cfg.p_eps, 1.0 - pmin)
     else:
-      gamma = np.ones(len(df_grp), dtype=float)
-    # softmax with temperature beta
+        gamma = np.ones(len(df_grp), dtype=float)
+
     w = np.exp(cfg.beta * S) * gamma
     return S, gamma, w
 
@@ -521,13 +546,19 @@ def _load_assign_tables(assign_glob: str) -> pd.DataFrame:
   for fp in files:
     df = _read_table(fp)
     df = _coerce_assign_schema(df)
-    # Some assign files may be raw (one row per (read,BC)) or filtered (alignment-level).
-    # Reduce to one row per (barcode, read_id, genome).
-    if {"barcode","read_id","genome"} <= set(df.columns):
-      df = _reduce_alignments_to_per_genome(df)
-      frames.append(df)
-      out = pd.concat(frames, ignore_index=True)
-      # Final sanity filter: keep only rows with the required keys populated
+    
+    # Ensure required keys exist; if not, warn & skip this file
+    if not {"barcode", "read_id", "genome"} <= set(df.columns):
+      typer.echo(f"[warn] Missing required columns in {fp.name}; skipping.")
+      continue
+
+    df = _reduce_alignments_to_per_genome(df)
+    frames.append(df)
+        
+  if not frames:
+    raise ValueError("No valid assign tables after schema coercion; aborting.")
+  
+  out = pd.concat(frames, ignore_index=True)
   out = out.dropna(subset=["barcode","read_id","genome"])
   return out
 
