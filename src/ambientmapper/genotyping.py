@@ -110,7 +110,7 @@ class MergeConfig(BaseModel):
     w_nm: float = 0.25                # weight for NM (lower better)
     ambient_const: float = 1e-3       # per-read ambient mass before renorm
     p_eps: float = 1e-3               # floor for p-value penalty gamma = max(eps,1-p)
-    min_reads: int = 300              # minimum reads to attempt a confident call
+    min_reads: int = 100              # minimum reads to attempt a confident call
     single_mass_min: float = 0.85     # mass threshold for single call
     doublet_minor_min: float = 0.20   # minor fraction threshold for doublet
     bic_margin: float = 6.0           # ΔBIC to accept more complex model
@@ -647,7 +647,7 @@ def genotyping(
     assign: str = typer.Option(..., help="Path or glob to assign outputs (csv/tsv/parquet, possibly gz)."),
     outdir: Path = typer.Option(Path("merge_out"), help="Output directory."),
     sample: str = typer.Option("sample", help="Sample name used for output filenames."),
-    min_reads: int = typer.Option(300, help="Minimum reads to attempt confident calls."),
+    min_reads: int = typer.Option(100, help="Minimum reads to attempt confident calls."),
     beta: float = typer.Option(0.5, help="Softmax temperature for score fusion."),
     w_as: float = typer.Option(1.0, help="Weight for AS."),
     w_mapq: float = typer.Option(0.5, help="Weight for MAPQ."),
