@@ -584,6 +584,8 @@ def genotyping(
     tau_drop: float = typer.Option(8.0, help="Posterior-odds threshold to drop contrary reads in singles."),
     topk_genomes: int = typer.Option(3, help="Number of candidate genomes per barcode to consider."),
     make_report: bool = typer.Option(True, help="Render QC PDF report."),
+    threads: int = typer.Option(1, help="Parallel workers for per-cell model selection."),
+
 ):
     """Run the full merge pipeline: read-level posteriors → ambient estimate → per-cell calls → optional decontam → summaries."""
     cfg = MergeConfig(
@@ -612,38 +614,41 @@ def genotyping(
     # Evaluate models per barcode
     rows = []
     drops = []
-    for bc, L_block in tqdm(Ldf.groupby("barcode"), total=Ldf["barcode"].nunique()):
+        typer.echo("[4/5] Per-cell model selection & calls…")
+    topk = _topk_genomes_per_barcode(C, cfg.topk_genomes)
+
+    # Build tasks for each barcode
+    tasks = []
+    for bc, L_block in Ldf.groupby("barcode"):
         cand = topk.get(bc, [])
-        if len(cand) == 0:
+        if not cand:
             continue
-        # Low-depth guard
-        read_count = L_block["read_id"].nunique()
-        if read_count < cfg.min_reads:
-            res = {
-                "barcode": bc, "call": "ambiguous", "genome_1": None, "genome_2": None,
-                "alpha": np.nan, "rho": np.nan, "purity": 0.0, "minor": 0.0, "bic_best": np.nan,
-                "bic_single": np.nan, "bic_doublet": np.nan, "delta_bic": np.nan,
-                "n_reads": read_count, "n_effective": float(L_block["L"].sum()),
-                "concordance": np.nan, "indistinguishable_set": "", "notes": "low_reads"
-            }
-            rows.append(res)
-            continue
+        tasks.append((bc, L_block, cand, eta.to_dict(), cfg.model_dump()))
 
-        best = _select_model_for_barcode(L_block, eta, cfg, cand)
-        best["barcode"] = bc
-        best["notes"] = ""
-        rows.append(best)
+    rows, drops_list = [], []
 
-        # per-read drops for singles/indistinguishable
-        D = _reads_to_discard(L_block, best, cfg)
-        if len(D):
-            drops.append(D)
+    if threads <= 1:
+        for t in tqdm(tasks, total=len(tasks)):
+            best, D = _process_one(t)
+            rows.append(best)
+            if len(D):
+                drops_list.append(D)
+    else:
+        typer.echo(f"   → using {threads} workers")
+        with ProcessPoolExecutor(max_workers=threads) as ex:
+            futures = [ex.submit(_process_one, t) for t in tasks]
+            for fut in tqdm(as_completed(futures), total=len(futures)):
+                best, D = fut.result()
+                rows.append(best)
+                if len(D):
+                    drops_list.append(D)
 
     calls = pd.DataFrame(rows)
-    if drops:
-        drops_df = pd.concat(drops, ignore_index=True)
-    else:
-        drops_df = pd.DataFrame(columns=["barcode", "read_id", "top_genome", "assigned_genome", "L_top", "L_assigned", "posterior_odds", "reason"]).astype({"barcode": str})
+    drops_df = (pd.concat(drops_list, ignore_index=True) if drops_list else
+                pd.DataFrame(columns=["barcode","read_id","top_genome","assigned_genome",
+                                      "L_top","L_assigned","posterior_odds","reason"]).astype({"barcode": str}))
+
+
 
     # Legacy-compatible summary (PASS_by_mapping), keep but now enriched
     legacy = calls.copy()
