@@ -369,27 +369,39 @@ def _loglik_for_params(L_block: pd.DataFrame, eta: pd.Series,
 def _bic(loglik: float, n_params: int, n_reads: int) -> float:
     return -2.0 * loglik + n_params * math.log(max(n_reads, 1))
 
-
 def _select_model_for_barcode(L_block: pd.DataFrame, eta: pd.Series, cfg: MergeConfig,
                               candidate_genomes: Sequence[str]) -> Dict:
     """Evaluate single and (optionally) doublet models for a barcode and pick best by BIC.
-    Returns a dict with call, genomes, alpha, rho, bic values, purity, etc.
+    Returns a dict with call, genomes, alpha, rho, bic values, purity, etc., plus light
+    multiplet-suspicion heuristics (no behavior change to call).
     """
-    read_count = L_block["read_id"].nunique()
+    read_count = int(L_block["read_id"].nunique())
 
-    # Single candidates: each genome in candidate_genomes
-    # Doublet candidates: all unordered pairs among candidate_genomes
+    # Guard: no candidates → ambiguous stub
+    if not candidate_genomes:
+        return {
+            "model": None, "genome_1": None, "genome_2": None,
+            "alpha": np.nan, "rho": np.nan,
+            "bic_best": np.inf, "bic_single": np.inf, "bic_doublet": np.inf, "delta_bic": np.nan,
+            "n_reads": read_count, "n_effective": float(L_block["L"].sum()),
+            "purity": 0.0, "minor": 0.0, "call": "ambiguous",
+            "indistinguishable_set": "", "concordance": 0.0,
+            "p_top1": 0.0, "p_top2": 0.0, "p_top3": 0.0, "top3_sum": 0.0, "entropy": 0.0,
+            "suspect_multiplet": False, "multiplet_reason": ""
+        }
+
+    # Grid for parameters
     alphas = np.arange(0.0, cfg.max_alpha + 1e-9, cfg.alpha_grid)
-    rhos = np.arange(0.1, 0.9 + 1e-9, cfg.rho_grid)
+    rhos   = np.arange(0.1, 0.9 + 1e-9, cfg.rho_grid)
 
     best = {"bic": float("inf"), "model": None}
     evals = []
 
-    # SINGLE MODELS
+    # -------- SINGLE MODELS --------
     for g1 in candidate_genomes:
         best_local = {"bic": float("inf")}
         for a in alphas:
-            ll = _loglik_for_params(L_block, eta, model="single", g1=g1, g2=None, alpha=a)
+            ll  = _loglik_for_params(L_block, eta, model="single", g1=g1, g2=None, alpha=a)
             bic = _bic(ll, n_params=1, n_reads=read_count)  # only alpha
             if bic < best_local["bic"]:
                 best_local = {"model": "single", "g1": g1, "alpha": a, "rho": 1.0, "ll": ll, "bic": bic}
@@ -397,7 +409,7 @@ def _select_model_for_barcode(L_block: pd.DataFrame, eta: pd.Series, cfg: MergeC
         if best_local["bic"] < best["bic"]:
             best = best_local
 
-    # DOUBLET MODELS
+    # -------- DOUBLET MODELS --------
     if len(candidate_genomes) >= 2:
         for i in range(len(candidate_genomes)):
             for j in range(i + 1, len(candidate_genomes)):
@@ -405,7 +417,7 @@ def _select_model_for_barcode(L_block: pd.DataFrame, eta: pd.Series, cfg: MergeC
                 best_local = {"bic": float("inf")}
                 for a in alphas:
                     for r in rhos:
-                        ll = _loglik_for_params(L_block, eta, model="doublet", g1=g1, g2=g2, alpha=a, rho=r)
+                        ll  = _loglik_for_params(L_block, eta, model="doublet", g1=g1, g2=g2, alpha=a, rho=r)
                         bic = _bic(ll, n_params=2, n_reads=read_count)  # alpha + rho
                         if bic < best_local["bic"]:
                             best_local = {"model": "doublet", "g1": g1, "g2": g2, "alpha": a, "rho": r, "ll": ll, "bic": bic}
@@ -413,12 +425,17 @@ def _select_model_for_barcode(L_block: pd.DataFrame, eta: pd.Series, cfg: MergeC
                 if best_local["bic"] < best["bic"]:
                     best = best_local
 
-    # Derive additional QC metrics
-    # Compute mass per genome (expected from L) under the best model, ignoring ambient part
-    mass = L_block.groupby("genome")["L"].sum().sort_values(ascending=False)
-    
+    # ---- Per-genome expected mass & proportions (for QC/heuristics) ----
+    mass = L_block.groupby("genome", observed=True)["L"].sum().sort_values(ascending=False)
+    tot = float(mass.sum())
+    props = (mass / max(tot, 1e-12)).to_numpy()
+    p1 = float(props[0]) if len(props) > 0 else 0.0
+    p2 = float(props[1]) if len(props) > 1 else 0.0
+    p3 = float(props[2]) if len(props) > 2 else 0.0
+    top3_sum = p1 + p2 + p3
+    entropy = float(-np.sum(props * np.log(np.clip(props, 1e-12, 1.0)))) if tot > 0 else 0.0
 
-    # default outputs
+    # ---- Build main output (uses best/evals) ----
     out = {
         "model": best.get("model", None),
         "genome_1": best.get("g1", None),
@@ -426,34 +443,36 @@ def _select_model_for_barcode(L_block: pd.DataFrame, eta: pd.Series, cfg: MergeC
         "alpha": best.get("alpha", 0.0),
         "rho": best.get("rho", 1.0),
         "bic_best": best.get("bic", float("inf")),
-        "bic_single": min([e["bic"] for e in evals if e.get("model") == "single"], default=float("inf")),
+        "bic_single": min([e["bic"] for e in evals if e.get("model") == "single"],  default=float("inf")),
         "bic_doublet": min([e["bic"] for e in evals if e.get("model") == "doublet"], default=float("inf")),
         "n_reads": read_count,
         "n_effective": float(L_block["L"].sum()),
     }
     out["delta_bic"] = min(out["bic_doublet"], out["bic_single"]) - out["bic_best"]
 
-    # Purity definition: (1-alpha) * major component weight inside model
+    # Purity & minor (fraction of non-ambient mass assigned to major/minor)
     if out["model"] == "single":
-        purity = (1.0 - out["alpha"])  # all non-ambient goes to g1
-        minor = 0.0
+        purity = (1.0 - out["alpha"])
+        minor  = 0.0
     elif out["model"] == "doublet":
         purity = (1.0 - out["alpha"]) * max(out["rho"], 1.0 - out["rho"])
-        minor = min(out["rho"], 1.0 - out["rho"]) * (1.0 - out["alpha"]) 
+        minor  = (1.0 - out["alpha"]) * min(out["rho"], 1.0 - out["rho"])
     else:
         purity, minor = 0.0, 0.0
+    out["purity"] = float(purity)
+    out["minor"]  = float(minor)
 
-    out["purity"] = purity
-    out["minor"] = minor
-
-    # Determine call per decision rules
+    # Call decision
     call = "ambiguous"
     indist = None
 
-    # Near-tie check among singletons (indistinguishable genomes)
-    singles_sorted = sorted([e for e in evals if e.get("model") == "single"], key=lambda x: x["bic"])[:2]
+    # Near-tie among singles → indistinguishable
+    singles_sorted = sorted(
+        [e for e in evals if e.get("model") == "single"],
+        key=lambda x: x["bic"]
+    )[:2]
     if len(singles_sorted) == 2 and (singles_sorted[1]["bic"] - singles_sorted[0]["bic"]) < cfg.near_tie_margin:
-        indist = (singles_sorted[0]["g1"], singles_sorted[1]["g1"])  # report pair
+        indist = (singles_sorted[0]["g1"], singles_sorted[1]["g1"])
 
     if out["model"] == "single" and out["purity"] >= cfg.single_mass_min and (out["bic_doublet"] - out["bic_best"]) >= cfg.bic_margin:
         call = "single"
@@ -465,20 +484,47 @@ def _select_model_for_barcode(L_block: pd.DataFrame, eta: pd.Series, cfg: MergeC
     out["call"] = call
     out["indistinguishable_set"] = ",".join(indist) if indist is not None else ""
 
-    # Concordance: fraction of reads whose argmax genome equals chosen major genome
-    # Compute per-read argmax
+    # Concordance of per-read argmax with major genome
     maj = out["genome_1"]
     if maj is None:
         concord = 0.0
     else:
-        # For each read, sum L by genome, argmax, compare to maj
-        x = L_block.groupby(["read_id", "genome"])["L"].sum().reset_index()
-        argmax = x.sort_values(["read_id", "L"], ascending=[True, False]).drop_duplicates("read_id")["genome"]
+        x = (L_block.groupby(["read_id", "genome"], observed=True)["L"]
+                    .sum().reset_index())
+        argmax = (x.sort_values(["read_id", "L"], ascending=[True, False])
+                    .drop_duplicates("read_id")["genome"])
         concord = float((argmax == maj).mean())
     out["concordance"] = concord
 
+    # ---- Multiplet suspicion heuristics (no change to 'call') ----
+    suspect = False
+    reasons = []
+
+    # Heuristic #1: notable mass on ≥3 genomes
+    if p3 >= 0.15 and top3_sum >= 0.85:
+        suspect = True
+        reasons.append(f"top3={top3_sum:.2f} with p3={p3:.2f}")
+
+    # Heuristic #2: weak separation between single/doublet BIC and low purity
+    weak_doublet_edge = (
+        (out["model"] == "doublet" and (out["bic_single"]  - out["bic_best"]) < 4.0) or
+        (out["model"] == "single"  and (out["bic_doublet"] - out["bic_best"]) < 4.0)
+    )
+    if weak_doublet_edge and out["purity"] < 0.75:
+        suspect = True
+        reasons.append(f"weak_deltaBIC + purity={out['purity']:.2f}")
+
+    out.update({
+        "p_top1": p1, "p_top2": p2, "p_top3": p3,
+        "top3_sum": top3_sum, "entropy": entropy,
+        "suspect_multiplet": bool(suspect),
+        "multiplet_reason": ";".join(reasons),
+    })
+
     return out
 
+    
+    
 # ------------------------------
 # Decontamination (per-read drop list)
 # ------------------------------
