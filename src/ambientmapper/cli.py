@@ -4,8 +4,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import json, csv
 import typer
 from typing import Dict, List, Optional
-
-# NEW: import the resumable pipeline engine
+import hashlib, time, json as _json
 from .pipeline import run_pipeline
 
 app = typer.Typer(help="ambientmapper: local-first ambient cleaning pipeline")
@@ -149,6 +148,77 @@ def _ensure_minimal_chunk(workdir: Path, sample: str) -> None:
         "derived_from": {"filtered_inputs_sha256": "bootstrap", "upstream_generation": 0},
     }
     (chunks / "manifest.json").write_text(json.dumps(man, indent=2))
+
+
+STEP_ORDER = ["extract", "filter", "chunks", "assign", "genotyping", "summarize", "interpool"]
+
+def _norm_steps(xs: list[str]) -> list[str]:
+    s = set(STEP_ORDER)
+    out = []
+    for x in xs:
+        if x not in s:
+            raise typer.BadParameter(f"Unknown step '{x}'. Valid: {', '.join(STEP_ORDER)}")
+        out.append(x)
+    return out
+
+def _sentinel_root(cfg: dict) -> Path:
+    return Path(cfg["workdir"]) / cfg["sample"] / "_sentinels"
+
+def _sentinel_path(cfg: dict, step: str) -> Path:
+    return _sentinel_root(cfg) / f"{step}.ok"
+
+def _is_done(cfg: dict, step: str) -> bool:
+    return _sentinel_path(cfg, step).exists()
+
+def _mark_done(cfg: dict, step: str, meta: dict | None = None) -> None:
+    p = _sentinel_path(cfg, step)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "step": step,
+        "sample": cfg.get("sample"),
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+        "meta": meta or {},
+    }
+    p.write_text(_json.dumps(payload, indent=2))
+
+def _clear_step(cfg: dict, step: str) -> None:
+    p = _sentinel_path(cfg, step)
+    if p.exists():
+        p.unlink()
+
+def _cfg_hash(cfg: dict, params: dict) -> str:
+    h = hashlib.sha256()
+    h.update(_json.dumps(cfg, sort_keys=True, default=str).encode())
+    h.update(b"|")
+    h.update(_json.dumps(params, sort_keys=True, default=str).encode())
+    return h.hexdigest()[:12]
+
+def _plan_steps(resume: bool, force: list[str], skip_to: str, only: list[str]) -> list[str]:
+    """Return ordered steps to run given policy flags."""
+    base = STEP_ORDER[:]
+    if only:
+        return _norm_steps(only)
+    if skip_to:
+        if skip_to not in STEP_ORDER:
+            raise typer.BadParameter(f"--skip-to must be one of: {', '.join(STEP_ORDER)}")
+        i = STEP_ORDER.index(skip_to)
+        base = STEP_ORDER[i:]
+    # force list is validated but does not change order, only clearing sentinels
+    _ = _norm_steps(force) if force else []
+    return base
+
+def _apply_resume_policy(cfg: dict, resume: bool, force: list[str], run_steps: list[str]) -> None:
+    """Enforce resume/force by pruning sentinels."""
+    root = _sentinel_root(cfg); root.mkdir(parents=True, exist_ok=True)
+    if not resume:
+        # fresh run for selected steps
+        for s in run_steps:
+            _clear_step(cfg, s)
+    # force always clears
+    for s in force:
+        _clear_step(cfg, s)
+# ---- end helpers --------------------------------------------------------------
+
 
 
 # --------------------------------------------------------------------------------
@@ -315,30 +385,59 @@ def genotyping(
     outdir: Optional[Path] = typer.Option(None, "--outdir"),
     sample: Optional[str] = typer.Option(None, "--sample"),
     make_report: bool = typer.Option(True, "--report/--no-report"),
-    threads: int = typer.Option(1, help="Parallel workers for per-cell model selection."),
+    threads: int = typer.Option(1, "--threads", help="Parallel workers for per-cell model selection."),
 ):
     """Posterior-aware genotyping (merge + summarize + optional post-steps)."""
     from .genotyping import genotyping as _run_genotyping
     import glob as _glob
-    if not _glob.glob(assign_glob, recursive=True):
-        raise typer.BadParameter(f"No assign files matched: {assign_glob}")
-            
+    import json as _json
 
-    cfg = json.loads(Path(config).read_text())
+    # load config and dirs
+    cfg = _json.loads(Path(config).read_text())
     d = _cfg_dirs(cfg); _ensure_dirs(d)
 
-    # Resolve sample first so the default glob can include it
+    # resolve sample/outdir
     sample = sample or cfg["sample"]
     outdir = outdir or d["final"]
 
-    # Safer default glob: only *_filtered.* files under chunks
+    # derive a sane default for --assign if user omitted it
     if not assign_glob:
-        assign_glob = str(d["chunks"] / f"{sample}_chunk*_filtered.*")
-    
-    typer.echo(f"[genotyping] sample={sample} outdir={outdir} assign_glob='{assign_glob}' threads={threads}")
-    # Call the underlying function directly, and forward threads
-    _run_genotyping(assign=assign_glob, outdir=outdir, sample=sample,
-                    make_report=make_report, threads=threads)
+        chunks_dir = d["chunks"]  # <workdir>/<sample>/cell_map_ref_chunks
+        # Try specific patterns first, then a general fallback
+        candidate_patterns = [
+            str(chunks_dir / "**" / "*filtered.tsv.gz"),
+            str(chunks_dir / "**" / "*.tsv.gz"),
+            str(chunks_dir / "**" / "*.parquet"),
+            str(chunks_dir / "**" / "*.csv.gz"),
+            str(chunks_dir / "**" / "*.csv"),
+            str(chunks_dir / "**" / "*.tsv"),
+        ]
+        matched = []
+        for pat in candidate_patterns:
+            matched.extend(_glob.glob(pat, recursive=True))
+        if not matched:
+            raise typer.BadParameter(
+                f"No assign outputs found under {chunks_dir}.\n"
+                f"Expected files like 'Seedling_chunkNNN_filtered.tsv.gz'.\n"
+                f"Provide --assign or run the 'assign' step first."
+            )
+        # Use a broad glob so the genotyper can re-scan once; keeps behavior simple
+        assign_glob = str(chunks_dir / "**" / "*")
+
+    # final sanity check
+    if not _glob.glob(assign_glob, recursive=True):
+        raise typer.BadParameter(f"No assign files matched: {assign_glob}")
+
+    # optional mismatch warning
+    if "sample" in cfg and cfg["sample"] != sample:
+        typer.echo(f"[genotyping] warn: config sample={cfg['sample']} but CLI --sample={sample}")
+
+    typer.echo(f"[genotyping] sample={sample}  outdir={outdir}")
+    typer.echo(f"[genotyping] assign_glob={assign_glob}")
+    typer.echo(f"[genotyping] threads={threads}  report={'on' if make_report else 'off'}")
+
+    # run
+    _run_genotyping(assign=assign_glob, outdir=outdir, sample=sample, make_report=make_report, threads=threads)
 
 
 @app.command()
