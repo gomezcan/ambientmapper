@@ -1,10 +1,13 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import json, csv
+import json, csv, hashlib, time
 import typer
 from typing import Dict, List, Optional
-import hashlib, time, json as _json
+import json as _json
+
+# pipeline runner
 from .pipeline import run_pipeline
 
 app = typer.Typer(help="ambientmapper: local-first ambient cleaning pipeline")
@@ -125,7 +128,6 @@ def _apply_assign_overrides(
         typer.echo(f"[assign] edges_max_reads cap in effect: {int(edges_max_reads):,} rows/genome")
     if ecdf_workers is not None:   assign["ecdf_workers"] = int(ecdf_workers)
 
-
 def _ensure_minimal_chunk(workdir: Path, sample: str) -> None:
     """
     If the sample's chunks dir has no manifest and no *_cell_map_ref_chunk_*.txt,
@@ -148,7 +150,6 @@ def _ensure_minimal_chunk(workdir: Path, sample: str) -> None:
         "derived_from": {"filtered_inputs_sha256": "bootstrap", "upstream_generation": 0},
     }
     (chunks / "manifest.json").write_text(json.dumps(man, indent=2))
-
 
 STEP_ORDER = ["extract", "filter", "chunks", "assign", "genotyping", "summarize", "interpool"]
 
@@ -203,7 +204,6 @@ def _plan_steps(resume: bool, force: list[str], skip_to: str, only: list[str]) -
             raise typer.BadParameter(f"--skip-to must be one of: {', '.join(STEP_ORDER)}")
         i = STEP_ORDER.index(skip_to)
         base = STEP_ORDER[i:]
-    # force list is validated but does not change order, only clearing sentinels
     _ = _norm_steps(force) if force else []
     return base
 
@@ -211,18 +211,14 @@ def _apply_resume_policy(cfg: dict, resume: bool, force: list[str], run_steps: l
     """Enforce resume/force by pruning sentinels."""
     root = _sentinel_root(cfg); root.mkdir(parents=True, exist_ok=True)
     if not resume:
-        # fresh run for selected steps
         for s in run_steps:
             _clear_step(cfg, s)
-    # force always clears
     for s in force:
         _clear_step(cfg, s)
 # ---- end helpers --------------------------------------------------------------
 
-
-
 # --------------------------------------------------------------------------------
-# Existing stepwise commands (unchanged behavior)
+# Existing stepwise commands
 # --------------------------------------------------------------------------------
 
 @app.command()
@@ -233,8 +229,9 @@ def extract(config: Path = typer.Option(..., "--config", "-c", exists=True, read
     genomes = sorted(cfg["genomes"].items())
     with ProcessPoolExecutor(max_workers=_clamp(threads, 1, len(genomes))) as ex:
         futs = [ex.submit(bam_to_qc, Path(bam), d["qc"] / f"{g}_QCMapping.txt", cfg["sample"])
-            for g, bam in genomes]
-        for f in as_completed(futs): f.result()
+                for g, bam in genomes]
+        for f in as_completed(futs):
+            f.result()
     typer.echo("[extract] done")
 
 @app.command()
@@ -244,12 +241,13 @@ def filter(config: Path = typer.Option(..., "--config", "-c", exists=True, reada
     cfg = json.loads(Path(config).read_text()); d = _cfg_dirs(cfg); _ensure_dirs(d)
     genomes = sorted(cfg["genomes"].keys()); minf = int(cfg["min_barcode_freq"])
     with ProcessPoolExecutor(max_workers=_clamp(threads, 1, len(genomes))) as ex:
-        futs=[]
+        futs = []
         for g in genomes:
-            ip = d["qc"]/f"{g}_QCMapping.txt"
-            op = d["filtered"]/f"filtered_{g}_QCMapping.txt"
+            ip = d["qc"] / f"{g}_QCMapping.txt"
+            op = d["filtered"] / f"filtered_{g}_QCMapping.txt"
             futs.append(ex.submit(filter_qc_file, ip, op, minf, cfg["sample"]))
-        for f in as_completed(futs): f.result()
+        for f in as_completed(futs):
+            f.result()
     typer.echo("[filter] done")
 
 @app.command()
@@ -266,7 +264,7 @@ def assign(
     edges_workers: Optional[int] = typer.Option(None, "--edges-workers",
         help="Max process workers for learn_edges_parallel (default: = --threads)"),
     edges_max_reads: Optional[int] = typer.Option(None, "--edges-max-reads",
-        help="Optional cap of reads per genome when learning edges (speeds up on huge files)"),
+        help="Optional cap of reads per genome when learning edges"),
     ecdf_workers: Optional[int] = typer.Option(None, "--ecdf-workers",
         help="Max workers for learn_ecdfs (default: = --threads)"),
     chunksize: Optional[int] = typer.Option(
@@ -284,18 +282,17 @@ def assign(
     cfg = _load_config(config)
     d = _cfg_dirs(cfg); _ensure_dirs(d)
 
-    # Bootstrap chunks dir in empty sandboxes (keeps tests green)
     _ensure_minimal_chunk(Path(cfg["workdir"]), cfg["sample"])
 
     workdir = Path(cfg["workdir"])
     sample = str(cfg["sample"])
     chunks_dir = d["chunks"]
 
-    aconf       = cfg.get("assign", {}) if isinstance(cfg.get("assign"), dict) else {}
-    alpha       = float(aconf.get("alpha", 0.05))
-    k           = int(aconf.get("k", 10))
-    mapq_min    = int(aconf.get("mapq_min", 20))
-    xa_max      = int(aconf.get("xa_max", 2))
+    aconf = cfg.get("assign", {}) if isinstance(cfg.get("assign"), dict) else {}
+    alpha    = float(aconf.get("alpha", 0.05))
+    k        = int(aconf.get("k", 10))
+    mapq_min = int(aconf.get("mapq_min", 20))
+    xa_max   = int(aconf.get("xa_max", 2))
 
     chunksize_val  = int(chunksize if chunksize is not None else aconf.get("chunksize", cfg.get("chunksize", 1_000_000)))
     batch_size_val = int(batch_size if batch_size is not None else aconf.get("batch_size",  cfg.get("batch_size", 32)))
@@ -303,7 +300,6 @@ def assign(
     if "chunks_dir" in aconf:
         chunks_dir = Path(workdir) / sample / str(aconf["chunks_dir"])
 
-    # Soft bootstrap if still no txt chunks
     chunk_files = sorted(chunks_dir.glob("*_cell_map_ref_chunk_*.txt"))
     if not chunk_files:
         dummy = chunks_dir / f"{sample}_cell_map_ref_chunk_0001.txt"
@@ -318,7 +314,6 @@ def assign(
         typer.echo(f"[assign] No chunk files found; created {dummy.name} to proceed.")
         chunk_files = [dummy]
 
-    # Validation & clamping
     threads_eff = max(1, int(threads))
     if edges_workers is not None:
         edges_workers = 1 if edges_workers <= 0 else min(edges_workers, threads_eff)
@@ -344,7 +339,6 @@ def assign(
         typer.echo(f"[assign] effective chunksize={chunksize_val:,}  batch_size={batch_size_val}  "
                    f"threads={threads_eff}" + ("  " + "  ".join(extra) if extra else ""))
 
-    # 1) global models
     learn_edges_parallel(
         workdir=workdir, sample=sample, chunks_dir=chunks_dir, out_model=edges_npz,
         mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize_val, k=k, batch_size=batch_size_val,
@@ -357,7 +351,6 @@ def assign(
         mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize_val, verbose=verbose, workers=ecdf_workers_eff
     )
 
-    # 2) per-chunk scoring (parallel)
     pool_n = min(threads_eff, len(chunk_files))
     typer.echo(f"[assign/score] start: {len(chunk_files)} chunks, procs={pool_n}")
     with ProcessPoolExecutor(max_workers=pool_n) as ex:
@@ -390,20 +383,15 @@ def genotyping(
     """Posterior-aware genotyping (merge + summarize + optional post-steps)."""
     from .genotyping import genotyping as _run_genotyping
     import glob as _glob
-    import json as _json
 
-    # load config and dirs
     cfg = _json.loads(Path(config).read_text())
     d = _cfg_dirs(cfg); _ensure_dirs(d)
 
-    # resolve sample/outdir
     sample = sample or cfg["sample"]
     outdir = outdir or d["final"]
 
-    # derive a sane default for --assign if user omitted it
     if not assign_glob:
-        chunks_dir = d["chunks"]  # <workdir>/<sample>/cell_map_ref_chunks
-        # Try specific patterns first, then a general fallback
+        chunks_dir = d["chunks"]
         candidate_patterns = [
             str(chunks_dir / "**" / "*filtered.tsv.gz"),
             str(chunks_dir / "**" / "*.tsv.gz"),
@@ -421,14 +409,11 @@ def genotyping(
                 f"Expected files like 'Seedling_chunkNNN_filtered.tsv.gz'.\n"
                 f"Provide --assign or run the 'assign' step first."
             )
-        # Use a broad glob so the genotyper can re-scan once; keeps behavior simple
         assign_glob = str(chunks_dir / "**" / "*")
 
-    # final sanity check
     if not _glob.glob(assign_glob, recursive=True):
         raise typer.BadParameter(f"No assign files matched: {assign_glob}")
 
-    # optional mismatch warning
     if "sample" in cfg and cfg["sample"] != sample:
         typer.echo(f"[genotyping] warn: config sample={cfg['sample']} but CLI --sample={sample}")
 
@@ -436,9 +421,7 @@ def genotyping(
     typer.echo(f"[genotyping] assign_glob={assign_glob}")
     typer.echo(f"[genotyping] threads={threads}  report={'on' if make_report else 'off'}")
 
-    # run
     _run_genotyping(assign=assign_glob, outdir=outdir, sample=sample, make_report=make_report, threads=threads)
-
 
 @app.command()
 def summarize(
@@ -481,7 +464,7 @@ def plate(
     typer.echo(f"[plate] heatmap: {out['heatmap_pdf']}")
 
 # --------------------------------------------------------------------------------
-# End-to-end: now powered by the resumable DAG + sentinels
+# End-to-end: resumable DAG + sentinels
 # --------------------------------------------------------------------------------
 @app.command()
 def run(
@@ -533,24 +516,22 @@ def run(
         raise typer.BadParameter("Choose exactly one mode: --config OR (--sample/--genome/--bam/--workdir) OR --configs")
 
     def _do_one(cfg: dict):
-        # apply assign overrides (stored in cfg['assign'])
         _apply_assign_overrides(
             cfg,
             alpha=assign_alpha, k=assign_k, mapq_min=assign_mapq_min, xa_max=assign_xa_max,
             chunksize=assign_chunksize, batch_size=assign_batch_size,
             edges_workers=assign_edges_workers, edges_max_reads=assign_edges_max_reads, ecdf_workers=ecdf_workers,
         )
-        # build params that the DAG can use (extend as you please)
         params = {
             "threads": int(threads),
             "verbose": bool(verbose),
-            # mirror assign overrides for downstream helpers if needed:
             "assign": cfg.get("assign", {}),
         }
         force = [s.strip() for s in force_steps.split(",") if s.strip()]
         only  = [s.strip() for s in only_steps.split(",") if s.strip()]
 
-        # hand-off to the resumable DAG
+        # sentinel policy is handled inside run_pipeline in your design;
+        # if you want to enforce here per-step, call _apply_resume_policy.
         result = run_pipeline(cfg, params, version="0.4.0", resume=resume, force=force, skip_to=skip_to, only=only)
         typer.echo(f"[run] Executed: {result['executed']}")
         typer.echo(f"[run] Skipped:  {result['skipped']}")
@@ -560,19 +541,18 @@ def run(
         cfg = _load_config(config)
         _ensure_minimal_chunk(Path(cfg["workdir"]), cfg["sample"])
         _do_one(cfg)
-        
         return
     elif inline_ready:
         cfg = _cfg_from_inline(sample, genome, bam, str(workdir), min_barcode_freq, chunk_size_cells)
         _ensure_minimal_chunk(Path(cfg["workdir"]), cfg["sample"])
         _do_one(cfg)
         return
-    else:  # configs TSV
+    else:
         batch = _cfgs_from_tsv(configs, min_barcode_freq, chunk_size_cells)
         if not batch:
-            typer.echo("[run] no configs found in TSV"); return
+            typer.echo("[run] no configs found in TSV")
+            return
         for cfg in batch:
-            # apply CLI overrides per config
             _apply_assign_overrides(
                 cfg,
                 alpha=assign_alpha, k=assign_k, mapq_min=assign_mapq_min, xa_max=assign_xa_max,
@@ -583,3 +563,6 @@ def run(
             _ensure_minimal_chunk(Path(cfg["workdir"]), cfg["sample"])
             _do_one(cfg)
         return
+
+if __name__ == "__main__":
+    app()
