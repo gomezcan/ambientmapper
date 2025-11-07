@@ -319,12 +319,27 @@ def genotyping(
 ):
     """Posterior-aware genotyping (merge + summarize + optional post-steps)."""
     from .genotyping import genotyping as _run_genotyping
+    import glob as _glob
+    if not _glob.glob(assign_glob, recursive=True):
+        raise typer.BadParameter(f"No assign files matched: {assign_glob}")
+            
+
     cfg = json.loads(Path(config).read_text())
     d = _cfg_dirs(cfg); _ensure_dirs(d)
-    assign_glob = assign_glob or str(d["chunks"] / "**" / "*")
-    outdir = outdir or d["final"]
+
+    # Resolve sample first so the default glob can include it
     sample = sample or cfg["sample"]
-    _run_genotyping.callback(assign=assign_glob, outdir=outdir, sample=sample, make_report=make_report)
+    outdir = outdir or d["final"]
+
+    # Safer default glob: only *_filtered.* files under chunks
+    if not assign_glob:
+        assign_glob = str(d["chunks"] / f"{sample}_chunk*_filtered.*")
+    
+    typer.echo(f"[genotyping] sample={sample} outdir={outdir} assign_glob='{assign_glob}' threads={threads}")
+    # Call the underlying function directly, and forward threads
+    _run_genotyping(assign=assign_glob, outdir=outdir, sample=sample,
+                    make_report=make_report, threads=threads)
+
 
 @app.command()
 def summarize(
