@@ -1,49 +1,75 @@
 #!/usr/bin/env python3
 """
-ambientmapper genotyping — probabilistic merge + summarize (+ optional decontam)
+ambientmapper genotyping — posterior-aware merge → per-cell genotype calls (+ optional decontam)
 
-This module consumes per-read multi-genome evidence exported by `assign` and
-produces per-cell calls (single / doublet / indistinguishable / ambiguous),
-with ambient-aware priors, optional design priors, and a summary report.
+This module consumes per-read, multi-genome evidence exported by `assign` and
+emits per-cell genotype calls: {single, doublet, indistinguishable, ambiguous}.
+All decisions are data-driven from `assign` outputs (no plate/design priors here).
+An optional QC report and per-read drop list (for single/indistinguishable calls)
+are produced to aid downstream cleaning.
 
 CLI (Typer):
   ambientmapper genotyping \
       --assign 'work/assign_chunks/*.parquet' \
       --outdir work/merge \
-      [--design design.csv] [--sample SAMPLE] \
-      [--min-reads 300] [--beta 0.5] [--tau-drop 8]
+      --sample SAMPLE \
+      [--min-reads 300] [--beta 0.5] [--tau-drop 8] \
+      [--topk-genomes 3] [--ambient-const 1e-3] \
+      [--report/--no-report] [--threads 1]
 
-Inputs expected from `assign` (flexible; auto-detected when possible):
-  Required columns:
+Inputs expected from `assign` (flexible; auto-detected when possible)
+  Required columns (after coercion):
     - barcode (str)
     - read_id (str or int)
     - genome (str)
-  Recommended score columns (at least one of AS/MAPQ/NM should exist):
-    - AS (alignment score, higher better)
-    - MAPQ (mapping quality, higher better)
-    - NM (edits / mismatches, lower better)
-  Optional per-genome p-values for the winning-vs-runner-up ambiguity model:
-    - p_as, p_mq  (0..1, lower means stronger winner)
+  Recommended score columns (any subset; improves separation):
+    - AS   (alignment score; higher is better)
+    - MAPQ (mapping quality; higher is better)
+    - NM   (edits/mismatches; lower is better)
+  Optional per-read ambiguity p-values (if your assign pipeline emits them):
+    - p_as, p_mq  — in [0,1]; smaller = stronger winner-vs-runner-up evidence
 
-Design priors (optional): CSV with any of:
-  - barcode (exact) → {genome: weight,...}
-  - plate, well, genome_prior_* columns, OR a wide one-hot schema per genome.
-  Use --design-key to choose key column among {barcode, plate, well}.
+Behavior (high level)
+  1) Schema-coerce and collapse to one row per (barcode, read_id, genome):
+       AS=max; MAPQ=max; NM=min; p_* = min
+  2) For each read, fuse available scores with robust z-scaling and a p-value
+     penalty; softmax (temperature beta) + tiny ambient mass → soft posteriors L(r,g).
+  3) Aggregate expected counts per (barcode, genome): C(b,g) = Σ_r L(r,g).
+     Estimate an ambient profile eta(g) from low-read barcodes (<200 reads).
+  4) For each barcode, pick top-k candidate genomes by C(b,g). Grid-search
+     single vs doublet models with ambient (alpha) and, for doublets, mixture (rho);
+     select by BIC with conservative margins.
+  5) Emit call + QC metrics. For single/indistinguishable, optionally list reads to
+     drop if their top genome strongly contradicts the assigned one (odds ≥ tau-drop).
 
-Outputs:
-  - <outdir>/<sample>_cells_calls.tsv.gz         (per-cell calls + QC)
-  - <outdir>/<sample>_Reads_to_discard.csv.gz    (optional per-read drops)
-  - <outdir>/<sample>_BCs_PASS_by_mapping.csv    (legacy compatible summary)
-  - <outdir>/<sample>_qc_report.pdf              (summary plots)
+Outputs
+  - <outdir>/<sample>_cells_calls.tsv.gz
+      One row per barcode with:
+        call, genome_1, genome_2, alpha, rho, purity, minor,
+        bic_best, bic_single, bic_doublet, delta_bic,
+        n_reads, n_effective, concordance, indistinguishable_set, notes
+  - <outdir>/<sample>_Reads_to_discard.csv.gz
+      Per-read drops for single/indistinguishable calls (reason='contrary_genome').
+  - <outdir>/<sample>_BCs_PASS_by_mapping.csv
+      Legacy-compatible summary: barcode, AssignedGenome, call, purity, n_reads.
+  - <outdir>/<sample>_qc_report.pdf   (when --report)
+      Basic histograms, purity vs reads, and call counts.
+  - <outdir>/<sample>_expected_counts_by_genome.csv
+      Barcode × genome expected-count matrix (debug/inspection).
 
-Notes:
-  * This file is intentionally self-contained. If you later want to split into
-    submodules (io.py, model.py, summarize.py), you can copy the corresponding
-    sections out cleanly.
-  * The likelihood used here is a pragmatic composite likelihood based on
-    per-read soft posteriors from `assign`. It is calibrated for model selection
-    (BIC) and decontamination heuristics as discussed with Fabio.
+Notes
+  * This module is intentionally self-contained. If you later split into
+    io.py / model.py / summarize.py, sections can be moved cleanly.
+  * The likelihood is a pragmatic composite built on per-read soft posteriors
+    from `assign`, tuned for model selection (BIC) and decontamination heuristics.
+
+Future hooks (not used here)
+  * Plate/well design or pool metadata are NOT consumed by genotyping.
+    They are intended to be incorporated in downstream steps such as
+    `summarize` or `interpool` (e.g., for well-aware recovery of second-ranked
+    genotypes or cross-pool consistency checks).
 """
+
 from __future__ import annotations
 
 import gzip
