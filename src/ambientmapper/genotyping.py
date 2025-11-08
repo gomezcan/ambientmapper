@@ -97,9 +97,16 @@ import warnings
 try:
     import matplotlib.pyplot as plt
     import seaborn as sns
+    from typer.models import OptionInfo
     HAS_PLOTTING = True
 except Exception:
     HAS_PLOTTING = False
+
+try:
+  from typer.models import OptionInfo
+except Exception:
+  class OptionInfo:  # fallback so isinstance(x, OptionInfo) is valid
+    pass
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
@@ -198,10 +205,10 @@ def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 def _optint(x, default: int) -> int:
-    if isinstance(x, OptionInfo):
-        d = getattr(x, "default", None)
-        return int(d) if d is not None else int(default)
-    return int(x)
+  if isinstance(x, OptionInfo):
+    d = getattr(x, "default", None)
+    return int(d) if d is not None else int(default)
+  return int(x)
 
 # ------------------------------
 # Core math utilities
