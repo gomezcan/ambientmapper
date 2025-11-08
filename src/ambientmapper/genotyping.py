@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 ambientmapper genotyping — posterior-aware merge → per-cell genotype calls (+ optional decontam)
+Two-pass, streaming implementation.
 
 This module consumes per-read, multi-genome evidence exported by `assign` and
 emits per-cell genotype calls: {single, doublet, indistinguishable, ambiguous}.
@@ -8,11 +9,17 @@ All decisions are data-driven from `assign` outputs (no plate/design priors here
 An optional QC report and per-read drop list (for single/indistinguishable calls)
 are produced to aid downstream cleaning.
 
+Two-pass execution
+  Pass 1: Stream input TSV.GZ chunks → compute per-read posteriors L(r,g),
+          accumulate expected counts C(b,g) + n_reads(b), and spill per-read L
+          into barcode-hashed shard files on disk.
+  Pass 2: Walk shard files → group rows per barcode → model selection (single vs
+          doublet with ambient) → write calls and optional read-drop table.
+
 CLI (Typer):
   ambientmapper genotyping \
-      --assign 'work/assign_chunks/*.parquet' \
-      --outdir work/merge \
-      --sample SAMPLE \
+      --assign 'work/cell_map_ref_chunks/*_filtered.tsv.gz' \
+      --outdir work/merge --sample SAMPLE \
       [--min-reads 300] [--beta 0.5] [--tau-drop 8] \
       [--topk-genomes 3] [--ambient-const 1e-3] \
       [--report/--no-report] [--threads 1]
@@ -62,12 +69,6 @@ Notes
     io.py / model.py / summarize.py, sections can be moved cleanly.
   * The likelihood is a pragmatic composite built on per-read soft posteriors
     from `assign`, tuned for model selection (BIC) and decontamination heuristics.
-
-Future hooks (not used here)
-  * Plate/well design or pool metadata are NOT consumed by genotyping.
-    They are intended to be incorporated in downstream steps such as
-    `summarize` or `interpool` (e.g., for well-aware recovery of second-ranked
-    genotypes or cross-pool consistency checks).
 """
 
 from __future__ import annotations
@@ -78,7 +79,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -87,7 +88,10 @@ import typer
 from pydantic import BaseModel
 from tqdm import tqdm
 import glob
-
+import hashlib
+import tempfile
+import shutil
+import warnings
 
 # Optional but nice to have for summary plots
 try:
@@ -121,22 +125,24 @@ class MergeConfig(BaseModel):
     max_alpha: float = 0.5            # cap ambient fraction
     topk_genomes: int = 3             # candidate genomes per barcode
     sample: str = "sample"
+    shards: int = 32                  # number of barcode-hash shards
+    chunk_rows: int = 1_000_000       # streaming chunk size for input TSVs
 
 # ------------------------------
 # I/O helpers
 # ------------------------------
 
-def _read_table(path: Path) -> pd.DataFrame:
-    suf = "".join(path.suffixes).lower()
-    # Parquet (plain or gz)
-    if suf.endswith(".parquet") or suf.endswith(".parquet.gz"):
-        return pd.read_parquet(path)
-    # Delimited (plain or gz)
-    if suf.endswith(".csv") or suf.endswith(".csv.gz"):
-        return pd.read_csv(path)
-    if suf.endswith(".tsv") or suf.endswith(".tsv.gz") or suf.endswith(".txt") or suf.endswith(".txt.gz"):
-        return pd.read_csv(path, sep="\t")
-    raise ValueError(f"Unsupported file format: {path}")
+NEEDED_COLS: Sequence[str] = ("barcode","read_id","genome","AS","MAPQ","NM")
+DTYPES: Dict[str,str] = {
+    "barcode": "string",
+    "read_id": "string",
+    "genome": "string",   # cast to category later
+    "AS": "int32", "MAPQ": "int16", "NM": "int16",
+}
+
+REQUIRED_COLS = {"barcode", "read_id", "genome"}
+SCORE_COLS = ["AS", "MAPQ", "NM"]
+PVAL_COLS = ["p_as", "p_mq"]
 
 def _coerce_assign_schema(df: pd.DataFrame) -> pd.DataFrame:
     """Rename columns from assign outputs to the schema expected by genotyping."""
@@ -182,7 +188,7 @@ def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
     if "p_mq" in have: agg["p_mq"] = "min"
 
     if not agg:
-        # we must at least have the keys; return distinct keys
+        # At least return the keys
         return df.drop_duplicates(keys)[keys]
 
     return (
@@ -190,35 +196,6 @@ def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
           .agg(agg)
           .reset_index()
     )
-
-def _process_one(args):
-    bc, L_block, cand, eta_dict, cfg_dict = args
-    # Rehydrate config and ambient profile
-    cfg = MergeConfig(**cfg_dict)
-    eta = pd.Series(eta_dict)
-
-    read_count = L_block["read_id"].nunique()
-    if read_count < cfg.min_reads:
-        res = {
-            "barcode": bc, "call": "ambiguous", "genome_1": None, "genome_2": None,
-            "alpha": np.nan, "rho": np.nan, "purity": 0.0, "minor": 0.0, "bic_best": np.nan,
-            "bic_single": np.nan, "bic_doublet": np.nan, "delta_bic": np.nan,
-            "n_reads": read_count, "n_effective": float(L_block["L"].sum()),
-            "concordance": np.nan, "indistinguishable_set": "", "notes": "low_reads"
-        }
-        return res, pd.DataFrame()
-
-    best = _select_model_for_barcode(L_block, eta, cfg, cand)
-    best["barcode"] = bc
-    best["notes"] = ""
-
-    drops = _reads_to_discard(L_block, best, cfg)
-    return best, drops
-
-
-REQUIRED_COLS = {"barcode", "read_id", "genome"}
-SCORE_COLS = ["AS", "MAPQ", "NM"]
-PVAL_COLS = ["p_as", "p_mq"]
 
 # ------------------------------
 # Core math utilities
@@ -291,34 +268,33 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
     return pd.concat(records, ignore_index=True)
 
 
-def _aggregate_expected_counts(Ldf: pd.DataFrame) -> pd.DataFrame:
-    """Return per-barcode expected counts per genome: C_{b,g} = sum_r L_{r,g}.
-    Output columns: barcode, genome, C, n_reads.
+def _aggregate_expected_counts_from_chunk(Ldf: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Return two frames:
+       C_chunk: per-barcode expected counts per genome: columns [barcode, genome, C]
+       N_chunk: per-barcode n_reads: columns [barcode, n_reads]
     """
-    grp = Ldf.groupby(["barcode", "genome"], observed=True)["L"].sum().rename("C").reset_index()
-    n_reads = Ldf.groupby("barcode")["read_id"].nunique().rename("n_reads").reset_index()
-    return grp.merge(n_reads, on="barcode", how="left")
+    C_chunk = Ldf.groupby(["barcode", "genome"], observed=True)["L"].sum().rename("C").reset_index()
+    N_chunk = Ldf.groupby("barcode")["read_id"].nunique().rename("n_reads").reset_index()
+    return C_chunk, N_chunk
 
 
-def _estimate_ambient_profile(Ldf: pd.DataFrame, low_read_threshold: int = 200) -> pd.Series:
-    """Crude ambient estimate: use low-read barcodes to infer genome mix.
-    Return pd.Series indexed by genome with probabilities summing to 1.
+def _estimate_ambient_profile(Ldf_or_C: pd.DataFrame, low_read_threshold: int = 200, input_is_L: bool = True) -> pd.Series:
+    """Estimate ambient genome mix eta(g).
+       If input_is_L=True, expects columns [barcode, read_id, genome, L].
+       Else expects aggregated C with columns [barcode, genome, C] and n_reads table provided separately.
     """
-    n_by_bc = Ldf.groupby("barcode")["read_id"].nunique()
-    empties = set(n_by_bc[n_by_bc < low_read_threshold].index)
-    if not empties:
-        # fallback: use all reads (rare)
-        df_use = Ldf
+    if input_is_L:
+        n_by_bc = Ldf_or_C.groupby("barcode")["read_id"].nunique()
+        empties = set(n_by_bc[n_by_bc < low_read_threshold].index)
+        df_use = Ldf_or_C[Ldf_or_C["barcode"].isin(empties)] if len(empties) else Ldf_or_C
+        mix = df_use.groupby("genome")["L"].sum()
+        s = float(mix.sum())
+        if s <= 0:
+            mix = pd.Series(1.0, index=sorted(Ldf_or_C["genome"].unique()))
+            s = float(mix.sum())
+        return mix / s
     else:
-        df_use = Ldf[Ldf["barcode"].isin(empties)]
-    mix = df_use.groupby("genome")["L"].sum()
-    s = mix.sum()
-    if s <= 0:
-        # uniform fallback
-        mix = pd.Series(1.0, index=sorted(Ldf["genome"].unique()))
-        s = mix.sum()
-    eta = mix / s
-    return eta
+        raise NotImplementedError("Ambient from aggregated-only path not used in this script.")
 
 # ------------------------------
 # Model selection per barcode
@@ -327,18 +303,7 @@ def _estimate_ambient_profile(Ldf: pd.DataFrame, low_read_threshold: int = 200) 
 def _loglik_for_params(L_block: pd.DataFrame, eta: pd.Series, 
                        model: str, g1: str, g2: Optional[str],
                        alpha: float, rho: float = 0.5) -> float:
-    """Composite log-likelihood for a barcode block of rows (one per (read,genome)).
-
-    L_block columns: genome, read_id, L, L_amb
-
-    Model:
-      - single: theta_g = 1 for g1; effective mixture over genomes = (1-alpha)*delta_{g1} + alpha*eta
-      - doublet: (1-alpha)*(rho*delta_{g1} + (1-rho)*delta_{g2}) + alpha*eta
-
-    The per-read likelihood is sum_g w_g * L_{r,g}, where w_g is the effective mixture weight.
-    We do not include L_amb separately here because eta already absorbs ambient genome mix.
-    """
-    # Precompute effective weights per genome
+    """Composite log-likelihood for a barcode block of rows (one per (read,genome))."""
     genomes = L_block["genome"].unique()
     eta_g = eta.reindex(genomes).fillna(0.0).to_numpy()
 
@@ -354,30 +319,20 @@ def _loglik_for_params(L_block: pd.DataFrame, eta: pd.Series,
     else:
         raise ValueError("model must be 'single' or 'doublet'")
 
-    # Per-read sums: sum over genomes present for that read
-    # Build by grouping by read_id
     arr_wL = w * L_block["L"].to_numpy()
     df_tmp = L_block[["read_id"]].copy()
     df_tmp["wL"] = arr_wL
     s = df_tmp.groupby("read_id")["wL"].sum().to_numpy()
-
-    # Numerical safety
     s = np.clip(s, 1e-12, None)
     return float(np.log(s).sum())
-
 
 def _bic(loglik: float, n_params: int, n_reads: int) -> float:
     return -2.0 * loglik + n_params * math.log(max(n_reads, 1))
 
 def _select_model_for_barcode(L_block: pd.DataFrame, eta: pd.Series, cfg: MergeConfig,
                               candidate_genomes: Sequence[str]) -> Dict:
-    """Evaluate single and (optionally) doublet models for a barcode and pick best by BIC.
-    Returns a dict with call, genomes, alpha, rho, bic values, purity, etc., plus light
-    multiplet-suspicion heuristics (no behavior change to call).
-    """
     read_count = int(L_block["read_id"].nunique())
 
-    # Guard: no candidates → ambiguous stub
     if not candidate_genomes:
         return {
             "model": None, "genome_1": None, "genome_2": None,
@@ -390,26 +345,25 @@ def _select_model_for_barcode(L_block: pd.DataFrame, eta: pd.Series, cfg: MergeC
             "suspect_multiplet": False, "multiplet_reason": ""
         }
 
-    # Grid for parameters
     alphas = np.arange(0.0, cfg.max_alpha + 1e-9, cfg.alpha_grid)
     rhos   = np.arange(0.1, 0.9 + 1e-9, cfg.rho_grid)
 
     best = {"bic": float("inf"), "model": None}
     evals = []
 
-    # -------- SINGLE MODELS --------
+    # Singles
     for g1 in candidate_genomes:
         best_local = {"bic": float("inf")}
         for a in alphas:
             ll  = _loglik_for_params(L_block, eta, model="single", g1=g1, g2=None, alpha=a)
-            bic = _bic(ll, n_params=1, n_reads=read_count)  # only alpha
+            bic = _bic(ll, n_params=1, n_reads=read_count)
             if bic < best_local["bic"]:
                 best_local = {"model": "single", "g1": g1, "alpha": a, "rho": 1.0, "ll": ll, "bic": bic}
         evals.append(best_local)
         if best_local["bic"] < best["bic"]:
             best = best_local
 
-    # -------- DOUBLET MODELS --------
+    # Doublets
     if len(candidate_genomes) >= 2:
         for i in range(len(candidate_genomes)):
             for j in range(i + 1, len(candidate_genomes)):
@@ -418,14 +372,14 @@ def _select_model_for_barcode(L_block: pd.DataFrame, eta: pd.Series, cfg: MergeC
                 for a in alphas:
                     for r in rhos:
                         ll  = _loglik_for_params(L_block, eta, model="doublet", g1=g1, g2=g2, alpha=a, rho=r)
-                        bic = _bic(ll, n_params=2, n_reads=read_count)  # alpha + rho
+                        bic = _bic(ll, n_params=2, n_reads=read_count)
                         if bic < best_local["bic"]:
                             best_local = {"model": "doublet", "g1": g1, "g2": g2, "alpha": a, "rho": r, "ll": ll, "bic": bic}
                 evals.append(best_local)
                 if best_local["bic"] < best["bic"]:
                     best = best_local
 
-    # ---- Per-genome expected mass & proportions (for QC/heuristics) ----
+    # QC props
     mass = L_block.groupby("genome", observed=True)["L"].sum().sort_values(ascending=False)
     tot = float(mass.sum())
     props = (mass / max(tot, 1e-12)).to_numpy()
@@ -435,7 +389,6 @@ def _select_model_for_barcode(L_block: pd.DataFrame, eta: pd.Series, cfg: MergeC
     top3_sum = p1 + p2 + p3
     entropy = float(-np.sum(props * np.log(np.clip(props, 1e-12, 1.0)))) if tot > 0 else 0.0
 
-    # ---- Build main output (uses best/evals) ----
     out = {
         "model": best.get("model", None),
         "genome_1": best.get("g1", None),
@@ -450,7 +403,7 @@ def _select_model_for_barcode(L_block: pd.DataFrame, eta: pd.Series, cfg: MergeC
     }
     out["delta_bic"] = min(out["bic_doublet"], out["bic_single"]) - out["bic_best"]
 
-    # Purity & minor (fraction of non-ambient mass assigned to major/minor)
+    # Purity & minor
     if out["model"] == "single":
         purity = (1.0 - out["alpha"])
         minor  = 0.0
@@ -466,17 +419,16 @@ def _select_model_for_barcode(L_block: pd.DataFrame, eta: pd.Series, cfg: MergeC
     call = "ambiguous"
     indist = None
 
-    # Near-tie among singles → indistinguishable
     singles_sorted = sorted(
         [e for e in evals if e.get("model") == "single"],
         key=lambda x: x["bic"]
     )[:2]
-    if len(singles_sorted) == 2 and (singles_sorted[1]["bic"] - singles_sorted[0]["bic"]) < cfg.near_tie_margin:
+    if len(singles_sorted) == 2 and (singles_sorted[1]["bic"] - singles_sorted[0]["bic"]) < 2.0:
         indist = (singles_sorted[0]["g1"], singles_sorted[1]["g1"])
 
-    if out["model"] == "single" and out["purity"] >= cfg.single_mass_min and (out["bic_doublet"] - out["bic_best"]) >= cfg.bic_margin:
+    if out["model"] == "single" and out["purity"] >= 0.85 and (out["bic_doublet"] - out["bic_best"]) >= 6.0:
         call = "single"
-    elif out["model"] == "doublet" and out["minor"] >= cfg.doublet_minor_min and (out["bic_single"] - out["bic_best"]) >= cfg.bic_margin:
+    elif out["model"] == "doublet" and out["minor"] >= 0.20 and (out["bic_single"] - out["bic_best"]) >= 6.0:
         call = "doublet"
     elif indist is not None:
         call = "indistinguishable"
@@ -496,20 +448,16 @@ def _select_model_for_barcode(L_block: pd.DataFrame, eta: pd.Series, cfg: MergeC
         concord = float((argmax == maj).mean())
     out["concordance"] = concord
 
-    # ---- Multiplet suspicion heuristics (no change to 'call') ----
+    # Multiplet suspicion heuristics
     suspect = False
     reasons = []
-
-    # Heuristic #1: notable mass on ≥3 genomes
-    if p3 >= 0.15 and top3_sum >= 0.85:
-        suspect = True
-        reasons.append(f"top3={top3_sum:.2f} with p3={p3:.2f}")
-
-    # Heuristic #2: weak separation between single/doublet BIC and low purity
     weak_doublet_edge = (
         (out["model"] == "doublet" and (out["bic_single"]  - out["bic_best"]) < 4.0) or
         (out["model"] == "single"  and (out["bic_doublet"] - out["bic_best"]) < 4.0)
     )
+    if p3 >= 0.15 and top3_sum >= 0.85:
+        suspect = True
+        reasons.append(f"top3={top3_sum:.2f} with p3={p3:.2f}")
     if weak_doublet_edge and out["purity"] < 0.75:
         suspect = True
         reasons.append(f"weak_deltaBIC + purity={out['purity']:.2f}")
@@ -535,7 +483,6 @@ def _reads_to_discard(L_block: pd.DataFrame, call_row: Dict, cfg: MergeConfig) -
     """
     call = call_row.get("call")
     g1 = call_row.get("genome_1")
-    g2 = call_row.get("genome_2")
 
     # aggregate per-read per-genome L to ensure unique entries
     X = L_block.groupby(["read_id", "genome"], observed=True)["L"].sum().reset_index()
@@ -607,44 +554,135 @@ def _render_qc_report(calls: pd.DataFrame, out_pdf: Path, sample: str) -> None:
     plt.close(fig)
 
 # ------------------------------
+# Two-pass streaming helpers
+# ------------------------------
+
+def _barcode_to_shard_idx(barcode: str, shards: int) -> int:
+    h = hashlib.sha1(barcode.encode("utf-8")).digest()
+    return int.from_bytes(h[:4], "little") % max(shards, 1)
+
+def _open_shard_handles(shard_dir: Path, shards: int) -> List[gzip.GzipFile]:
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    handles = []
+    for i in range(shards):
+        fp = shard_dir / f"shard_{i:02d}.tsv.gz"
+        # open in append-text mode
+        handles.append(gzip.open(fp, "at"))
+    return handles
+
+def _close_shard_handles(handles: List[gzip.GzipFile]) -> None:
+    for h in handles:
+        try:
+            h.close()
+        except Exception:
+            pass
+
+def _write_L_chunk_to_shards(Ldf: pd.DataFrame, shard_handles: List[gzip.GzipFile], shards: int, write_header_flags: Dict[int, bool]) -> None:
+    # write rows to shard by barcode-hash. Keep a small header tracker per shard.
+    # Ensure consistent column order
+    cols = ["barcode", "read_id", "genome", "L", "L_amb"]
+    Ldf = Ldf[cols].copy()
+    for bc, sub in Ldf.groupby("barcode", sort=False):
+        idx = _barcode_to_shard_idx(str(bc), shards)
+        h = shard_handles[idx]
+        if not write_header_flags[idx]:
+            h.write("\t".join(cols) + "\n")
+            write_header_flags[idx] = True
+        # write sub as TSV without header
+        sub.to_csv(h, sep="\t", header=False, index=False)
+
+def _iter_input_chunks(assign_glob: str, chunk_rows: int) -> Iterator[pd.DataFrame]:
+    files = [Path(p) for p in glob.glob(assign_glob, recursive=True) if p.endswith("_filtered.tsv.gz") or p.endswith(".tsv.gz")]
+    if not files:
+        raise FileNotFoundError(f"No assign files found for pattern: {assign_glob}")
+    for fp in files:
+        try:
+            it = pd.read_csv(
+                fp,
+                sep="\t",
+                usecols=None,   # read all then coerce and reduce
+                dtype=None,
+                chunksize=chunk_rows,
+                engine="c",
+                low_memory=False,
+                memory_map=True,
+                on_bad_lines="skip",
+            )
+        except Exception as e:
+            typer.echo(f"[warn] Failed to open {fp.name}: {e}; skipping.")
+            continue
+        for chunk in it:
+            yield chunk
+
+def _pass1_stream_build(assign_glob: str, cfg: MergeConfig, tmp_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame, Path]:
+    """Pass 1: stream inputs, compute L, accumulate C and n_reads, spill L to shards.
+       Returns (C_all, N_all, shard_dir)
+    """
+    shard_dir = tmp_dir / "L_shards"
+    shard_handles = _open_shard_handles(shard_dir, cfg.shards)
+    header_written = {i: False for i in range(cfg.shards)}
+
+    C_all_list = []
+    N_all_list = []
+
+    for raw in tqdm(_iter_input_chunks(assign_glob, cfg.chunk_rows), desc="[pass1] reading+processing"):
+        try:
+            df = _coerce_assign_schema(raw)
+            df = _reduce_alignments_to_per_genome(df)
+            # Drop bad rows early
+            df = df.dropna(subset=["barcode", "read_id", "genome"])
+            if df.empty:
+                continue
+            # Compute L
+            Ldf = _compute_read_posteriors(df, cfg)
+            # Accumulate aggregations
+            C_chunk, N_chunk = _aggregate_expected_counts_from_chunk(Ldf)
+            C_all_list.append(C_chunk)
+            N_all_list.append(N_chunk)
+            # Spill to shards
+            _write_L_chunk_to_shards(Ldf, shard_handles, cfg.shards, header_written)
+        except Exception as e:
+            typer.echo(f"[warn] skipping chunk due to error: {e}")
+            continue
+
+    _close_shard_handles(shard_handles)
+
+    if not C_all_list:
+        raise RuntimeError("No valid data encountered during pass 1.")
+
+    # Merge chunked C and N
+    C_all = pd.concat(C_all_list, ignore_index=True)
+    C_all = C_all.groupby(["barcode","genome"], observed=True)["C"].sum().reset_index()
+
+    N_all = pd.concat(N_all_list, ignore_index=True)
+    N_all = N_all.groupby("barcode")["n_reads"].sum().reset_index()
+
+    return C_all, N_all, shard_dir
+
+def _iter_shard_rows(shard_fp: Path) -> Iterator[pd.DataFrame]:
+    """Yield the L rows from one shard in manageable pieces to limit memory."""
+    try:
+        it = pd.read_csv(shard_fp, sep="\t", compression="gzip", chunksize=2_000_000,
+                         dtype={"barcode":"string", "read_id":"string", "genome":"category", "L":"float32", "L_amb":"float32"})
+        for chunk in it:
+            yield chunk
+    except FileNotFoundError:
+        return
+
+def _process_barcode_group(bc: str, L_block: pd.DataFrame, cand: List[str], eta: pd.Series, cfg: MergeConfig):
+    best = _select_model_for_barcode(L_block, eta, cfg, cand)
+    best["barcode"] = bc
+    best["notes"] = ""
+    drops = _reads_to_discard(L_block, best, cfg)
+    return best, drops
+
+# ------------------------------
 # Main driver
 # ------------------------------
 
-def _load_assign_tables(assign_glob: str) -> pd.DataFrame:
-  files = [Path(p) for p in glob.glob(assign_glob, recursive=True)]
-  if not files:
-    raise FileNotFoundError(f"No assign files found for pattern: {assign_glob}")
-  frames = []
-  for fp in files:
-    df = _read_table(fp)
-    df = _coerce_assign_schema(df)
-    
-    # Ensure required keys exist; if not, warn & skip this file
-    if not {"barcode", "read_id", "genome"} <= set(df.columns):
-      typer.echo(f"[warn] Missing required columns in {fp.name}; skipping.")
-      continue
-
-    df = _reduce_alignments_to_per_genome(df)
-    frames.append(df)
-        
-  if not frames:
-    raise ValueError("No valid assign tables after schema coercion; aborting.")
-  
-  out = pd.concat(frames, ignore_index=True)
-  out = out.dropna(subset=["barcode","read_id","genome"])
-  return out
-
-def _topk_genomes_per_barcode(C: pd.DataFrame, k: int) -> Dict[str, List[str]]:
-    out: Dict[str, List[str]] = {}
-    for bc, sub in C.groupby("barcode", sort=False):
-        top = sub.sort_values("C", ascending=False)["genome"].head(k).tolist()
-        out[bc] = top
-    return out
-
-
 @app.command("genotyping")
 def genotyping(
-    assign: str = typer.Option(..., help="Path or glob to assign outputs (csv/tsv/parquet, possibly gz)."),
+    assign: str = typer.Option(..., help="Path or glob to assign outputs (*.tsv.gz from assign)."),
     outdir: Path = typer.Option(Path("merge_out"), help="Output directory."),
     sample: str = typer.Option("sample", help="Sample name used for output filenames."),
     min_reads: int = typer.Option(100, help="Minimum reads to attempt confident calls."),
@@ -657,69 +695,106 @@ def genotyping(
     topk_genomes: int = typer.Option(3, help="Number of candidate genomes per barcode to consider."),
     make_report: bool = typer.Option(True, help="Render QC PDF report."),
     threads: int = typer.Option(1, help="Parallel workers for per-cell model selection."),
-
+    shards: int = typer.Option(32, help="Number of on-disk shards for pass-1 spill."),
+    chunk_rows: int = typer.Option(1_000_000, help="Input chunk size for streaming read."),
 ):
-    """Run the full merge pipeline: read-level posteriors → ambient estimate → per-cell calls → optional decontam → summaries."""
+    """Run the two-pass pipeline: streaming posterior calc → ambient estimate → per-cell calls → optional decontam → summaries."""
     cfg = MergeConfig(
         beta=beta, w_as=w_as, w_mapq=w_mapq, w_nm=w_nm,
         ambient_const=ambient_const, min_reads=min_reads,
         tau_drop=tau_drop, topk_genomes=topk_genomes, sample=sample,
+        shards=shards, chunk_rows=chunk_rows
     )
-    typer.echo("[1/5] Loading assign outputs…")
-    df = _load_assign_tables(assign)
-    missing = REQUIRED_COLS - set(df.columns)
-    if missing:
-        raise typer.BadParameter(f"Assign inputs missing required columns: {missing}")
 
-    typer.echo("[2/5] Computing per-read posteriors…")
-    Ldf = _compute_read_posteriors(df, cfg)
+    outdir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = outdir / f"tmp_{sample}"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    typer.echo("[3/5] Aggregating expected counts & estimating ambient profile…")
-    C = _aggregate_expected_counts(Ldf)
-    eta = _estimate_ambient_profile(Ldf)
+    # ---------------- Pass 1 ----------------
+    typer.echo("[1/5] Pass 1: streaming inputs → per-read posteriors + accumulators")
+    C_all, N_all, shard_dir = _pass1_stream_build(assign, cfg, tmp_dir)
 
-    typer.echo("[4/5] Per-cell model selection & calls…")
-    # Build candidate genomes per barcode
-    topk = _topk_genomes_per_barcode(C, cfg.topk_genomes)
+    # Estimate ambient from shards using low-read barcodes
+    typer.echo("[2/5] Estimating ambient profile from low-read barcodes")
+    low_reads = set(N_all[N_all["n_reads"] < 200]["barcode"])
+    if not low_reads:
+        warnings.warn("No low-read barcodes found; ambient will be estimated from all L rows.")
 
-    # Evaluate models per barcode
-    rows = []
-    drops = []
-    typer.echo("[4/5] Per-cell model selection & calls…")
-    topk = _topk_genomes_per_barcode(C, cfg.topk_genomes)
-
-    # Build tasks for each barcode
-    tasks = []
-    for bc, L_block in Ldf.groupby("barcode"):
-        cand = topk.get(bc, [])
-        if not cand:
-            continue
-        tasks.append((bc, L_block, cand, eta.to_dict(), cfg.model_dump()))
-
-    rows, drops_list = [], []
-
-    if threads <= 1:
-        for t in tqdm(tasks, total=len(tasks)):
-            best, D = _process_one(t)
-            rows.append(best)
-            if len(D):
-                drops_list.append(D)
+    mix = {}
+    for shard_fp in sorted(shard_dir.glob("shard_*.tsv.gz")):
+        for chunk in _iter_shard_rows(shard_fp):
+            if low_reads:
+                chunk = chunk[chunk["barcode"].isin(low_reads)]
+            if chunk.empty:
+                continue
+            add = chunk.groupby("genome")["L"].sum()
+            for g, v in add.items():
+                mix[g] = mix.get(g, 0.0) + float(v)
+    if not mix:
+        # Fallback: uniform
+        genomes = sorted(C_all["genome"].unique())
+        eta = pd.Series({g: 1.0/len(genomes) for g in genomes})
     else:
-        typer.echo(f"   → using {threads} workers")
+        s = sum(mix.values())
+        eta = pd.Series({g: v / s for g, v in mix.items()})
+
+    # Candidate genomes per barcode
+    typer.echo("[3/5] Selecting top-k candidate genomes per barcode")
+    def _topk_genomes_per_barcode(C: pd.DataFrame, k: int) -> Dict[str, List[str]]:
+        out: Dict[str, List[str]] = {}
+        for bc, sub in C.groupby("barcode", sort=False):
+            top = sub.sort_values("C", ascending=False)["genome"].head(k).astype(str).tolist()
+            out[str(bc)] = top
+        return out
+    topk = _topk_genomes_per_barcode(C_all, cfg.topk_genomes)
+
+    # ---------------- Pass 2 ----------------
+    typer.echo("[4/5] Pass 2: per-cell model selection over shards")
+    rows: List[Dict] = []
+    drops_list: List[pd.DataFrame] = []
+
+    def _process_shard(shard_fp: Path) -> Tuple[List[Dict], List[pd.DataFrame]]:
+        local_rows = []
+        local_drops = []
+        # Build in-memory blocks per barcode for this shard
+        blocks: Dict[str, List[pd.DataFrame]] = {}
+        for chunk in _iter_shard_rows(shard_fp):
+            for bc, sub in chunk.groupby("barcode", sort=False):
+                blocks.setdefault(str(bc), []).append(sub[["barcode","read_id","genome","L","L_amb"]])
+        for bc, parts in blocks.items():
+            L_block = pd.concat(parts, ignore_index=True)
+            cand = topk.get(bc, [])
+            if not cand or L_block.empty:
+                continue
+            best, D = _process_barcode_group(bc, L_block, cand, eta, cfg)
+            local_rows.append(best)
+            if len(D):
+                local_drops.append(D)
+        return local_rows, local_drops
+
+    shard_files = sorted(shard_dir.glob("shard_*.tsv.gz"))
+    if threads <= 1:
+        for fp in tqdm(shard_files, desc="[pass2] shards"):
+            r, d = _process_shard(fp)
+            rows.extend(r)
+            drops_list.extend(d)
+    else:
+        typer.echo(f"   → using {threads} workers at shard level")
         with ProcessPoolExecutor(max_workers=threads) as ex:
-            futures = [ex.submit(_process_one, t) for t in tasks]
+            futures = [ex.submit(_process_shard, fp) for fp in shard_files]
             for fut in tqdm(as_completed(futures), total=len(futures)):
-                best, D = fut.result()
-                rows.append(best)
-                if len(D):
-                    drops_list.append(D)
+                r, d = fut.result()
+                rows.extend(r)
+                drops_list.extend(d)
 
     calls = pd.DataFrame(rows)
     drops_df = (pd.concat(drops_list, ignore_index=True) if drops_list else
                 pd.DataFrame(columns=["barcode","read_id","top_genome","assigned_genome",
                                       "L_top","L_assigned","posterior_odds","reason"]).astype({"barcode": str}))
 
-    # Legacy-compatible summary (PASS_by_mapping), keep but now enriched
+    # Legacy-compatible summary (PASS_by_mapping)
     legacy = calls.copy()
     legacy["AssignedGenome"] = legacy["genome_1"].fillna("")
     pass_mask = legacy["call"].isin(["single", "doublet", "indistinguishable"])  # you can tighten if desired
@@ -736,14 +811,19 @@ def genotyping(
         _render_qc_report(calls, outdir / f"{sample}_qc_report.pdf", sample=sample)
 
     # Optional debugging matrix
-    if not C.empty:
+    if not C_all.empty:
         mat = (
-            C.pivot(index="barcode", columns="genome", values="C")
+            C_all.pivot(index="barcode", columns="genome", values="C")
              .sort_index(axis=1)
              .fillna(0.0)
         )
         mat.to_csv(outdir / f"{sample}_expected_counts_by_genome.csv")
-        # or: mat.to_csv(outdir / f"{sample}_expected_counts_by_genome.csv.gz")
+
+    # Cleanup tmp
+    try:
+        shutil.rmtree(tmp_dir)
+    except Exception:
+        pass
 
     typer.echo("[5/5] Done.")
 
