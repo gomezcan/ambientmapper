@@ -197,6 +197,12 @@ def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
           .reset_index()
     )
 
+def _optint(x, default: int) -> int:
+    if isinstance(x, OptionInfo):
+        d = getattr(x, "default", None)
+        return int(d) if d is not None else int(default)
+    return int(x)
+
 # ------------------------------
 # Core math utilities
 # ------------------------------
@@ -699,6 +705,11 @@ def genotyping(
     chunk_rows: int = typer.Option(1_000_000, help="Input chunk size for streaming read."),
 ):
     """Run the two-pass pipeline: streaming posterior calc → ambient estimate → per-cell calls → optional decontam → summaries."""
+    
+    # fix OptionInfo when called programmatically from cli.py
+    shards = _optint(shards, 64)
+    chunk_rows = _optint(chunk_rows, 1_000_000)
+  
     cfg = MergeConfig(
         beta=beta, w_as=w_as, w_mapq=w_mapq, w_nm=w_nm,
         ambient_const=ambient_const, min_reads=min_reads,
