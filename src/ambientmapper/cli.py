@@ -395,10 +395,7 @@ def genotyping(
         candidate_patterns = [
             str(chunks_dir / "**" / "*filtered.tsv.gz"),
             str(chunks_dir / "**" / "*.tsv.gz"),
-            str(chunks_dir / "**" / "*.parquet"),
             str(chunks_dir / "**" / "*.csv.gz"),
-            str(chunks_dir / "**" / "*.csv"),
-            str(chunks_dir / "**" / "*.tsv"),
         ]
         matched = []
         for pat in candidate_patterns:
@@ -406,10 +403,10 @@ def genotyping(
         if not matched:
             raise typer.BadParameter(
                 f"No assign outputs found under {chunks_dir}.\n"
-                f"Expected files like 'Seedling_chunkNNN_filtered.tsv.gz'.\n"
+                f"Expected files like 'Sample_chunkNNN_filtered.tsv.gz'.\n"
                 f"Provide --assign or run the 'assign' step first."
             )
-        assign_glob = str(chunks_dir / "**" / "*")
+        assign_glob = str(chunks_dir / "**" / "*filtered.tsv.gz")
 
     if not _glob.glob(assign_glob, recursive=True):
         raise typer.BadParameter(f"No assign files matched: {assign_glob}")
@@ -417,6 +414,18 @@ def genotyping(
     if "sample" in cfg and cfg["sample"] != sample:
         typer.echo(f"[genotyping] warn: config sample={cfg['sample']} but CLI --sample={sample}")
 
+
+        # I/O hygiene
+    # Bound how many files genotyping tries to open in parallel downstream.
+    # Your genotyper already has a threads parameter; keep it smaller by default.
+    threads = max(1, int(threads))
+    if threads > 8:
+        typer.echo(f"[genotyping] capping threads from {threads} to 8 for merge memory safety")
+        threads = 8
+
+    typer.echo(f"[genotyping] sample={sample}  outdir={outdir}")
+    typer.echo(f"[genotyping] assign_glob={assign_glob}")
+    typer.echo(f"[genotyping] threads={threads}  report={'on' if make_report else 'off'}")
     typer.echo(f"[genotyping] sample={sample}  outdir={outdir}")
     typer.echo(f"[genotyping] assign_glob={assign_glob}")
     typer.echo(f"[genotyping] threads={threads}  report={'on' if make_report else 'off'}")
