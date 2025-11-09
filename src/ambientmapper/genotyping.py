@@ -267,7 +267,8 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
 
     records = []
     # Efficient group iteration
-    for (_, _), grp in df.groupby(["barcode", "read_id"], sort=False):
+    # observed=True avoids categorical cross-product expansion and silences the warning
+    for (_, _), grp in df.groupby(["barcode", "read_id"], sort=False, observed=True):    
         S, gamma, w = _fuse_support(grp, cfg)
         # ambient const mass
         amb = cfg.ambient_const
@@ -286,8 +287,8 @@ def _aggregate_expected_counts_from_chunk(Ldf: pd.DataFrame) -> Tuple[pd.DataFra
        C_chunk: per-barcode expected counts per genome: columns [barcode, genome, C]
        N_chunk: per-barcode n_reads: columns [barcode, n_reads]
     """
-    C_chunk = Ldf.groupby(["barcode", "genome"], observed=True)["L"].sum().rename("C").reset_index()
-    N_chunk = Ldf.groupby("barcode")["read_id"].nunique().rename("n_reads").reset_index()
+    C_chunk = Ldf.groupby(["barcode", "genome"], observed=True)["L"].sum().rename("C").reset_index()    
+    N_chunk = (Ldf.groupby("barcode", observed=True)["read_id"].nunique().rename("n_reads").reset_index())
     return C_chunk, N_chunk
 
 
@@ -595,7 +596,7 @@ def _write_L_chunk_to_shards(Ldf: pd.DataFrame, shard_handles: List[gzip.GzipFil
     # Ensure consistent column order
     cols = ["barcode", "read_id", "genome", "L", "L_amb"]
     Ldf = Ldf[cols].copy()
-    for bc, sub in Ldf.groupby("barcode", sort=False):
+    for bc, sub in Ldf.groupby("barcode", sort=False, observed=True):
         idx = _barcode_to_shard_idx(str(bc), shards)
         h = shard_handles[idx]
         if not write_header_flags[idx]:
@@ -646,6 +647,10 @@ def _pass1_stream_build(assign_glob: str, cfg: MergeConfig, tmp_dir: Path) -> Tu
             df = df.dropna(subset=["barcode", "read_id", "genome"])
             if df.empty:
                 continue
+            # enforce compact dtypes before the hottest path
+            df["barcode"] = df["barcode"].astype("category")
+            df["genome"]  = df["genome"].astype("category")          
+            
             # Compute L
             Ldf = _compute_read_posteriors(df, cfg)
             # Accumulate aggregations
