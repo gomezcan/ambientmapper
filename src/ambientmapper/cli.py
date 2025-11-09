@@ -419,9 +419,9 @@ def genotyping(
     # Bound how many files genotyping tries to open in parallel downstream.
     # Your genotyper already has a threads parameter; keep it smaller by default.
     threads = max(1, int(threads))
-    if threads > 8:
+    if threads > 16:
         typer.echo(f"[genotyping] capping threads from {threads} to 8 for merge memory safety")
-        threads = 8
+        threads = 16
 
     typer.echo(f"[genotyping] sample={sample}  outdir={outdir}")
     typer.echo(f"[genotyping] assign_glob={assign_glob}")
