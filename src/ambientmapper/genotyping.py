@@ -132,8 +132,8 @@ class MergeConfig(BaseModel):
     max_alpha: float = 0.5            # cap ambient fraction
     topk_genomes: int = 3             # candidate genomes per barcode
     sample: str = "sample"
-    shards: int = 32                  # number of barcode-hash shards
-    chunk_rows: int = 1_000_000       # streaming chunk size for input TSVs
+    shards: int = 128                  # number of barcode-hash shards
+    chunk_rows: int = 2_000_000       # streaming chunk size for input TSVs
 
 # ------------------------------
 # I/O helpers
