@@ -819,8 +819,9 @@ def _pass1_worker(args) -> Tuple[pd.DataFrame, pd.DataFrame, Path]:
     shard_handles = _open_shard_handles(shard_dir, cfg.shards)
     header_written = {i: False for i in range(cfg.shards)}
 
-    C_all_list: List[pd.DataFrame], N_all_list: List[pd.DataFrame]
-    C_all_list, N_all_list = [], []
+    C_all_list: List[pd.DataFrame] = []
+    N_all_list: List[pd.DataFrame] = []
+
     for raw in _iter_input_chunks(files, cfg.chunk_rows):
         try:
             df = _coerce_assign_schema(raw)
@@ -864,6 +865,7 @@ def _pass1_worker(args) -> Tuple[pd.DataFrame, pd.DataFrame, Path]:
           .sum().reset_index()
     )
     return C_all, N_all, shard_dir
+
 
 # --- Merge shards from workers into final shard set without recompression ---
 def _concat_worker_shards(worker_dirs: Sequence[Path],
