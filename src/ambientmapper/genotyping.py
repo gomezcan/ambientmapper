@@ -952,14 +952,21 @@ def genotyping(
     threads: int = typer.Option(1, help="Parallel workers for per-cell model selection (Pass 2)."),
     shards: int = typer.Option(32, help="Number of on-disk shards for pass-1 spill."),
     chunk_rows: int = typer.Option(1_000_000, help="Input chunk size for streaming read."),
-    pass1_workers: int = typer.Option(1, help="Parallel workers for Pass 1 (file-level)."),
+    pass1_workers: Optional[int] = typer.Option(None, help="Parallel workers for Pass 1 (file-level). If None, use --threads."),
+
 ):
     """Run the two-pass pipeline: streaming posterior calc → ambient estimate → per-cell calls → optional decontam → summaries."""
 
     # fix OptionInfo when called programmatically
     shards = _optint(shards, 32)
-    chunk_rows = _optint(chunk_rows, 1_000_000)
-
+    chunk_rows = _optint(chunk_rows, 2_000_000)
+    threads = max(1, int(threads))
+  
+    if pass1_workers is None:
+        pass1_workers = threads
+    else:
+        pass1_workers = max(1, int(pass1_workers))
+      
     cfg = MergeConfig(
         beta=beta,
         w_as=w_as,
