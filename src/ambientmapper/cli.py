@@ -378,7 +378,7 @@ def genotyping(
     outdir: Optional[Path] = typer.Option(None, "--outdir"),
     sample: Optional[str] = typer.Option(None, "--sample"),
     make_report: bool = typer.Option(True, "--report/--no-report"),
-    threads: int = typer.Option(1, "--threads", help="Parallel workers for per-cell model selection."),
+    threads: int = typer.Option(16, "--threads", help="Parallel workers for per-cell model selection."),
 ):
     """Posterior-aware genotyping (merge + summarize + optional post-steps)."""
     from .genotyping import genotyping as _run_genotyping
@@ -415,27 +415,28 @@ def genotyping(
         typer.echo(f"[genotyping] warn: config sample={cfg['sample']} but CLI --sample={sample}")
 
 
-        # I/O hygiene
+    # I/O hygiene
     # Bound how many files genotyping tries to open in parallel downstream.
     # Your genotyper already has a threads parameter; keep it smaller by default.
     threads = max(1, int(threads))
+    
     if threads > 16:
-        typer.echo(f"[genotyping] capping threads from {threads} to 8 for merge memory safety")
+        typer.echo(f"[genotyping] capping threads from {threads} to 16 for merge memory safety")
         threads = 16
 
     typer.echo(f"[genotyping] sample={sample}  outdir={outdir}")
     typer.echo(f"[genotyping] assign_glob={assign_glob}")
     typer.echo(f"[genotyping] threads={threads}  report={'on' if make_report else 'off'}")
-    typer.echo(f"[genotyping] sample={sample}  outdir={outdir}")
-    typer.echo(f"[genotyping] assign_glob={assign_glob}")
-    typer.echo(f"[genotyping] threads={threads}  report={'on' if make_report else 'off'}")
-
+ 
     _run_genotyping(
         assign=assign_glob,
         outdir=outdir,
         sample=sample,
         make_report=make_report,
         threads=int(threads),
+        
+        # pass same valie to pass 1 
+        pass1_workers=threads,
         # explicit numeric defaults to avoid OptionInfo leaking into pydantic:
         beta=0.5,
         w_as=1.0,
