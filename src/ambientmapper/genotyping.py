@@ -324,10 +324,10 @@ def _estimate_ambient_profile(Ldf_or_C: pd.DataFrame,
        Else expects aggregated C with columns [barcode, genome, C] and n_reads table provided separately.
     """
     if input_is_L:
-        n_by_bc = Ldf_or_C.groupby("barcode")["read_id"].nunique()
+        n_by_bc = Ldf_or_C.groupby("barcode", observed=True)["read_id"].nunique()
         empties = set(n_by_bc[n_by_bc < low_read_threshold].index)
         df_use = Ldf_or_C[Ldf_or_C["barcode"].isin(empties)] if len(empties) else Ldf_or_C
-        mix = df_use.groupby("genome")["L"].sum()
+        mix = df_use.groupby("genome", observed=True)["L"].sum()
         s = float(mix.sum())
         if s <= 0:
             mix = pd.Series(1.0, index=sorted(Ldf_or_C["genome"].unique()))
@@ -369,7 +369,7 @@ def _loglik_for_params(L_block: pd.DataFrame,
     arr_wL = w * L_block["L"].to_numpy()
     df_tmp = L_block[["read_id"]].copy()
     df_tmp["wL"] = arr_wL
-    s = df_tmp.groupby("read_id")["wL"].sum().to_numpy()
+    s = df_tmp.groupby("read_id", observed=True)["wL"].sum().to_numpy()
     s = np.clip(s, 1e-12, None)
     return float(np.log(s).sum())
 
@@ -835,7 +835,7 @@ def _pass1_worker(args) -> Tuple[pd.DataFrame, pd.DataFrame, Path]:
                    .sum().rename("C").reset_index()
             )
             N_chunk = (
-                Ldf.groupby("barcode")["read_id"]
+                Ldf.groupby("barcode", observed=True)["read_id"]
                    .nunique().rename("n_reads").reset_index()
             )
             C_all_list.append(C_chunk)
@@ -861,7 +861,7 @@ def _pass1_worker(args) -> Tuple[pd.DataFrame, pd.DataFrame, Path]:
     )
     N_all = (
         pd.concat(N_all_list, ignore_index=True)
-          .groupby("barcode")["n_reads"]
+          .groupby("barcode", observed=True)["n_reads"]
           .sum().reset_index()
     )
     return C_all, N_all, shard_dir
@@ -924,7 +924,7 @@ def _pass1_stream_build(assign_glob: str,
     )
     N_all = (
         pd.concat(N_parts, ignore_index=True)
-          .groupby("barcode")["n_reads"]
+          .groupby("barcode", observed=True)["n_reads"]
           .sum().reset_index()
     )
 
@@ -1011,7 +1011,7 @@ def genotyping(
                 chunk = chunk[chunk["barcode"].isin(low_reads)]
             if chunk.empty:
                 continue
-            add = chunk.groupby("genome")["L"].sum()
+            add = chunk.groupby("genome", observed=True)["L"].sum()
             for g, v in add.items():
                 mix[g] = mix.get(g, 0.0) + float(v)
     if not mix:
@@ -1027,7 +1027,7 @@ def genotyping(
 
     def _topk_genomes_per_barcode(C: pd.DataFrame, k: int) -> Dict[str, List[str]]:
         out: Dict[str, List[str]] = {}
-        for bc, sub in C.groupby("barcode", sort=False):
+        for bc, sub in C.groupby("barcode", sort=False, observed=True):
             top = (
                 sub.sort_values("C", ascending=False)["genome"]
                    .head(k).astype(str).tolist()
@@ -1048,7 +1048,7 @@ def genotyping(
         # Build in-memory blocks per barcode for this shard
         blocks: Dict[str, List[pd.DataFrame]] = {}
         for chunk in _iter_shard_rows(shard_fp):
-            for bc, sub in chunk.groupby("barcode", sort=False):
+            for bc, sub in chunk.groupby("barcode", sort=False, observed=True):
                 blocks.setdefault(str(bc), []).append(
                     sub[["barcode", "read_id", "genome", "L", "L_amb"]]
                 )
