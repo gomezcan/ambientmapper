@@ -379,6 +379,9 @@ def genotyping(
     sample: Optional[str] = typer.Option(None, "--sample"),
     make_report: bool = typer.Option(True, "--report/--no-report"),
     threads: int = typer.Option(16, "--threads", help="Parallel workers for per-cell model selection."),
+    chunk_rows: int = typer.Option(5_000_000, "--chunk-rows", help="Input chunk size (rows per chunk) for streaming read in pass1."),
+),
+
 ):
     """Posterior-aware genotyping (merge + summarize + optional post-steps)."""
     from .genotyping import genotyping as _run_genotyping
