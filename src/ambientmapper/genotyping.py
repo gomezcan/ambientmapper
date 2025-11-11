@@ -115,9 +115,9 @@ app = typer.Typer(add_completion=False, no_args_is_help=True)
 
 class MergeConfig(BaseModel):
     beta: float = 0.5                 # softmax temperature for score fusion
-    w_as: float = 1.0                 # weight for AS (higher better)
-    w_mapq: float = 0.5               # weight for MAPQ (higher better)
-    w_nm: float = 0.25                # weight for NM (lower better)
+    w_as: float = 0.5                 # weight for AS (higher better)
+    w_mapq: float = 1                 # weight for MAPQ (higher better)
+    w_nm: float = 1                   # weight for NM (lower better)
     ambient_const: float = 1e-3       # per-read ambient mass before renorm
     p_eps: float = 1e-3               # floor for p-value penalty gamma = max(eps,1-p)
     min_reads: int = 100              # minimum reads to attempt a confident call
