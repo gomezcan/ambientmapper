@@ -420,9 +420,9 @@ def genotyping(
     # Your genotyper already has a threads parameter; keep it smaller by default.
     threads = max(1, int(threads))
     
-    if threads > 16:
+    if threads > 32:
         typer.echo(f"[genotyping] capping threads from {threads} to 16 for merge memory safety")
-        threads = 16
+        threads = 32
 
     typer.echo(f"[genotyping] sample={sample}  outdir={outdir}")
     typer.echo(f"[genotyping] assign_glob={assign_glob}")
