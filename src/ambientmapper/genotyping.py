@@ -116,8 +116,8 @@ app = typer.Typer(add_completion=False, no_args_is_help=True)
 class MergeConfig(BaseModel):
     beta: float = 0.5                 # softmax temperature for score fusion
     w_as: float = 0.5                 # weight for AS (higher better)
-    w_mapq: float = 1                 # weight for MAPQ (higher better)
-    w_nm: float = 1                   # weight for NM (lower better)
+    w_mapq: float = 1.0               # weight for MAPQ (higher better)
+    w_nm: float = 1.0                 # weight for NM (lower better)
     ambient_const: float = 1e-3       # per-read ambient mass before renorm
     p_eps: float = 1e-3               # floor for p-value penalty gamma = max(eps,1-p)
     min_reads: int = 100              # minimum reads to attempt a confident call
@@ -131,7 +131,7 @@ class MergeConfig(BaseModel):
     max_alpha: float = 0.5            # cap ambient fraction
     topk_genomes: int = 3             # candidate genomes per barcode
     sample: str = "sample"
-    shards: int = 32                 # number of barcode-hash shards
+    shards: int = 32                  # number of barcode-hash shards
     chunk_rows: int = 5_000_000       # streaming chunk size for input TSVs
 
 # ------------------------------
@@ -319,21 +319,20 @@ def _loglik_for_params(L_block: pd.DataFrame,
                        alpha: float,
                        rho: float = 0.5) -> float:
     """Composite log-likelihood for a barcode block of rows (one per (read,genome))."""
-    genomes = L_block["genome"].unique()
-    eta_g = eta.reindex(genomes).fillna(0.0).to_numpy()
+    # eta(g) per row
+    genomes_series = L_block["genome"].astype(str)
+    eta_row = genomes_series.map(eta).fillna(0.0).to_numpy()
 
     if model == "single":
-        eta_g1 = eta.reindex([g1]).fillna(0.0).to_numpy()[0]
-        w = np.where(
-            L_block["genome"].to_numpy() == g1,
-            (1.0 - alpha) + alpha * eta_g1,
-            alpha * eta_g,
-        )
+        is_g1 = (genomes_series == g1).to_numpy()
+        # w(g) = (1-alpha) * 1[g==g1] + alpha * eta(g)
+        w = np.where(is_g1, (1.0 - alpha) + alpha * eta_row, alpha * eta_row)
     elif model == "doublet":
-        is_g1 = (L_block["genome"].to_numpy() == g1)
-        is_g2 = (L_block["genome"].to_numpy() == g2)
+        is_g1 = (genomes_series == g1).to_numpy()
+        is_g2 = (genomes_series == g2).to_numpy() if g2 is not None else np.zeros_like(is_g1, dtype=bool)
         mix = np.where(is_g1, rho, np.where(is_g2, 1.0 - rho, 0.0))
-        w = (1.0 - alpha) * mix + alpha * eta_g
+        # w(g) = (1-alpha) * mix(g) + alpha * eta(g)
+        w = (1.0 - alpha) * mix + alpha * eta_row
     else:
         raise ValueError("model must be 'single' or 'doublet'")
 
@@ -807,9 +806,9 @@ def genotyping(
     sample: str = typer.Option("sample", help="Sample name used for output filenames."),
     min_reads: int = typer.Option(100, help="Minimum reads to attempt confident calls."),
     beta: float = typer.Option(0.5, help="Softmax temperature for score fusion."),
-    w_as: float = typer.Option(1.0, help="Weight for AS."),
-    w_mapq: float = typer.Option(0.5, help="Weight for MAPQ."),
-    w_nm: float = typer.Option(0.25, help="Weight for NM (penalty)."),
+    w_as: float = typer.Option(0.5, help="Weight for AS."),
+    w_mapq: float = typer.Option(1.0, help="Weight for MAPQ."),
+    w_nm: float = typer.Option(1.0, help="Weight for NM (penalty; lower is better)."),
     ambient_const: float = typer.Option(1e-3, help="Ambient constant mass per read before normalization."),
     tau_drop: float = typer.Option(8.0, help="(unused) Posterior-odds threshold for drops."),
     topk_genomes: int = typer.Option(3, help="Number of candidate genomes per barcode to consider."),
