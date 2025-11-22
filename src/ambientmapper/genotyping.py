@@ -116,8 +116,8 @@ app = typer.Typer(add_completion=False, no_args_is_help=True)
 class MergeConfig(BaseModel):
     beta: float = 0.5                 # softmax temperature for score fusion
     w_as: float = 0.5                 # weight for AS (higher better)
-    w_mapq: float = 1.0               # weight for MAPQ (higher better)
-    w_nm: float = 1.0                 # weight for NM (lower better)
+    w_mapq: float = 1                 # weight for MAPQ (higher better)
+    w_nm: float = 1                   # weight for NM (lower better)
     ambient_const: float = 1e-3       # per-read ambient mass before renorm
     p_eps: float = 1e-3               # floor for p-value penalty gamma = max(eps,1-p)
     min_reads: int = 100              # minimum reads to attempt a confident call
@@ -131,7 +131,7 @@ class MergeConfig(BaseModel):
     max_alpha: float = 0.5            # cap ambient fraction
     topk_genomes: int = 3             # candidate genomes per barcode
     sample: str = "sample"
-    shards: int = 32                  # number of barcode-hash shards
+    shards: int = 32                 # number of barcode-hash shards
     chunk_rows: int = 5_000_000       # streaming chunk size for input TSVs
 
 # ------------------------------
@@ -319,20 +319,21 @@ def _loglik_for_params(L_block: pd.DataFrame,
                        alpha: float,
                        rho: float = 0.5) -> float:
     """Composite log-likelihood for a barcode block of rows (one per (read,genome))."""
-    # eta(g) per row
-    genomes_series = L_block["genome"].astype(str)
-    eta_row = genomes_series.map(eta).fillna(0.0).to_numpy()
+    genomes = L_block["genome"].unique()
+    eta_g = eta.reindex(genomes).fillna(0.0).to_numpy()
 
     if model == "single":
-        is_g1 = (genomes_series == g1).to_numpy()
-        # w(g) = (1-alpha) * 1[g==g1] + alpha * eta(g)
-        w = np.where(is_g1, (1.0 - alpha) + alpha * eta_row, alpha * eta_row)
+        eta_g1 = eta.reindex([g1]).fillna(0.0).to_numpy()[0]
+        w = np.where(
+            L_block["genome"].to_numpy() == g1,
+            (1.0 - alpha) + alpha * eta_g1,
+            alpha * eta_g,
+        )
     elif model == "doublet":
-        is_g1 = (genomes_series == g1).to_numpy()
-        is_g2 = (genomes_series == g2).to_numpy() if g2 is not None else np.zeros_like(is_g1, dtype=bool)
+        is_g1 = (L_block["genome"].to_numpy() == g1)
+        is_g2 = (L_block["genome"].to_numpy() == g2)
         mix = np.where(is_g1, rho, np.where(is_g2, 1.0 - rho, 0.0))
-        # w(g) = (1-alpha) * mix(g) + alpha * eta(g)
-        w = (1.0 - alpha) * mix + alpha * eta_row
+        w = (1.0 - alpha) * mix + alpha * eta_g
     else:
         raise ValueError("model must be 'single' or 'doublet'")
 
@@ -590,27 +591,60 @@ def _write_L_chunk_to_shards(Ldf: pd.DataFrame,
         # write sub as TSV without header
         sub.to_csv(h, sep="\t", header=False, index=False)
 
-
-def _iter_shard_rows(shard_fp: Path) -> Iterator[pd.DataFrame]:
-    """Yield the L rows from one shard in manageable pieces to limit memory."""
+def _iter_shard_rows(shard_fp: Path, chunksize: int = 2_000_000):
+    """
+    Stream rows from a per-read posterior shard, coercing L/L_amb to floats
+    and dropping header repeats + rows without posteriors.
+    """
     try:
         it = pd.read_csv(
             shard_fp,
             sep="\t",
             compression="gzip",
-            chunksize=2_000_000,
+            chunksize=chunksize,
             dtype={
-                "barcode": "string",
+                "barcode": "string",   # or "category" if you prefer
                 "read_id": "string",
-                "genome": "category",
-                "L": "float32",
-                "L_amb": "float32",
+                "genome": "string",    # or "category"
+                "L": "string",
+                "L_amb": "string",
             },
         )
-        for chunk in it:
-            yield chunk
     except FileNotFoundError:
         return
+
+    for chunk in it:
+        if chunk.empty:
+            continue
+
+        # 1) Drop repeated header rows inside the file
+        #    (these have literal 'barcode', 'read_id', 'genome', 'L', 'L_amb' as values)
+        is_header_like = (
+            (chunk["barcode"] == "barcode")
+            & (chunk["read_id"] == "read_id")
+        )
+        if is_header_like.any():
+            chunk = chunk[~is_header_like]
+
+        if chunk.empty:
+            continue
+
+        # 2) Coerce L / L_amb → numeric; invalid tokens -> NaN
+        chunk["L"] = pd.to_numeric(chunk["L"], errors="coerce")
+        chunk["L_amb"] = pd.to_numeric(chunk["L_amb"], errors="coerce")
+
+        # 3) Keep only rows with valid posteriors for downstream use
+        mask_valid = chunk["L"].notna() & chunk["L_amb"].notna()
+        if not mask_valid.any():
+            continue
+
+        chunk = chunk.loc[mask_valid].copy()
+
+        # Optional: downcast to float32 to save memory
+        chunk["L"] = chunk["L"].astype("float32")
+        chunk["L_amb"] = chunk["L_amb"].astype("float32")
+
+        yield chunk
 
 
 def _process_barcode_group(bc: str,
@@ -806,9 +840,9 @@ def genotyping(
     sample: str = typer.Option("sample", help="Sample name used for output filenames."),
     min_reads: int = typer.Option(100, help="Minimum reads to attempt confident calls."),
     beta: float = typer.Option(0.5, help="Softmax temperature for score fusion."),
-    w_as: float = typer.Option(0.5, help="Weight for AS."),
-    w_mapq: float = typer.Option(1.0, help="Weight for MAPQ."),
-    w_nm: float = typer.Option(1.0, help="Weight for NM (penalty; lower is better)."),
+    w_as: float = typer.Option(1.0, help="Weight for AS."),
+    w_mapq: float = typer.Option(0.5, help="Weight for MAPQ."),
+    w_nm: float = typer.Option(0.25, help="Weight for NM (penalty)."),
     ambient_const: float = typer.Option(1e-3, help="Ambient constant mass per read before normalization."),
     tau_drop: float = typer.Option(8.0, help="(unused) Posterior-odds threshold for drops."),
     topk_genomes: int = typer.Option(3, help="Number of candidate genomes per barcode to consider."),
