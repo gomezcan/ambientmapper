@@ -301,37 +301,65 @@ def _aggregate_expected_counts_from_chunk(Ldf: pd.DataFrame) -> Tuple[pd.DataFra
     return C_chunk, N_chunk
 
 
-def _loglik_for_params(L_block: pd.DataFrame,
-                       eta: pd.Series,
-                       model: str,
-                       g1: str,
-                       g2: Optional[str],
-                       alpha: float,
-                       rho: float = 0.5) -> float:
-    """Composite log-likelihood for a barcode block of rows (one per (read,genome))."""
-    genomes = L_block["genome"].unique()
-    eta_g = eta.reindex(genomes).fillna(0.0).to_numpy()
+def _loglik_for_params(
+    L_block: pd.DataFrame,
+    eta: pd.Series,
+    model: str,
+    g1: str,
+    g2: Optional[str],
+    alpha: float,
+    rho: float = 0.5,
+) -> float:
+    """
+    Composite log-likelihood for a barcode block of rows (one per (read,genome)).
+
+    L_block: columns at least ["read_id", "genome", "L"]
+    eta    : ambient profile indexed by genome name (probabilities)
+    """
+    # Per-row genome labels
+    genomes = L_block["genome"].astype(str)
+    # Ambient probability per row genome
+    eta_row = eta.reindex(genomes).fillna(0.0).to_numpy()
 
     if model == "single":
-        eta_g1 = eta.reindex([g1]).fillna(0.0).to_numpy()[0]
+        # ambient prob for the primary genome
+        eta_g1 = float(eta.get(g1, 0.0))
+        is_g1 = (genomes.to_numpy() == g1)
+
+        # For the main genome: (1 - alpha) signal + alpha * ambient(g1)
+        # For other genomes: purely ambient
         w = np.where(
-            L_block["genome"].to_numpy() == g1,
+            is_g1,
             (1.0 - alpha) + alpha * eta_g1,
-            alpha * eta_g,
+            alpha * eta_row,
         )
+
     elif model == "doublet":
-        is_g1 = (L_block["genome"].to_numpy() == g1)
-        is_g2 = (L_block["genome"].to_numpy() == g2)
+        if g2 is None:
+            raise ValueError("doublet model requires g2 != None")
+
+        is_g1 = (genomes.to_numpy() == g1)
+        is_g2 = (genomes.to_numpy() == g2)
+
+        # mixture of two genomes for the signal component
         mix = np.where(is_g1, rho, np.where(is_g2, 1.0 - rho, 0.0))
-        w = (1.0 - alpha) * mix + alpha * eta_g
+
+        # Total weight: signal mixture + ambient
+        w = (1.0 - alpha) * mix + alpha * eta_row
+
     else:
         raise ValueError("model must be 'single' or 'doublet'")
 
-    arr_wL = w * L_block["L"].to_numpy()
+    # Combine with per-read posteriors L
+    L_vals = L_block["L"].to_numpy()
+    arr_wL = w * L_vals
+
+    # Sum over genomes per read, then log-sum
     df_tmp = L_block[["read_id"]].copy()
     df_tmp["wL"] = arr_wL
     s = df_tmp.groupby("read_id", observed=True)["wL"].sum().to_numpy()
     s = np.clip(s, 1e-12, None)
+
     return float(np.log(s).sum())
 
 
