@@ -563,7 +563,7 @@ def _select_model_for_barcode(L_block: pd.DataFrame,
 def _write_gzip_df(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(path, "wt") as f:
-        df.to_csv(f, index=False)
+        df.to_csv(f, sep="\t", index=False)
 
 # ------------------------------
 # Two-pass streaming helpers
