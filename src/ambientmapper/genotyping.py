@@ -71,19 +71,14 @@ Notes
 from __future__ import annotations
 
 import gzip
-import json
 import math
-import os
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Any
 from concurrent.futures import ProcessPoolExecutor
 import glob
 import hashlib
-import tempfile
 import shutil
 import warnings
-from itertools import islice
-from typing import Set
 
 import numpy as np
 import pandas as pd
@@ -265,12 +260,7 @@ def _fuse_support(df_grp: pd.DataFrame, cfg: MergeConfig) -> Tuple[np.ndarray, n
 
 
 def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame:
-    """Compute per-read soft posteriors L_{r,g} from assign rows.
-
-    Input df columns must include REQUIRED_COLS and ideally some SCORE_COLS and/or PVAL_COLS.
-    Output DataFrame has columns: barcode, read_id, genome, L (posterior), L_amb (same for all rows of a read),
-    and any passthrough columns present in input.
-    """
+    """Compute per-read soft posteriors L_{r,g} from assign rows."""
     missing = REQUIRED_COLS - set(df.columns)
     if missing:
         raise ValueError(f"assign table missing required columns: {missing}")
@@ -296,9 +286,9 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
 
 
 def _aggregate_expected_counts_from_chunk(Ldf: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Return two frames:
-       C_chunk: per-barcode expected counts per genome: columns [barcode, genome, C]
-       N_chunk: per-barcode n_reads: columns [barcode, n_reads]
+    """Return:
+       C_chunk: per-barcode expected counts per genome: [barcode, genome, C]
+       N_chunk: per-barcode n_reads: [barcode, n_reads]
     """
     C_chunk = (
         Ldf.groupby(["barcode", "genome"], observed=True)["L"]
@@ -561,8 +551,7 @@ def _open_shard_handles(shard_dir: Path, shards: int) -> List[gzip.GzipFile]:
     handles: List[gzip.GzipFile] = []
     for i in range(shards):
         fp = shard_dir / f"shard_{i:02d}.tsv.gz"
-        # open in append-text mode
-        handles.append(gzip.open(fp, "at"))
+        handles.append(gzip.open(fp, "at"))  # append-text mode
     return handles
 
 
@@ -578,8 +567,6 @@ def _write_L_chunk_to_shards(Ldf: pd.DataFrame,
                              shard_handles: List[gzip.GzipFile],
                              shards: int,
                              write_header_flags: Dict[int, bool]) -> None:
-    # write rows to shard by barcode-hash. Keep a small header tracker per shard.
-    # Ensure consistent column order
     cols = ["barcode", "read_id", "genome", "L", "L_amb"]
     Ldf = Ldf[cols].copy()
     for bc, sub in Ldf.groupby("barcode", sort=False, observed=True):
@@ -588,7 +575,6 @@ def _write_L_chunk_to_shards(Ldf: pd.DataFrame,
         if not write_header_flags[idx]:
             h.write("\t".join(cols) + "\n")
             write_header_flags[idx] = True
-        # write sub as TSV without header
         sub.to_csv(h, sep="\t", header=False, index=False)
 
 
@@ -618,7 +604,6 @@ def _iter_shard_rows(shard_fp: Path, chunksize: int = 2_000_000):
         if chunk.empty:
             continue
 
-        # Drop repeated header rows inside the file
         is_header_like = (
             (chunk["barcode"] == "barcode")
             & (chunk["read_id"] == "read_id")
@@ -629,18 +614,14 @@ def _iter_shard_rows(shard_fp: Path, chunksize: int = 2_000_000):
         if chunk.empty:
             continue
 
-        # Coerce L / L_amb → numeric; invalid tokens -> NaN
         chunk["L"] = pd.to_numeric(chunk["L"], errors="coerce")
         chunk["L_amb"] = pd.to_numeric(chunk["L_amb"], errors="coerce")
 
-        # Keep only rows with valid posteriors
         mask_valid = chunk["L"].notna() & chunk["L_amb"].notna()
         if not mask_valid.any():
             continue
 
         chunk = chunk.loc[mask_valid].copy()
-
-        # Downcast to float32 to save memory
         chunk["L"] = chunk["L"].astype("float32")
         chunk["L_amb"] = chunk["L_amb"].astype("float32")
 
@@ -657,7 +638,7 @@ def _process_barcode_group(bc: str,
     best["notes"] = ""
     return best
 
-# --- narrow columns early: place near DTYPES/NEEDED_COLS ---
+# --- narrow columns early ---
 READ_COLS = [
     "BC",
     "Read",
@@ -674,7 +655,7 @@ READ_COLS = [
     "p_mq",
 ]  # tolerate pre-coerced
 
-# --- helper: file listing once ---
+
 def _list_input_files(assign_glob: str) -> List[Path]:
     return [
         Path(p)
@@ -685,7 +666,7 @@ def _list_input_files(assign_glob: str) -> List[Path]:
         or p.endswith(".tsv")
     ]
 
-# --- faster chunk iterator: only needed columns, bigger chunks, C engine ---
+
 def _iter_input_chunks(files: Sequence[Path],
                        chunk_rows: int) -> Iterator[pd.DataFrame]:
     for fp in files:
@@ -736,7 +717,6 @@ def _pass1_worker(args) -> Tuple[pd.DataFrame, pd.DataFrame, Path]:
 
     _close_shard_handles(shard_handles)
     if not C_all_list:
-        # empty sentinel
         return (
             pd.DataFrame(columns=["barcode", "genome", "C"]),
             pd.DataFrame(columns=["barcode", "n_reads"]),
@@ -756,7 +736,6 @@ def _pass1_worker(args) -> Tuple[pd.DataFrame, pd.DataFrame, Path]:
     return C_all, N_all, shard_dir
 
 
-# --- Merge shards from workers into final shard set without recompression ---
 def _concat_worker_shards(worker_dirs: Sequence[Path],
                           final_dir: Path,
                           shards: int) -> None:
@@ -771,7 +750,7 @@ def _concat_worker_shards(worker_dirs: Sequence[Path],
                 with gzip.open(part, "rb") as fin:
                     shutil.copyfileobj(fin, fout)
 
-# --- Pass 1 dispatcher: can go parallel over files ---
+
 def _pass1_stream_build(assign_glob: str,
                         cfg: MergeConfig,
                         tmp_dir: Path,
@@ -781,11 +760,9 @@ def _pass1_stream_build(assign_glob: str,
         raise FileNotFoundError(f"No assign files found for pattern: {assign_glob}")
 
     if pass1_workers <= 1:
-        # single-worker path reuses worker logic
         C_all, N_all, shard_dir = _pass1_worker((files, cfg.model_dump(), 0, tmp_dir))
         return C_all, N_all, shard_dir
 
-    # split file list across workers
     chunks: List[List[Path]] = [[] for _ in range(pass1_workers)]
     for i, fp in enumerate(files):
         chunks[i % pass1_workers].append(fp)
@@ -805,7 +782,6 @@ def _pass1_stream_build(assign_glob: str,
             N_parts.append(N_i)
             worker_dirs.append(shard_dir_i)
 
-    # reduce aggregations
     C_all = (
         pd.concat(C_parts, ignore_index=True)
           .groupby(["barcode", "genome"], observed=True)["C"]
@@ -817,7 +793,6 @@ def _pass1_stream_build(assign_glob: str,
           .sum().reset_index()
     )
 
-    # merge per-worker shard trees into one final shard tree
     final_shard_dir = tmp_dir / "L_shards"
     _concat_worker_shards(worker_dirs, final_shard_dir, cfg.shards)
     return C_all, N_all, final_shard_dir
@@ -836,17 +811,11 @@ def _process_shard_worker(args: Tuple[
     ----------
     args : tuple
         (shard_fp, cfg, topk, eta)
-
-    Returns
-    -------
-    rows : list of dict
-        One dict per barcode with genotype call and QC metrics.
     """
     shard_fp, cfg, topk, eta = args
 
     local_rows: List[Dict[str, Any]] = []
 
-    # Build in-memory blocks per barcode for this shard
     blocks: Dict[str, List[pd.DataFrame]] = {}
     for chunk in _iter_shard_rows(shard_fp, chunksize=cfg.chunk_rows):
         for bc, sub in chunk.groupby("barcode", sort=False, observed=True):
@@ -875,9 +844,9 @@ def genotyping(
     sample: str = typer.Option("sample", help="Sample name used for output filenames."),
     min_reads: int = typer.Option(100, help="Minimum reads to attempt confident calls."),
     beta: float = typer.Option(0.5, help="Softmax temperature for score fusion."),
-    w_as: float = typer.Option(1.0, help="Weight for AS."),
-    w_mapq: float = typer.Option(0.5, help="Weight for MAPQ."),
-    w_nm: float = typer.Option(0.25, help="Weight for NM (penalty)."),
+    w_as: float = typer.Option(0.5, help="Weight for AS."),
+    w_mapq: float = typer.Option(1.0, help="Weight for MAPQ."),
+    w_nm: float = typer.Option(1.0, help="Weight for NM (penalty, lower is better)."),
     ambient_const: float = typer.Option(1e-3, help="Ambient constant mass per read before normalization."),
     tau_drop: float = typer.Option(8.0, help="(unused) Posterior-odds threshold for drops."),
     topk_genomes: int = typer.Option(3, help="Number of candidate genomes per barcode to consider."),
@@ -897,7 +866,6 @@ def genotyping(
     else:
         pass1_workers = max(1, int(pass1_workers))
 
-    # Use MergeConfig defaults for w_* unless overridden later
     cfg = MergeConfig(
         beta=beta,
         w_as=w_as,
@@ -944,7 +912,6 @@ def genotyping(
             for g, v in add.items():
                 mix[g] = mix.get(g, 0.0) + float(v)
     if not mix:
-        # Fallback: uniform
         genomes = sorted(C_all["genome"].unique())
         eta = pd.Series({g: 1.0 / len(genomes) for g in genomes})
     else:
@@ -1008,7 +975,7 @@ def genotyping(
 
     calls["status_flag"] = calls["call"].astype(str).map(_status_flag)
 
-    # Legacy-compatible summary (PASS_by_mapping)
+    # Legacy-compatible summary
     legacy = calls.copy()
     legacy["AssignedGenome"] = legacy["best_genome"].fillna("")
     pass_mask = legacy["call"].isin(["single", "doublet", "indistinguishable"])
