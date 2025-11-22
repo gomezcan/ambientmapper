@@ -75,8 +75,8 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Any
+from concurrent.futures import ProcessPoolExecutor
 import glob
 import hashlib
 import tempfile
@@ -116,8 +116,8 @@ app = typer.Typer(add_completion=False, no_args_is_help=True)
 class MergeConfig(BaseModel):
     beta: float = 0.5                 # softmax temperature for score fusion
     w_as: float = 0.5                 # weight for AS (higher better)
-    w_mapq: float = 1                 # weight for MAPQ (higher better)
-    w_nm: float = 1                   # weight for NM (lower better)
+    w_mapq: float = 1.0               # weight for MAPQ (higher better)
+    w_nm: float = 1.0                 # weight for NM (lower better; used as penalty)
     ambient_const: float = 1e-3       # per-read ambient mass before renorm
     p_eps: float = 1e-3               # floor for p-value penalty gamma = max(eps,1-p)
     min_reads: int = 100              # minimum reads to attempt a confident call
@@ -131,7 +131,7 @@ class MergeConfig(BaseModel):
     max_alpha: float = 0.5            # cap ambient fraction
     topk_genomes: int = 3             # candidate genomes per barcode
     sample: str = "sample"
-    shards: int = 32                 # number of barcode-hash shards
+    shards: int = 32                  # number of barcode-hash shards
     chunk_rows: int = 5_000_000       # streaming chunk size for input TSVs
 
 # ------------------------------
@@ -591,6 +591,7 @@ def _write_L_chunk_to_shards(Ldf: pd.DataFrame,
         # write sub as TSV without header
         sub.to_csv(h, sep="\t", header=False, index=False)
 
+
 def _iter_shard_rows(shard_fp: Path, chunksize: int = 2_000_000):
     """
     Stream rows from a per-read posterior shard, coercing L/L_amb to floats
@@ -603,9 +604,9 @@ def _iter_shard_rows(shard_fp: Path, chunksize: int = 2_000_000):
             compression="gzip",
             chunksize=chunksize,
             dtype={
-                "barcode": "string",   # or "category" if you prefer
+                "barcode": "string",
                 "read_id": "string",
-                "genome": "string",    # or "category"
+                "genome": "string",
                 "L": "string",
                 "L_amb": "string",
             },
@@ -617,8 +618,7 @@ def _iter_shard_rows(shard_fp: Path, chunksize: int = 2_000_000):
         if chunk.empty:
             continue
 
-        # 1) Drop repeated header rows inside the file
-        #    (these have literal 'barcode', 'read_id', 'genome', 'L', 'L_amb' as values)
+        # Drop repeated header rows inside the file
         is_header_like = (
             (chunk["barcode"] == "barcode")
             & (chunk["read_id"] == "read_id")
@@ -629,18 +629,18 @@ def _iter_shard_rows(shard_fp: Path, chunksize: int = 2_000_000):
         if chunk.empty:
             continue
 
-        # 2) Coerce L / L_amb → numeric; invalid tokens -> NaN
+        # Coerce L / L_amb → numeric; invalid tokens -> NaN
         chunk["L"] = pd.to_numeric(chunk["L"], errors="coerce")
         chunk["L_amb"] = pd.to_numeric(chunk["L_amb"], errors="coerce")
 
-        # 3) Keep only rows with valid posteriors for downstream use
+        # Keep only rows with valid posteriors
         mask_valid = chunk["L"].notna() & chunk["L_amb"].notna()
         if not mask_valid.any():
             continue
 
         chunk = chunk.loc[mask_valid].copy()
 
-        # Optional: downcast to float32 to save memory
+        # Downcast to float32 to save memory
         chunk["L"] = chunk["L"].astype("float32")
         chunk["L_amb"] = chunk["L_amb"].astype("float32")
 
@@ -726,14 +726,7 @@ def _pass1_worker(args) -> Tuple[pd.DataFrame, pd.DataFrame, Path]:
             if df.empty:
                 continue
             Ldf = _compute_read_posteriors(df, cfg)
-            C_chunk = (
-                Ldf.groupby(["barcode", "genome"], observed=True)["L"]
-                   .sum().rename("C").reset_index()
-            )
-            N_chunk = (
-                Ldf.groupby("barcode", observed=True)["read_id"]
-                   .nunique().rename("n_reads").reset_index()
-            )
+            C_chunk, N_chunk = _aggregate_expected_counts_from_chunk(Ldf)
             C_all_list.append(C_chunk)
             N_all_list.append(N_chunk)
             _write_L_chunk_to_shards(Ldf, shard_handles, cfg.shards, header_written)
@@ -829,6 +822,48 @@ def _pass1_stream_build(assign_glob: str,
     _concat_worker_shards(worker_dirs, final_shard_dir, cfg.shards)
     return C_all, N_all, final_shard_dir
 
+
+def _process_shard_worker(args: Tuple[
+    Path,          # shard_fp
+    MergeConfig,   # cfg
+    Dict[str, List[str]],  # topk
+    pd.Series,     # eta
+]) -> List[Dict[str, Any]]:
+    """
+    Top-level worker for pass-2 per-cell model selection.
+
+    Parameters
+    ----------
+    args : tuple
+        (shard_fp, cfg, topk, eta)
+
+    Returns
+    -------
+    rows : list of dict
+        One dict per barcode with genotype call and QC metrics.
+    """
+    shard_fp, cfg, topk, eta = args
+
+    local_rows: List[Dict[str, Any]] = []
+
+    # Build in-memory blocks per barcode for this shard
+    blocks: Dict[str, List[pd.DataFrame]] = {}
+    for chunk in _iter_shard_rows(shard_fp, chunksize=cfg.chunk_rows):
+        for bc, sub in chunk.groupby("barcode", sort=False, observed=True):
+            blocks.setdefault(str(bc), []).append(
+                sub[["barcode", "read_id", "genome", "L", "L_amb"]]
+            )
+
+    for bc, parts in blocks.items():
+        L_block = pd.concat(parts, ignore_index=True)
+        cand = topk.get(bc, [])
+        if not cand or L_block.empty:
+            continue
+        best = _process_barcode_group(bc, L_block, cand, eta, cfg)
+        local_rows.append(best)
+
+    return local_rows
+
 # ------------------------------
 # Main driver
 # ------------------------------
@@ -862,6 +897,7 @@ def genotyping(
     else:
         pass1_workers = max(1, int(pass1_workers))
 
+    # Use MergeConfig defaults for w_* unless overridden later
     cfg = MergeConfig(
         beta=beta,
         w_as=w_as,
@@ -932,38 +968,25 @@ def genotyping(
 
     # ---------------- Pass 2 ----------------
     typer.echo("[4/5] Pass 2: per-cell model selection over shards")
-    rows: List[Dict] = []
-
-    def _process_shard(shard_fp: Path) -> List[Dict]:
-        local_rows: List[Dict] = []
-        # Build in-memory blocks per barcode for this shard
-        blocks: Dict[str, List[pd.DataFrame]] = {}
-        for chunk in _iter_shard_rows(shard_fp):
-            for bc, sub in chunk.groupby("barcode", sort=False, observed=True):
-                blocks.setdefault(str(bc), []).append(
-                    sub[["barcode", "read_id", "genome", "L", "L_amb"]]
-                )
-        for bc, parts in blocks.items():
-            L_block = pd.concat(parts, ignore_index=True)
-            cand = topk.get(bc, [])
-            if not cand or L_block.empty:
-                continue
-            best = _process_barcode_group(bc, L_block, cand, eta, cfg)
-            local_rows.append(best)
-        return local_rows
 
     shard_files = sorted(shard_dir.glob("shard_*.tsv.gz"))
+    worker_args = [(fp, cfg, topk, eta) for fp in shard_files]
+
+    rows: List[Dict[str, Any]] = []
+
     if threads <= 1:
-        for fp in tqdm(shard_files, desc="[pass2] shards"):
-            r = _process_shard(fp)
-            rows.extend(r)
+        for args in tqdm(worker_args, desc="[pass2] shards"):
+            shard_rows = _process_shard_worker(args)
+            rows.extend(shard_rows)
     else:
         typer.echo(f"   → using {threads} workers at shard level")
         with ProcessPoolExecutor(max_workers=threads) as ex:
-            futures = [ex.submit(_process_shard, fp) for fp in shard_files]
-            for fut in tqdm(as_completed(futures), total=len(futures)):
-                r = fut.result()
-                rows.extend(r)
+            for shard_rows in tqdm(
+                ex.map(_process_shard_worker, worker_args),
+                total=len(worker_args),
+                desc="[pass2] shards",
+            ):
+                rows.extend(shard_rows)
 
     calls = pd.DataFrame(rows)
 
