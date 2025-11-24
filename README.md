@@ -1,22 +1,72 @@
 # ambientmapper
-Ambient contamination cleaning for multi-genome mapping (single-cell, scifi-ATAC)
+
+Ambient contamination–aware multi-genome genotyping for single-cell libraries (scifi-ATAC, sci-ATAC, 10x-style, etc.)
 
 ![tests](https://github.com/gomezcan/ambientmapper/actions/workflows/tests.yml/badge.svg)
 
+`ambientmapper` takes reads mapped to multiple reference genomes and:
+
+1. Normalizes barcodes across genomes.
+2. Builds ECDF-based models of winner-vs-runner-up score deltas (AS / MAPQ / NM).
+3. Scores each read across all genomes, including a dominance filter for locally ambiguous alignments.
+4. Computes per-read posteriors L(r,g) and estimates an ambient profile across genomes.
+5. Performs per-barcode model selection (single vs doublet vs ambiguous) under an ambient-aware likelihood.
+
+End-to-end pipeline:
+
+```
+extract → filter → chunks → assign → genotyping (→ optional summary/interpool, experimental)
+```
+
+---
+
 ## Requirements
 
-**OS:** Linux or macOS (Apple Silicon and x86_64 supported)\
-**Python:** 3.9–3.12 (tested in CI)\
-**CPU/RAM:** scales with your data; start with ≥8 threads and ≥16–32 GB RAM for comfortable chunking\
-**Disk:** enough for temporary QC TSVs and the final *.tsv.gz (can be 10s–100s of GB for large runs)\
-**External tools (optional):**\
-  -samtools (optional) – not required by ambientmapper, but handy for sanity checks\
-**Not required:** GPU/CUDA\
-Parallelism is controlled by the CLI flag --threads (used for both per-genome and per-chunk steps). Chunk size is set in your sample JSON (chunk_size_cells).
+**OS:** Linux or macOS (Apple Silicon and x86_64 tested in CI)
 
+**Python:** 3.9–3.12
 
-## Install
+**CPU/RAM:**
+
+* Scales with your data and number of genomes.
+* For typical scifi-ATAC pools with 5–10 genomes:
+
+  * Start with ≥8 threads and ≥16–32 GB RAM.
+  * Use smaller `chunk_size_cells` and `assign.chunksize` if you hit memory limits.
+
+**Disk:**
+
+* Needs space for:
+
+  * Per-genome QC TSVs (`qc/`, `filtered_QCFiles/`),
+  * Chunk barcode lists and assign outputs,
+  * Genotyping outputs under `final/`.
+* Expect 10s–100s of GB for large experiments.
+
+**External tools (optional):**
+
+* `samtools` – not required by `ambientmapper` itself, but useful to prepare BAMs and for sanity checks.
+
+**Not required:** GPU / CUDA.
+
+**BAM expectations:**
+
+* Coordinate-sorted and indexed BAMs, one per genome.
+* Per-read tags:
+
+  * Barcodes in `CB` or `BC`.
+  * Alignment score: `AS`.
+  * Edit distance / mismatches: `NM`.
+  * Mapping quality: `MAPQ`.
+  * Optional multi-hit tag: `XA` (used to count alternative alignments).
+* Reads from all genomes must share the same **raw barcode sequence**; `ambientmapper` will normalize barcodes across genomes.
+
+---
+
+## Installation
+
 ### Option A — New conda environment (recommended)
+
 ```bash
 mamba create -n ambientmapper -c conda-forge -c bioconda python=3.11 pip samtools
 mamba activate ambientmapper
@@ -38,58 +88,124 @@ conda config --add channels conda-forge
 conda config --add channels bioconda
 conda config --set channel_priority strict
 
-# install (from the repo you cloned)
+# install from local clone
 pip install -e /path/to/ambientmapper
-# or straight from GitHub
+# or directly from GitHub
 pip install "git+https://github.com/gomezcan/ambientmapper.git"
 ```
 
 ### Uninstall
-```
+
+```bash
 pip uninstall -y ambientmapper
 ```
 
+---
 
 ## Output directory layout
-all outputs live under: 
 
-```perl
+All outputs live under:
+
+```
 <workdir>/<sample>/
-├─ qc/                              # per-genome raw QC
-├─ filtered_QCFiles/                # per-genome filtered/collapsed QC
-├─ cell_map_ref_chunks/             # barcode chunks + per-chunk winners
-├─ final/<sample>_per_read_winner.tsv.gz
-├─ Plots/<sample>_contamination_correction_summary.pdf
-├─ <sample>_BCs_PASS_by_mapping.csv           # BCs assigned to in-pool genome
-└─ Reads_to_discard_<sample>.csv              # reads where winner ≠ assigned genome
 ```
 
-## Running the pipeline
-You can run **end-to-end** (*extract → filter → chunks → assign → merge*) and optionally **summarize**.
+Typical layout for a completed run:
 
-### One Step. Mode A — Inline one sample
+```
+<workdir>/<sample>/
+├─ qc/                                   # per-genome raw QC (extract)
+│   ├─ <genome1>_QCMapping.txt
+│   └─ <genome2>_QCMapping.txt
+├─ filtered_QCFiles/                     # per-genome filtered/collapsed QC (filter)
+│   ├─ filtered_<genome1>_QCMapping.txt
+│   └─ filtered_<genome2>_QCMapping.txt
+├─ cell_map_ref_chunks/                  # barcode chunk files + per-chunk assign outputs
+│   ├─ <sample>_cell_map_ref_chunk_1.txt
+│   ├─ <sample>_cell_map_ref_chunk_2.txt
+│   ├─ ...
+│   ├─ <sample>_chunk1_filtered.tsv.gz   # assign-streaming outputs, one per chunk
+│   └─ <sample>_chunk2_filtered.tsv.gz
+├─ raw_cell_map_ref_chunks/              # optional per-chunk raw scoring tables (assign)
+│   ├─ <sample>_chunk1_raw.tsv.gz
+│   └─ <sample>_chunk2_raw.tsv.gz
+├─ ExplorationReadLevel/                 # global models learned from all chunks
+│   ├─ global_edges.npz                  # decile boundaries for AS & MAPQ
+│   └─ global_ecdf.npz                   # per-decile ΔAS / ΔMAPQ ECDF model
+├─ final/
+│   ├─ <sample>_cells_calls.tsv.gz       # main per-barcode genotyping calls
+│   ├─ <sample>_BCs_PASS_by_mapping.csv  # compact summary: barcode, AssignedGenome, call, purity, n_reads
+│   ├─ <sample>_expected_counts_by_genome.csv  # expected counts C(b,g)
+│   └─ generation.json                   # generation counter (used by some higher-level tools)
+├─ _sentinels/                           # per-step sentinel JSON files for resumable runs
+│   ├─ extract.ok
+│   ├─ filter.ok
+│   ├─ chunks.ok
+│   ├─ assign.ok
+│   └─ genotyping.ok
+└─ (tmp_*/ directories are created during genotyping and removed on success)
+```
+
+The core outputs for downstream analysis are:
+
+* `final/<sample>_cells_calls.tsv.gz`
+* `final/<sample>_BCs_PASS_by_mapping.csv`
+* `final/<sample>_expected_counts_by_genome.csv`
+
+---
+
+## Run whole pipeline
+You can run `ambientmapper` in three main ways:
+
+1. **Inline, single sample** (Mode A).
+2. **JSON config per sample** (Mode B).
+3. **TSV table for many samples** (Mode C).
+
+In all cases, the pipeline executes:
+
+```
+extract → filter → chunks → assign → genotyping
+```
+
+### Mode A — Inline, one sample
+
 ```bash
 ambientmapper run \
   --sample B73Mo17_rep1 \
   --genome B73,Mo17 \
-  --bam /data/SC1_P1/B73.bam,/data/B73Mo17_rep1/Mo17.bam \
+  --bam /data/B73Mo17_rep1/B73.bam,/data/B73Mo17_rep1/Mo17.bam \
   --workdir /scratch/ambient_out \
-  --min-barcode-freq 5 \
-  --chunk-size-cells 1000 \
+  --min-barcode-freq 10 \
+  --chunk-size-cells 5000 \
   --threads 16 \
-  --with-summary \
   --xa-max 2
 ```
 
-### One Step. Mode B — JSON config
-configs/example.json
+Key options (top-level):
+
+* `--sample` — logical sample / pool name.
+* `--genome` — comma-separated genome IDs.
+* `--bam` — comma-separated BAM paths.
+* `--workdir` — output root.
+* `--min-barcode-freq` — minimum reads per barcode.
+* `--chunk-size-cells` — approximate number of barcodes per chunk.
+* `--threads` — global parallelism knob.
+* `--xa-max` — maximum allowed `XAcount`.
+
+### Mode B — JSON config per sample
+
+Create ```configs/example.json:```
+
 ```json
 {
   "sample": "B73Mo17_rep1",
+  "workdir": "/scratch/ambient_out",
   "genomes": {
     "B73":  "/data/B73Mo17_rep1/B73Mo17_rep1_A1_B73_scifiATAC.mq20.BC.rmdup.mm.bam",
     "Mo17": "/data/B73Mo17_rep1/B73Mo17_rep1_A1_Mo17_scifiATAC.mq20.BC.rmdup.mm.bam"
   },
+  "min_barcode_freq": 10,
+  "chunk_size_cells": 5000,
   "assign": {
     "alpha": 0.05,
     "k": 10,
@@ -102,209 +218,329 @@ configs/example.json
   }
 }
 ```
-run
+
+Run:
 ```bash
-ambientmapper run --config configs/SC1_P1.json \
+ambientmapper run \
+  --config configs/example.json \
   --threads 16 \
-  --with-summary \
   --xa-max 2
 
 ```
 
-### One Step. Mode C — TSV for many samples
-configs/samples.tsv (tab-separated; one row per **(sample, genome)**)
 
-```ts
+### Mode C — TSV for many samples
+
+You can supply a TSV where each row represents **one genome BAM for a given sample**. Required lowercase headers:
+
+```
+sample    genome    bam    workdir
+```
+
+Example:
+
+```
 sample        genome  bam                         workdir
-B73Mo17_rep1  B73     /data/SC1_P1/B73.bam       /scratch/ambient_out
-SB73Mo17_rep1 Mo17    /data/SC1_P1/Mo17.bam      /scratch/ambient_out
-B73Mo17_rep1  B73     /data/SC1_P2/B73.bam       /scratch/ambient_out
-B73Mo17_rep1  Mo17    /data/SC1_P2/Mo17.bam      /scratch/ambient_out
+PoolA         B73     /bam/B73.bam                /scratch/out
+PoolA         Mo17    /bam/Mo17.bam               /scratch/out
+PoolB         B73     /bam/B73.bam                /scratch/out
+PoolB         W22     /bam/W22.bam                /scratch/out
 ```
-run
+
+Run:
+
 ```bash
 ambientmapper run \
   --configs configs/samples.tsv \
-  --min-barcode-freq 10 \
-  --chunk-size-cells 1000 \
-  --threads 16 \
-  --with-summary \
-  --xa-max 2
-```
-
-## Two steps (recommended): per-pool then inter-pool
-
-If your library is split into **pools** (e.g. plates/wells with subsets of genotypes), treat **each pool as its own sample.**
-Run each pool end-to-end; the summary treats the genomes listed for that sample as the **in-pool** set.
-Then, optionally, run an **inter-pool** comparison across multiple pools.
-
-
-### 1) Per-pool run (one pool = one sample)
-```bash
-ambientmapper run \
-  --sample B73Mo17_A \
-  --genome B73,Mo17 \
-  --bam /bam/B73.bam,/bam/Mo17.bam \
-  --workdir ./ambient_out \
   --min-barcode-freq 10 \
   --chunk-size-cells 5000 \
-  --threads 16 \
-  --with-summary \
-  --xa-max 2
-```
-Repeat for other pools (e.g. B73Mo17_A, B73Mo17_B, …).
-
-### 2) Inter-pool comparison (after multiple pools are run)
-Use a TSV listing all pool runs. **Headers must be lowercase** and include these columns:
-
-configs/samples.tsv
-
-```tsv
-sample      genome   bam                 workdir
-B73Mo17_A   B73     /bam/B73.bam        ./ambient_out
-B73Mo17_A   Mo17    /bam/Mo17.bam       ./ambient_out
-B73Mo17_B   B73     /bam/B73.bam        ./ambient_out
-B73Mo17_B   W22     /bam/W22.bam        ./ambient_out
-```
-Note: Each sample line corresponds to one genome BAM mapping for that pool.
-
-Now aggregate:
-```bash
-ambientmapper interpool \
-  --configs configs/samples.tsv \
-  --outdir ./ambient_out/interpool
+  --threads 16
 ```
 
-This writes:
-- interpool_bc_counts.tsv — #BCs per AssignedGenome × sample\
-- interpool_read_composition.tsv — winner-read fractions per Genome × sample\
-- interpool_summary.pdf — two heatmaps (BC counts and read composition)\
+Each distinct ```sample``` value is treated as an independent pipeline run under ```<workdir>/<sample>/```.
 
-### No pool design?
-If you don’t split by pools, just run per-sample. The summary treats the sample as **one big pool** and splits BCs into **LowContam vs HighContam** using contamination rate (default threshold *0.20*).
+## Run step-by-step debugging
 
-
-## dry sanity: 
-create two empty dummy BAMs and run inline (just to test arg parsing).\ 
-The pipeline will start and likely fail earlier because they’re empty,\
-but it proves your flag parsing & file existence checks.
+Run steps individually using **JSON config only**:
 
 ```bash
-touch /tmp/a.bam /tmp/b.bam
-ambientmapper run \
-  --sample TEST \
-  --genome G1,G2 \
-  --bam /tmp/a.bam,/tmp/b.bam \
-  --workdir /tmp/amb_out \
-  --threads 2
+ambientmapper extract   --config cfg.json --threads 8
+ambientmapper filter    --config cfg.json --threads 8
+ambientmapper chunks    --config cfg.json
+ambientmapper assign    --config cfg.json --threads 16
+ambientmapper genotyping \
+  --assign "<glob>" \
+  --outdir final/ \
+  --sample SAMPLE \
+  --threads 4
 ```
 
-### Step-by-step (debugging)
+Notes:
+
+* Stepwise commands do **not** support inline or TSV modes.
+* Only `ambientmapper run` supports Modes A/B/C.
+* Small empty BAMs can be used to validate CLI parsing.
+  
+---
+# What each step does (current pipeline)
+
+## 1) extract — per-genome QC tables
+
+**Code:** `extract.py → bam_to_qc`
+
+For each genome BAM:
+
+* Scans mapped primary alignments (`!is_unmapped`, `!is_secondary`, `!is_supplementary`).
+* Reads per alignment:
+
+  * **Read** — read name (`query_name`).
+  * **MAPQ** — mapping quality.
+  * **AS** — alignment score (`AS` tag if present, else empty).
+  * **NM** — mismatches/edits (`NM` tag if present, else empty).
+  * **XAcount** — number of alternative alignments from the `XA` tag (0 if absent).
+  * **BC** — barcode from `CB` or `BC`.
+* Normalizes barcodes to `"<BCseq>-<sample>"` via `canonicalize_bc_seq_sample_force`.
+
+**Writes:**
+
+```
+qc/<genome>_QCMapping.txt
+# Columns: Read, BC, MAPQ, AS, NM, XAcount
+```
+
+---
+
+## 2) filter — barcode filtering + duplicate collapse
+
+**Code:** `filtering.py → filter_qc_file`
+
+For each QC file:
+
+* Re-normalizes barcode to `"<BCseq>-<sample>"`.
+* Counts reads per barcode and **keeps only barcodes with frequency ≥ min_barcode_freq**.
+* Collapses duplicate `(Read, BC)` pairs using:
+
+  * `MAPQ = max`
+  * `AS = max`
+  * `NM = min`
+  * `XAcount = max`
+
+**Writes:**
+
+```
+filtered_QCFiles/filtered_<genome>_QCMapping.txt
+```
+
+---
+
+## 3) chunks — barcode chunking
+
+**Code:** `chunks.py → make_barcode_chunks`
+
+* Scans all filtered QC files.
+* Collects the **union** of all normalized barcodes.
+* Splits into chunks of size ≈ `chunk_size_cells`.
+
+Each chunk *k*:
+
+```
+cell_map_ref_chunks/<sample>_cell_map_ref_chunk_<k>.txt
+```
+
+(Just newline-separated barcodes.)
+
+If later steps run without existing chunks, a **dummy chunk + manifest.json** is created.
+
+---
+
+## 4) assign — ECDF-based dominance filter + per-read winners
+
+**Code:** `assign_streaming.py`
+
+### Pass A — Learn winner score distributions (`learn_edges_parallel`)
+
+For each `(Read, BC)` pair across genomes:
+
+* Tracks **best1**, **best2**, **worst** alignments using a priority key:
+
+  1. lower NM
+  2. higher AS
+  3. higher MAPQ
+* Collects global histograms for `AS_best1`, `MAPQ_best1`.
+* Computes **decile boundaries** (`k=10`) stored in:
+
+```
+ExplorationReadLevel/global_edges.npz
+```
+
+### Pass B — Learn Δ-score ECDFs (`learn_ecdfs_parallel` or `learn_ecdfs_batched`)
+
+Computes:
+
+* `dAS = AS_best1 - AS_best2`
+* `dMAPQ = MAPQ_best1 - MAPQ_best2`
+
+These are stratified by the winner-quality decile and histograms/ECDFs recorded in:
+
+```
+ExplorationReadLevel/global_ecdf.npz
+```
+
+### Pass C — Score each chunk (`score_chunk`)
+
+For each chunk:
+
+* Reconstructs per-read, per-genome evidence (**per_g**: AS, MAPQ, NM).
+* Computes **p-values** using ΔAS/ΔMAPQ ECDFs (`p_as`, `p_mq`).
+* Performs **winner vs ambiguous** decision:
+
+  * Uses `alpha` (default 0.05) and NM differences.
+* Runs **dominance filter** across all genomes.
+
+**Outputs per chunk:**
+
+```
+raw_cell_map_ref_chunks/<sample>_chunk<k>_raw.tsv.gz
+cell_map_ref_chunks/<sample>_chunk<k>_filtered.tsv.gz
+```
+
+Filtered tables include:
+
+```
+Read, BC, Genome, AS, MAPQ, NM, XAcount, p_as, p_mq, assigned_class
+```
+
+---
+
+## 5) genotyping — ambient-aware per-cell calls
+
+**Code:** `genotyping.py` (CLI: `ambientmapper genotyping`)
+
+Genotyping consumes `*_filtered.tsv.gz` files and runs a **two-pass streaming algorithm**.
+
+### Pass 1 — Compute per-read posteriors + expected counts
+
+* Schema normalization to:
+
+  * `barcode`, `read_id`, `genome`, optional `AS`, `MAPQ`, `NM`, `p_as`, `p_mq`.
+* Collapse to one row per `(barcode, read_id, genome)` using:
+
+  * `AS=max`, `MAPQ=max`, `NM=min`, `p_* = min`.
+* Compute fused score per row:
+
+  * Robust z-scoring of AS, MAPQ, NM.
+  * Weighted sum: `w_as=0.5`, `w_mapq=1.0`, `w_nm=1.0`.
+  * P-value penalty via `p_as`, `p_mq`.
+  * Convert to softmax with `beta = 0.5` + ambient mass ⇒ `L(r,g)`.
+* Accumulate:
+
+  * `C(b,g) = Σ_r L(r,g)`
+  * `n_reads(b)`
+* Spill all posteriors to **barcode-hashed shards** for pass 2.
+
+### Ambient estimation
+
+Barcodes with `< 200` reads define the **low-read set**. Their `L(r,g)` values estimate the ambient profile η(g). Falls back to uniform η if needed.
+
+### Candidate genomes per barcode
+
+* Select **top-k genomes** (default 3) by expected counts C(b,g).
+
+### Pass 2 — Per-barcode model selection
+
+For each barcode:
+
+* Reconstruct full `L_block = {L(r,g)}`.
+* Test models:
+
+  * **Single** genome + ambient (`alpha` grid 0→0.5).
+  * **Doublet** mixture + ambient (`alpha` + `rho` grid).
+* Compute composite log-likelihood, convert to **BIC**.
+* Apply conservative calling:
+
+  * **single** if ΔBIC ≥ margin & purity ≥ threshold.
+  * **doublet** if ΔBIC ≥ margin & minor fraction ≥ threshold.
+  * **indistinguishable** if near-tie between singles.
+  * else **ambiguous**.
+
+### Outputs
+
+```
+final/<sample>_cells_calls.tsv.gz
+```
+
+One row per barcode with fields:
+
+* `call` ∈ {single, doublet, indistinguishable, ambiguous}
+* `genome_1`, `genome_2`
+* `alpha` (ambient fraction), `rho`(doublet mixture)
+* `purity`, `minor`
+* `bic_single`, `bic_doublet`, `bic_best`, `delta_bic`
+* `n_reads`, `n_effective`
+* `concordance` (per-read argmax agreement with major genome)
+* `p_top1`, `p_top2`, `p_top3`, `top3_sum`, `entropy`
+* `top_genome`, `best_genome`
+* `status_flag` (single / double / low_confidence / ambiguous)
+* `suspect_multiplet`, `multiplet_reason`
+
+```
+final/<sample>_BCs_PASS_by_mapping.csv
+```
+
+Barcode-level summary for downstream tools:
+
+```
+barcode,AssignedGenome,call,purity,n_reads
+```
+
+```
+final/<sample>_expected_counts_by_genome.csv
+```
+
+Dense C(b,g) matrix (barcodes × genomes) for QC and exploration.
+
+
+---
+
+## Advanced parameter tuning
+
+### Global options
+
+* `--threads`: parallelism.
+* `--min-barcode-freq`: barcode filter threshold.
+* `--chunk-size-cells`: number of barcodes per chunk.
+
+### Assign parameters (JSON or CLI overrides)
+Assign-related knobs via JSON (`assign` block) or CLI prefix (`--assign-*`) control:
+
+* `assign.alpha`: FDR threshold, per-read ECDF significance level for winner vs ambiguous (default 0.05).
+* `assign.k`: number of deciles for score stratification (default 10).
+* `assign.mapq_min`: minimum MAPQ to consider an alignment (default 20).
+* `assign.xa_max`: maximum allowed alternative hits (`XAcount`) (default `2`; set to `-1` to disable).
+* `assign.chunksize`: Number of rows read per chunk when streaming QC files to reduce memory usage (at the cost of processing time)
+* `assign.batch_size`: number of chunk files handled together in batched learning.
+* `assign.edges_workers`: number of workers for `learn_edges_parallel`.
+* `assign.edges_max_reads`: optional cap on reads per genome when learning edges (defaul all reads).
+* `assign.ecdf_workers`: ECDF workers.
+
+### Genotyping parameters
+
+* `--min_reads`: Minimum reads per barcode required for a confident call (default: 100). Note: reads are counted as pairs, so 100 reads correspond to 200 Tn5 insertions.
+* `--beta`: softmax temperature for per-read score fusion.
+* `--w_as`, `--w_mapq`, `--w_nm`: weights for AS, MAPQ, and NM.
+* `--ambient_const`: per-read ambient mass before normalization.
+* `--topk-genomes`: number of candidate genomes per barcode (default 3).
+* `alpha_grid`, `rho_grid`, `max_alpha`, `bic_margin`, `single_mass_min`, `doublet_minor_min`, `near_tie_margin`:  control the ambient-aware model selection.
+* `--chunk-rows`: streaming chunk size.
+* `--shards`: number of spill shards.
+* `--pass1-workers`: number of Pass1 workers.
+
+For full details, see:
+
 ```bash
-ambientmapper extract -c configs/example.json -t 8
-ambientmapper filter  -c configs/example.json -t 8
-ambientmapper chunks  -c configs/example.json
-ambientmapper assign  -c configs/example.json -t 16
-ambientmapper merge  -c configs/example.json -t 16
-
-# after ambientmapper run / merge
-ambientmapper summarize -c configs/example.json --xa-max 2
-# (add --pool-design configs/pools.tsv if you have pools)**
+ambientmapper assign --help
+ambientmapper genotyping --help
+ambientmapper run --help
 ```
 
-#### Note on stepwise commands ####
-The step-by-step subcommands (`extract`, `filter`, `chunks`, `assign`, `merge`, etc.) currently accept only **Mode A** (`--config JSON`).
-If you prefer inline arguments (Mode B) or TSV (Mode C), please use the top-level `ambientmapper run` command, which supports all three modes.
-Advanced parameter tuning (e.g. `alpha`, `k`, `assign.chunksize`) should be specified inside the JSON config under the "assign" block, and implemeted on the top-level options. 
-Note: If nothing is provided, defaults are: `alpha=0.05`, `k=10`, `mapq_min=20`, `xa_max=2`, `chunksize=500000`.
 
-- **Mode A (JSON + override flags):**
-  ```bash
-  ambientmapper run -c configs/example.json \
-  --assign-alpha 0.01 \
-  --assign-k 8 \
-  --assign-mapq-min 30 \
-  --assign-xa-max 1 \
-  --assign-chunksize 250000 \
-  -t 16
-  ```
-
-- **Mode B (inline):**
-  ```
-  ambientmapper run \
-  --sample PoolA \
-  --genome G1,G2 \
-  --bam /bam/G1.bam,/bam/G2.bam \
-  --workdir /scratch/out \
-  --min-barcode-freq 10 \
-  --chunk-size-cells 5000 \
-  --assign-alpha 0.02 \
-  --assign-chunksize 300000 \
-  -t 16
-  ```
-- **Mode C (TSV):**  
-  ```
-  ambientmapper run \
-  --configs configs/samples.tsv \
-  --assign-alpha 0.05 \
-  --assign-k 10 \
-  --assign-chunksize 500000 \
-  -t 32
-  ```
-
-
-### What the steps do (brief)
-
-- **extract**
-  From each genome BAM → per-read QC table with columns: `Read, BC, MAPQ, AS, NM, XAcount.`
-
-- **filter**
-  Keep barcodes (BCs) with frequency `≥ --min-barcode-freq.`
-  Collapse duplicate (`Read`, `BC`) rows per genome using:
-  - `MAPQ = max, AS = max, NM = min, XAcount = max.`
-
-- **chunks**
-  Build BC chunk files to cap memory (size controlled by `--chunk-size-cells`).
-
-- **assign**
-  Modular assign: learn edges (global), learn ECDFs (global), then score each chunk (parallel).
-  - Uses AS, then MAPQ (desc), then NM (asc).
-    Writes remove clear low quality aligments per-read
-  - Note: `ambientmapper-assign` exposes low-level developer commands (learn-edges, learn-ecdfs, score-chunk) for debugging or advanced use.
-
-- **merge**
-  Combine per-chunk winners `→ final/<sample>_per_read_winner.tsv.gz.`
-
-- **summarize** (*optional; per-pool*)
-  Treat the current sample as **one pool**.
-  - Compute assigned genome per BC (by AS_mean across that BC’s reads).
-  - Contamination rate per BC = fraction of winner reads whose Genome ≠ AssignedGenome.
-  - Produce a PDF with ECDFs (AS_mean, reads/BC), a contamination-vs-reads hexbin,\and counts (heatmap if multiple pools are provided; bar chart otherwise).
-  - Write:
-    - `<sample>_BCs_PASS_by_mapping.csv` (BCs whose assigned genome is considered in-pool for this run)
-    - `Reads_to_discard_<sample>.csv` (winner reads where Genome ≠ AssignedGenome for that BC)
-
-- **interpool** (*optional; cross-pool comparison after multiple per-pool runs*)
-  Aggregate several samples (pools) to compare:
-  - `interpool_bc_counts.tsv` — #BCs per **AssignedGenome × sample**
-  - `interpool_read_composition.tsv` — winner-read **fractions per Genome × sample**
-  - `interpool_summary.pdf` — two heatmaps (BC counts, read composition)
-
-## Notes
-  - BAMs should be coordinate-sorted and indexed; barcodes in CB or BC; alignment tags AS, NM expected; XA optional.
-  - --xa-max 2 filters winners by XAcount ≤ 2. If your BAMs lack XA, set --xa-max -1.
-  - --threads parallelizes per-genome (extract/filter) and per-chunk (assign). Adjust --chunk-size-cells to manage memory.
-
-## Troubleshooting
-- If you hit RAM limits:
-    - Lower `--threads`
-    - Lower `chunk_size_cells` (fewer cells per chunk).
-    - Lower `assign.chunksize` (default 500,000 rows per read_csv call).
-
-- Prefer fast local/scratch disk for workdir.
-- If conda channels cause issues:
-```
-conda config --add channels conda-forge
-conda config --add channels bioconda
-conda config --set channel_priority strict
-```
