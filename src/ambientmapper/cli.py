@@ -522,7 +522,56 @@ def run(
     assign_batch_size: Optional[int] = typer.Option(None, "--assign-batch-size"),
     assign_edges_workers: Optional[int] = typer.Option(None, "--assign-edges-workers"),
     assign_edges_max_reads: Optional[int] = typer.Option(None, "--assign-edges-max-reads"),
-    ecdf_workers: Optional[int] = typer.Option(None, "--ecdf-workers"),
+    ecdf_workers: Optional[int] = typer.Option(None, "--ecdf-workers"),    
+    # genotyping overrides (forwarded into params["genotyping"])
+    genotyping_min_reads: Optional[int] = typer.Option(
+        None, "--genotyping-min-reads",
+        help="Override genotyping minimum reads per barcode (default 100).",
+    ),
+    genotyping_beta: Optional[float] = typer.Option(
+        None, "--genotyping-beta",
+        help="Override genotyping softmax temperature beta (default 0.5).",
+    ),
+    genotyping_w_as: Optional[float] = typer.Option(
+        None, "--genotyping-w-as",
+        help="Override genotyping AS weight (default 0.5).",
+    ),
+    genotyping_w_mapq: Optional[float] = typer.Option(
+        None, "--genotyping-w-mapq",
+        help="Override genotyping MAPQ weight (default 1.0).",
+    ),
+    genotyping_w_nm: Optional[float] = typer.Option(
+        None, "--genotyping-w-nm",
+        help="Override genotyping NM weight (default 1.0, used as penalty).",
+    ),
+    genotyping_ambient_const: Optional[float] = typer.Option(
+        None, "--genotyping-ambient-const",
+        help="Override genotyping ambient_const (default 1e-3).",
+    ),
+    genotyping_tau_drop: Optional[float] = typer.Option(
+        None, "--genotyping-tau-drop",
+        help="Override genotyping tau_drop (default 8.0).",
+    ),
+    genotyping_topk_genomes: Optional[int] = typer.Option(
+        None, "--genotyping-topk-genomes",
+        help="Override genotyping topk_genomes (default 3).",
+    ),
+    genotyping_threads: Optional[int] = typer.Option(
+        None, "--genotyping-threads",
+        help="Override genotyping shard-level threads (default: pipeline --threads).",
+    ),
+    genotyping_shards: Optional[int] = typer.Option(
+        None, "--genotyping-shards",
+        help="Override genotyping shard count for pass-1 spill (default 32).",
+    ),
+    genotyping_chunk_rows: Optional[int] = typer.Option(
+        None, "--genotyping-chunk-rows",
+        help="Override genotyping pass-1 chunk_rows (default 1,000,000).",
+    ),
+    genotyping_pass1_workers: Optional[int] = typer.Option(
+        None, "--genotyping-pass1-workers",
+        help="Override genotyping pass-1 workers (default: = genotyping_threads).",
+    ),
 ):
     """
     Run the full pipeline with pipeline-wide resume via sentinels.
@@ -541,6 +590,35 @@ def run(
     if modes_used != 1:
         raise typer.BadParameter("Choose exactly one mode: --config OR (--sample/--genome/--bam/--workdir) OR --configs")
 
+    # Build genotyping overrides for pipeline._run_genotyping
+    genotyping_conf: Dict[str, object] = {}
+
+    if genotyping_min_reads is not None:
+        genotyping_conf["min_reads"] = int(genotyping_min_reads)
+    if genotyping_beta is not None:
+        genotyping_conf["beta"] = float(genotyping_beta)
+    if genotyping_w_as is not None:
+        genotyping_conf["w_as"] = float(genotyping_w_as)
+    if genotyping_w_mapq is not None:
+        genotyping_conf["w_mapq"] = float(genotyping_w_mapq)
+    if genotyping_w_nm is not None:
+        genotyping_conf["w_nm"] = float(genotyping_w_nm)
+    if genotyping_ambient_const is not None:
+        genotyping_conf["ambient_const"] = float(genotyping_ambient_const)
+    if genotyping_tau_drop is not None:
+        genotyping_conf["tau_drop"] = float(genotyping_tau_drop)
+    if genotyping_topk_genomes is not None:
+        genotyping_conf["topk_genomes"] = int(genotyping_topk_genomes)
+    if genotyping_threads is not None:
+        genotyping_conf["threads"] = int(genotyping_threads)
+    if genotyping_shards is not None:
+        genotyping_conf["shards"] = int(genotyping_shards)
+    if genotyping_chunk_rows is not None:
+        genotyping_conf["chunk_rows"] = int(genotyping_chunk_rows)
+    if genotyping_pass1_workers is not None:
+        genotyping_conf["pass1_workers"] = int(genotyping_pass1_workers)
+
+     
     def _do_one(cfg: dict):
         _apply_assign_overrides(
             cfg,
@@ -552,6 +630,7 @@ def run(
             "threads": int(threads),
             "verbose": bool(verbose),
             "assign": cfg.get("assign", {}),
+            "genotyping": genotyping_conf,
         }
         force = [s.strip() for s in force_steps.split(",") if s.strip()]
         only  = [s.strip() for s in only_steps.split(",") if s.strip()]
