@@ -151,7 +151,7 @@ def _ensure_minimal_chunk(workdir: Path, sample: str) -> None:
     }
     (chunks / "manifest.json").write_text(json.dumps(man, indent=2))
 
-STEP_ORDER = ["extract", "filter", "chunks", "assign", "genotyping", "summarize", "interpool"]
+STEP_ORDER = ["extract", "filter", "chunks", "assign", "genotyping"]
 
 def _norm_steps(xs: list[str]) -> list[str]:
     s = set(STEP_ORDER)
@@ -449,18 +449,18 @@ def genotyping(
         topk_genomes=3,
 )
 
-@app.command()
-def summarize(
-    config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
-    assign_glob: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs (parquet/tsv/csv)"),
-):
-    """[Deprecated] Back-compat wrapper to new merge.summarize."""
-    from .merge import run as posterior_merge_run
-    cfg = json.loads(Path(config).read_text()); d = _cfg_dirs(cfg); _ensure_dirs(d)
-    if not assign_glob:
-        assign_glob = str(d["chunks"] / "**" / "*")
-    posterior_merge_run(assign=assign_glob, outdir=d["final"], sample=cfg["sample"], make_report=True)
-    typer.echo(f"[summarize] outputs in {d['final']}")
+# @app.command()
+# def summarize(
+#     config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
+#     assign_glob: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs (parquet/tsv/csv)"),
+# ):
+#     """[Deprecated] Back-compat wrapper to new merge.summarize."""
+#     from .merge import run as posterior_merge_run
+#     cfg = json.loads(Path(config).read_text()); d = _cfg_dirs(cfg); _ensure_dirs(d)
+#     if not assign_glob:
+#         assign_glob = str(d["chunks"] / "**" / "*")
+#     posterior_merge_run(assign=assign_glob, outdir=d["final"], sample=cfg["sample"], make_report=True)
+#     typer.echo(f"[summarize] outputs in {d['final']}")
 
 @app.command()
 def interpool(
