@@ -12,7 +12,7 @@ def run_pipeline(cfg: dict, params: dict, version: str,
     """
     Execute pipeline with resumable sentinels.
 
-    Steps: extract → filter → chunks → assign → genotyping → summarize → interpool
+    Steps: extract → filter → chunks → assign → genotyping 
 
     Args:
       cfg: single-sample config (sample, workdir, genomes, …)
@@ -58,7 +58,7 @@ def run_pipeline(cfg: dict, params: dict, version: str,
 # --------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------
-STEP_ORDER: List[str] = ["extract", "filter", "chunks", "assign", "genotyping", "summarize", "interpool"]
+STEP_ORDER: List[str] = ["extract", "filter", "chunks", "assign", "genotyping"]
 
 # --------------------------------------------------------------------
 # Context and dirs
@@ -305,13 +305,6 @@ def _run_genotyping(ctx: Ctx) -> None:
         pass1_workers=pass1_workers,
     )
 
-
-def _run_summarize(ctx: Ctx) -> None:
-    from .merge import run as posterior_merge_run
-    cfg = ctx.cfg; d = ctx.dirs
-    assign_glob = str(d["chunks"] / "**" / "*")
-    posterior_merge_run(assign=assign_glob, outdir=d["final"], sample=cfg["sample"], make_report=True)
-
 def _run_interpool(ctx: Ctx) -> None:
     # Cross-sample driver. No-op here; call CLI `interpool` separately.
     return
@@ -322,8 +315,6 @@ RUNNERS: Dict[str, Callable[[Ctx], None]] = {
     "chunks": _run_chunks,
     "assign": _run_assign,
     "genotyping": _run_genotyping,
-    "summarize": _run_summarize,
-    "interpool": _run_interpool,
 }
 
 # --------------------------------------------------------------------
