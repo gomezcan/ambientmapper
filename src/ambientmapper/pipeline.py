@@ -255,10 +255,56 @@ def _run_assign(ctx: Ctx) -> None:
 
 def _run_genotyping(ctx: Ctx) -> None:
     from .genotyping import genotyping as _run
-    cfg = ctx.cfg; d = ctx.dirs
-    assign_glob = str(d["chunks"] / "**" / "*")
-    _run(assign=assign_glob, outdir=d["final"], sample=cfg["sample"],
-         make_report=True, threads=int(ctx.params.get("threads", 1)))
+    cfg = ctx.cfg
+    d = ctx.dirs
+
+    # Only use assign outputs from the genotyping step (filtered TSVs)
+    assign_glob = str(d["chunks"] / "**" / "*filtered.tsv.gz")
+
+    # Global pipeline threads (fallback for genotyping-specific threads)
+    threads_global = int(ctx.params.get("threads", 1))
+
+    # Genotyping-specific overrides from params (set by CLI `run`)
+    gconf = ctx.params.get("genotyping", {}) or {}
+
+    min_reads = int(gconf.get("min_reads", 100))
+    beta = float(gconf.get("beta", 0.5))
+    w_as = float(gconf.get("w_as", 0.5))
+    w_mapq = float(gconf.get("w_mapq", 1.0))
+    w_nm = float(gconf.get("w_nm", 1.0))
+    ambient_const = float(gconf.get("ambient_const", 1e-3))
+    tau_drop = float(gconf.get("tau_drop", 8.0))
+    topk_genomes = int(gconf.get("topk_genomes", 3))
+    shards = int(gconf.get("shards", 32))
+    chunk_rows = int(gconf.get("chunk_rows", 1_000_000))
+
+    threads = int(gconf.get("threads", threads_global))
+    if threads < 1:
+        threads = 1
+
+    pass1_workers = gconf.get("pass1_workers", None)
+    if pass1_workers is not None:
+        pass1_workers = max(1, int(pass1_workers))
+
+    _run(
+        assign=assign_glob,
+        outdir=d["final"],
+        sample=cfg["sample"],
+        min_reads=min_reads,
+        beta=beta,
+        w_as=w_as,
+        w_mapq=w_mapq,
+        w_nm=w_nm,
+        ambient_const=ambient_const,
+        tau_drop=tau_drop,
+        topk_genomes=topk_genomes,
+        make_report=True,
+        threads=threads,
+        shards=shards,
+        chunk_rows=chunk_rows,
+        pass1_workers=pass1_workers,
+    )
+
 
 def _run_summarize(ctx: Ctx) -> None:
     from .merge import run as posterior_merge_run
