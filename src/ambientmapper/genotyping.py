@@ -524,9 +524,9 @@ def _select_model_for_barcode(
 
     if (
       out["model"] == "single" 
-      and out["purity"] >= cfg.single_mass_min and
-      and (out["bic_doublet"] - out["bic_best"]) >= cfg.bic_margin
-      and ratio12 >= 3.0 
+      and out["purity"] >= cfg.single_mass_min and \
+      (out["bic_doublet"] - out["bic_best"]) >= cfg.bic_margin and \
+      ratio12 >= 3.0 
     ):
         call = "single"
         
