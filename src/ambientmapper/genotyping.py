@@ -119,7 +119,7 @@ class MergeConfig(BaseModel):
     ambient_const: float = 1e-3       # per-read ambient mass before renorm
     p_eps: float = 1e-3               # floor for p-value penalty gamma = max(eps,1-p)
     min_reads: int = 100              # minimum reads to attempt a confident call
-    single_mass_min: float = 0.85     # mass threshold for single call
+    single_mass_min: float = 0.5     # mass threshold for single call
     doublet_minor_min: float = 0.20   # minor fraction threshold for doublet
     bic_margin: float = 6.0           # ΔBIC to accept more complex model
     near_tie_margin: float = 2.0      # ΔBIC below which genomes are indistinguishable
@@ -129,7 +129,7 @@ class MergeConfig(BaseModel):
     max_alpha: float = 0.5            # cap ambient fraction
     topk_genomes: int = 3             # candidate genomes per barcode
     sample: str = "sample"
-    shards: int = 32                  # number of barcode-hash shards
+    shards: int = 40                  # number of barcode-hash shards
     chunk_rows: int = 5_000_000       # streaming chunk size for input TSVs
 
 # ------------------------------
@@ -522,9 +522,14 @@ def _select_model_for_barcode(
     if len(singles_sorted) == 2 and (singles_sorted[1]["bic"] - singles_sorted[0]["bic"]) < cfg.near_tie_margin:
         indist = (singles_sorted[0]["g1"], singles_sorted[1]["g1"])
 
-    if out["model"] == "single" and out["purity"] >= cfg.single_mass_min and \
-            (out["bic_doublet"] - out["bic_best"]) >= cfg.bic_margin:
+    if (
+      out["model"] == "single" 
+      and out["purity"] >= cfg.single_mass_min and
+      and (out["bic_doublet"] - out["bic_best"]) >= cfg.bic_margin
+      and ratio12 >= 3.0 
+    ):
         call = "single"
+        
     elif out["model"] == "doublet" and out["minor"] >= cfg.doublet_minor_min and \
             (out["bic_single"] - out["bic_best"]) >= cfg.bic_margin:
         call = "doublet"
