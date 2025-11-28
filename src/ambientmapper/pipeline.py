@@ -326,7 +326,7 @@ def _run_genotyping(ctx: Ctx) -> None:
         w_nm=w_nm,
         ambient_const=ambient_const,
         tau_drop=tau_drop,
-        bic_margin=bic_margin
+        bic_margin=bic_margin,
         topk_genomes=topk_genomes,
         make_report=True,
         threads=threads,
