@@ -381,7 +381,7 @@ def genotyping(
     outdir: Optional[Path] = typer.Option(None, "--outdir"),
     sample: Optional[str] = typer.Option(None, "--sample"),
     make_report: bool = typer.Option(True, "--report/--no-report"),
-    threads: int = typer.Option(16, "--threads", help="Parallel workers for per-cell model selection."),
+    threads: int = typer.Option(16, "--threads", help="Parallel workers for per-cell model selection."),    
     chunk_rows: int = typer.Option(5_000_000, "--chunk-rows", help="Input chunk size (rows per chunk) for streaming read in pass1."),
     # genotyping overrides (forwarded into params["genotyping"])
     min_reads: Optional[int] = typer.Option( None, "--genotyping-min-reads", help="Override genotyping minimum reads per barcode (default 100)."),
@@ -391,8 +391,7 @@ def genotyping(
     w_nm: Optional[float] = typer.Option(None, "--genotyping-w-nm", help="Override genotyping NM weight (default 1.0, used as penalty)."),
     ambient_const: Optional[float] = typer.Option(None, "--genotyping-ambient-const", help="Override genotyping ambient_const (default 1e-3)."),
     tau_drop: Optional[float] = typer.Option(None, "--genotyping-tau-drop", help="Override genotyping tau_drop (default 8.0)."),
-    topk_genomes: Optional[int] = typer.Option(None, "--genotyping-topk-genomes", help="Override genotyping topk_genomes (default 3)."),
-    threads: Optional[int] = typer.Option(None, "--genotyping-threads", help="Override genotyping shard-level threads (default: pipeline --threads)."),
+    topk_genomes: Optional[int] = typer.Option(None, "--genotyping-topk-genomes", help="Override genotyping topk_genomes (default 3)."),    
     shards: Optional[int] = typer.Option(None, "--genotyping-shards",help="Override genotyping shard count for pass-1 spill (default 32)."),
     chunk_rows: Optional[int] = typer.Option(None, "--genotyping-chunk-rows", help="Override genotyping pass-1 chunk_rows (default 1,000,000)."),
     pass1_workers: Optional[int] = typer.Option(None, "--genotyping-pass1-workers", help="Override genotyping pass-1 workers (default: = genotyping_threads)."),
