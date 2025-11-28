@@ -604,6 +604,7 @@ def run(
 
     # Build genotyping overrides for pipeline._run_genotyping
     genotyping_conf: Dict[str, object] = {}
+    params_run = {}
 
     if genotyping_min_reads is not None:
         genotyping_conf["min_reads"] = int(genotyping_min_reads)
