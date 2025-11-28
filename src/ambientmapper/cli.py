@@ -695,11 +695,11 @@ def run(
         help="If set, restrict genotyping to winner reads only (no ambiguous per-read entries).",
     ),
     genotyping_ratio_top1_top2_min: Optional[float] = typer.Option(
-        2, "--genotyping-ratio_top1_top2",
+        2, "--genotyping-ratio-top1-top2-min",
         help="Minimum p_top1/p_top2 ratio required to accept a confident single call (default 2).",
     ),
     genotyping_single_mass_min: Optional[float] = typer.Option(
-        None,
+        None, "--genotyping-single-mass-min",
         help="Override purity threshold for single calls (default 0.7).",
     ),
 ):
@@ -751,8 +751,10 @@ def run(
     if genotyping_winner_only is not None:
         genotyping_conf["winner_only"] = genotyping_winner_only
     if genotyping_ratio_top1_top2_min is not None:
-        genotyping_conf["ratio_top1_top2_min"] = genotyping_ratio_top1_top2_min
-        
+        genotyping_conf["ratio_top1_top2_min"] = float(genotyping_ratio_top1_top2_min)
+    if genotyping_single_mass_min is not None:
+        genotyping_conf["single_mass_min"] = float(genotyping_single_mass_min)
+    
     params_run = {}
     if genotyping_conf:
         params_run["genotyping"] = genotyping_conf
