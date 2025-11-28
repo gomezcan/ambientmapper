@@ -22,6 +22,7 @@ CLI (Typer):
       --outdir work/merge --sample SAMPLE \
       [--min-reads 300] [--beta 0.5] [--tau-drop 8] \
       [--topk-genomes 3] [--ambient-const 1e-3] \
+      [--winner-only/--no-winner-only] \
       [--report/--no-report] [--threads 1]
 
 Inputs expected from `assign` (flexible; auto-detected when possible)
@@ -41,6 +42,8 @@ Behavior (high level)
        AS=max; MAPQ=max; NM=min; p_* = min
   2) For each read, fuse available scores with robust z-scaling and a p-value
      penalty; softmax (temperature beta) + tiny ambient mass → soft posteriors L(r,g).
+     If --winner-only is enabled, each read is collapsed to its top genome,
+     and that genome receives all non-ambient mass (1 - L_amb).
   3) Aggregate expected counts per (barcode, genome): C(b,g) = Σ_r L(r,g).
      Estimate an ambient profile eta(g) from low-read barcodes (<200 reads).
   4) For each barcode, pick top-k candidate genomes by C(b,g). Grid-search
@@ -55,10 +58,7 @@ Outputs (current simplified design)
         bic_best, bic_single, bic_doublet, delta_bic,
         n_reads, n_effective, concordance, indistinguishable_set, notes,
         p_top1, p_top2, p_top3, top3_sum, entropy,
-        top_genome, second_genome, ratio_top1_top2,
-        frac_reads_top1, frac_reads_top2, frac_reads_non_top1,
-        contam_reads_top2, contam_reads_non_top1,
-        best_genome, status_flag, ...
+        top_genome, best_genome, status_flag, ...
   - <outdir>/<sample>_BCs_PASS_by_mapping.csv
       Legacy-compatible summary: barcode, AssignedGenome (=best_genome), call, purity, n_reads.
   - <outdir>/<sample>_expected_counts_by_genome.csv
@@ -119,7 +119,7 @@ class MergeConfig(BaseModel):
     ambient_const: float = 1e-3       # per-read ambient mass before renorm
     p_eps: float = 1e-3               # floor for p-value penalty gamma = max(eps,1-p)
     min_reads: int = 100              # minimum reads to attempt a confident call
-    single_mass_min: float = 0.5     # mass threshold for single call
+    single_mass_min: float = 0.85     # mass threshold for single call
     doublet_minor_min: float = 0.20   # minor fraction threshold for doublet
     bic_margin: float = 6.0           # ΔBIC to accept more complex model
     near_tie_margin: float = 2.0      # ΔBIC below which genomes are indistinguishable
@@ -129,8 +129,9 @@ class MergeConfig(BaseModel):
     max_alpha: float = 0.5            # cap ambient fraction
     topk_genomes: int = 3             # candidate genomes per barcode
     sample: str = "sample"
-    shards: int = 40                  # number of barcode-hash shards
+    shards: int = 32                  # number of barcode-hash shards
     chunk_rows: int = 5_000_000       # streaming chunk size for input TSVs
+    winner_only: bool = False         # if True, collapse each read to its top genome only
 
 # ------------------------------
 # I/O helpers
@@ -263,7 +264,12 @@ def _fuse_support(df_grp: pd.DataFrame, cfg: MergeConfig) -> Tuple[np.ndarray, n
 
 
 def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame:
-    """Compute per-read soft posteriors L_{r,g} from assign rows."""
+    """Compute per-read soft posteriors L_{r,g} from assign rows.
+
+    If cfg.winner_only is True, collapse each read to its top genome:
+      - keep only the argmax-L genome row
+      - assign it all non-ambient mass (1 - L_amb), with L_amb unchanged.
+    """
     missing = REQUIRED_COLS - set(df.columns)
     if missing:
         raise ValueError(f"assign table missing required columns: {missing}")
@@ -276,15 +282,25 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
     records: List[pd.DataFrame] = []
     for (_, _), grp in df.groupby(["barcode", "read_id"], sort=False, observed=True):
         S, gamma, w = _fuse_support(grp, cfg)
-        # ambient const mass
         amb = cfg.ambient_const
         total = w.sum() + amb
         L = w / total
         L_amb = amb / total
-        out = grp[["barcode", "read_id", "genome"]].copy()
-        out["L"] = L
-        out["L_amb"] = L_amb
-        records.append(out)
+
+        if cfg.winner_only:
+            # Keep only winner genome; give it all non-ambient mass (1 - L_amb)
+            winner_idx = int(np.argmax(L))
+            # Build a single-row DataFrame for this read's winner
+            row = grp.iloc[[winner_idx]][["barcode", "read_id", "genome"]].copy()
+            row["L"] = float(1.0 - L_amb)
+            row["L_amb"] = float(L_amb)
+            records.append(row)
+        else:
+            out = grp[["barcode", "read_id", "genome"]].copy()
+            out["L"] = L
+            out["L_amb"] = L_amb
+            records.append(out)
+
     return pd.concat(records, ignore_index=True)
 
 
@@ -370,12 +386,10 @@ def _bic(loglik: float, n_params: int, n_reads: int) -> float:
     return -2.0 * loglik + n_params * math.log(max(n_reads, 1))
 
 
-def _select_model_for_barcode(
-    L_block: pd.DataFrame,
-    eta: pd.Series,
-    cfg: MergeConfig,
-    candidate_genomes: Sequence[str],
-) -> Dict:
+def _select_model_for_barcode(L_block: pd.DataFrame,
+                              eta: pd.Series,
+                              cfg: MergeConfig,
+                              candidate_genomes: Sequence[str]) -> Dict:
     read_count = int(L_block["read_id"].nunique())
 
     if not candidate_genomes:
@@ -402,13 +416,6 @@ def _select_model_for_barcode(
             "top3_sum": 0.0,
             "entropy": 0.0,
             "top_genome": None,
-            "second_genome": None,
-            "ratio_top1_top2": np.nan,
-            "frac_reads_top1": 0.0,
-            "frac_reads_top2": 0.0,
-            "frac_reads_non_top1": 0.0,
-            "contam_reads_top2": 0.0,
-            "contam_reads_non_top1": 0.0,
             "suspect_multiplet": False,
             "multiplet_reason": "",
         }
@@ -522,14 +529,9 @@ def _select_model_for_barcode(
     if len(singles_sorted) == 2 and (singles_sorted[1]["bic"] - singles_sorted[0]["bic"]) < cfg.near_tie_margin:
         indist = (singles_sorted[0]["g1"], singles_sorted[1]["g1"])
 
-    if (
-      out["model"] == "single" 
-      and out["purity"] >= cfg.single_mass_min and \
-      (out["bic_doublet"] - out["bic_best"]) >= cfg.bic_margin and \
-      ratio12 >= 3.0 
-    ):
+    if out["model"] == "single" and out["purity"] >= cfg.single_mass_min and \
+            (out["bic_doublet"] - out["bic_best"]) >= cfg.bic_margin:
         call = "single"
-        
     elif out["model"] == "doublet" and out["minor"] >= cfg.doublet_minor_min and \
             (out["bic_single"] - out["bic_best"]) >= cfg.bic_margin:
         call = "doublet"
@@ -539,7 +541,8 @@ def _select_model_for_barcode(
     out["call"] = call
     out["indistinguishable_set"] = ",".join(indist) if indist is not None else ""
 
-    # Concordance and read-level contamination metrics
+    # Concordance of per-read argmax with major genome,
+    # plus per-barcode fractions of reads supporting top1 and top2 genomes.
     if top_genome is None:
         concord = 0.0
         frac_top1_reads = 0.0
@@ -552,19 +555,15 @@ def _select_model_for_barcode(
         x = x.sort_values(["read_id", "L"], ascending=[True, False])
         argmax = x.drop_duplicates("read_id")
 
-        # argmax now has one row per read with the genome of max posterior
         g_arg = argmax["genome"].astype(str)
-        n_reads_local = len(g_arg)
-
-        frac_top1_reads = float((g_arg == top_genome).mean()) if n_reads_local > 0 else 0.0
-        if genome_2nd is not None and n_reads_local > 0:
+        n_reads = len(g_arg)
+        frac_top1_reads = float((g_arg == top_genome).mean()) if n_reads > 0 else 0.0
+        if genome_2nd is not None:
             frac_top2_reads = float((g_arg == genome_2nd).mean())
         else:
             frac_top2_reads = 0.0
 
-        # Concordance vs major genome of the selected model (fall back to top_genome)
-        maj = out.get("genome_1", top_genome)
-        concord = float((g_arg == maj).mean()) if n_reads_local > 0 else 0.0
+        concord = float((g_arg == out.get("genome_1", top_genome)).mean()) if n_reads > 0 else 0.0
 
     out["concordance"] = concord
     out["frac_reads_top1"] = frac_top1_reads
@@ -595,10 +594,9 @@ def _select_model_for_barcode(
             "top3_sum": top3_sum,
             "entropy": entropy,
             "top_genome": top_genome,
-            "second_genome": genome_2nd,
-            "ratio_top1_top2": ratio12,
             "suspect_multiplet": bool(suspect),
             "multiplet_reason": ";".join(reasons),
+            "ratio_top1_top2": ratio12,
         }
     )
 
@@ -639,12 +637,10 @@ def _close_shard_handles(handles: List[gzip.GzipFile]) -> None:
             pass
 
 
-def _write_L_chunk_to_shards(
-    Ldf: pd.DataFrame,
-    shard_handles: List[gzip.GzipFile],
-    shards: int,
-    write_header_flags: Dict[int, bool],
-) -> None:
+def _write_L_chunk_to_shards(Ldf: pd.DataFrame,
+                             shard_handles: List[gzip.GzipFile],
+                             shards: int,
+                             write_header_flags: Dict[int, bool]) -> None:
     cols = ["barcode", "read_id", "genome", "L", "L_amb"]
     Ldf = Ldf[cols].copy()
     for bc, sub in Ldf.groupby("barcode", sort=False, observed=True):
@@ -706,13 +702,11 @@ def _iter_shard_rows(shard_fp: Path, chunksize: int = 2_000_000):
         yield chunk
 
 
-def _process_barcode_group(
-    bc: str,
-    L_block: pd.DataFrame,
-    cand: List[str],
-    eta: pd.Series,
-    cfg: MergeConfig,
-) -> Dict:
+def _process_barcode_group(bc: str,
+                           L_block: pd.DataFrame,
+                           cand: List[str],
+                           eta: pd.Series,
+                           cfg: MergeConfig) -> Dict:
     best = _select_model_for_barcode(L_block, eta, cfg, cand)
     best["barcode"] = bc
     best["notes"] = ""
@@ -747,10 +741,8 @@ def _list_input_files(assign_glob: str) -> List[Path]:
     ]
 
 
-def _iter_input_chunks(
-    files: Sequence[Path],
-    chunk_rows: int,
-) -> Iterator[pd.DataFrame]:
+def _iter_input_chunks(files: Sequence[Path],
+                       chunk_rows: int) -> Iterator[pd.DataFrame]:
     for fp in files:
         try:
             it = pd.read_csv(
@@ -818,11 +810,9 @@ def _pass1_worker(args) -> Tuple[pd.DataFrame, pd.DataFrame, Path]:
     return C_all, N_all, shard_dir
 
 
-def _concat_worker_shards(
-    worker_dirs: Sequence[Path],
-    final_dir: Path,
-    shards: int,
-) -> None:
+def _concat_worker_shards(worker_dirs: Sequence[Path],
+                          final_dir: Path,
+                          shards: int) -> None:
     final_dir.mkdir(parents=True, exist_ok=True)
     for i in range(shards):
         out = final_dir / f"shard_{i:02d}.tsv.gz"
@@ -835,12 +825,10 @@ def _concat_worker_shards(
                     shutil.copyfileobj(fin, fout)
 
 
-def _pass1_stream_build(
-    assign_glob: str,
-    cfg: MergeConfig,
-    tmp_dir: Path,
-    pass1_workers: int = 1,
-) -> Tuple[pd.DataFrame, pd.DataFrame, Path]:
+def _pass1_stream_build(assign_glob: str,
+                        cfg: MergeConfig,
+                        tmp_dir: Path,
+                        pass1_workers: int = 1) -> Tuple[pd.DataFrame, pd.DataFrame, Path]:
     files = _list_input_files(assign_glob)
     if not files:
         raise FileNotFoundError(f"No assign files found for pattern: {assign_glob}")
@@ -941,6 +929,7 @@ def genotyping(
     shards: int = typer.Option(32, help="Number of on-disk shards for pass-1 spill."),
     chunk_rows: int = typer.Option(1_000_000, help="Input chunk size for streaming read."),
     pass1_workers: Optional[int] = typer.Option(None, help="Parallel workers for Pass 1 (file-level). If None, use --threads."),
+    winner_only: bool = typer.Option(False, help="If true, collapse each read to its top genome (winner-only mode)."),
 ):
     """Run the two-pass pipeline: streaming posterior calc → ambient estimate → per-cell calls."""
     shards = _optint(shards, 32)
@@ -964,6 +953,7 @@ def genotyping(
         sample=sample,
         shards=shards,
         chunk_rows=chunk_rows,
+        winner_only=winner_only,
     )
 
     outdir.mkdir(parents=True, exist_ok=True)
