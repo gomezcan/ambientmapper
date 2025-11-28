@@ -860,11 +860,20 @@ def _pass1_stream_build(assign_glob: str,
             N_parts.append(N_i)
             worker_dirs.append(shard_dir_i)
 
-    C_all = (
-        pd.concat(C_parts, ignore_index=True)
+    # Remove empty or None entries before concatenation
+    C_parts_valid = [df for df in C_parts if isinstance(df, pd.DataFrame) and not df.empty]
+    
+    if len(C_parts_valid) == 0:
+      # No data → return empty result with expected columns
+      C_all = pd.DataFrame(columns=["barcode", "genome", "C"])
+    else:
+      C_all = (
+        pd.concat(C_parts_valid, ignore_index=True)
           .groupby(["barcode", "genome"], observed=True)["C"]
-          .sum().reset_index()
-    )
+          .sum()
+          .reset_index()
+      )
+                    
     N_all = (
         pd.concat(N_parts, ignore_index=True)
           .groupby("barcode", observed=True)["n_reads"]
