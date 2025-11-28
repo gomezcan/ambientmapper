@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, List, Callable, Sequence, Any
 import json, time, hashlib
+import typer
 
 # --------------------------------------------------------------------
 # Public entrypoint
@@ -275,7 +276,7 @@ def _run_genotyping(ctx: Ctx) -> None:
     gconf = ctx.params.get("genotyping", {}) or {}
 
     min_reads = int(gconf.get("min_reads", 100))
-    beta = float(gconf.get("beta", 0.5))
+    beta = float(gconf.get("beta", 1))
     w_as = float(gconf.get("w_as", 0.5))
     w_mapq = float(gconf.get("w_mapq", 1.0))
     w_nm = float(gconf.get("w_nm", 1.0))
@@ -284,6 +285,8 @@ def _run_genotyping(ctx: Ctx) -> None:
     topk_genomes = int(gconf.get("topk_genomes", 3))
     shards = int(gconf.get("shards", 32))
     chunk_rows = int(gconf.get("chunk_rows", 1_000_000))
+    winner_only = bool(gconf.get("winner_only", False))
+    ratio_top1_top2_min = float(gconf.get("ratio_top1_top2_min", 2.0))
 
     # New: winner-only flag
     winner_only = bool(gconf.get("winner_only", False))
