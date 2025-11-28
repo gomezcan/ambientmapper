@@ -371,37 +371,129 @@ def assign(
                 typer.echo(f"[assign/score] {done}/{total} chunks")
     typer.echo("[assign/score] done")
 
-##
-    
 
 @app.command()
 def genotyping(
-    config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
-    assign_glob: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs (parquet/csv/tsv)"),
-    outdir: Optional[Path] = typer.Option(None, "--outdir"),
-    sample: Optional[str] = typer.Option(None, "--sample"),
-    make_report: bool = typer.Option(True, "--report/--no-report"),
-    threads: int = typer.Option(16, "--threads", help="Parallel workers for per-cell model selection."),    
-    chunk_rows: int = typer.Option(5_000_000, "--chunk-rows", help="Input chunk size (rows per chunk) for streaming read in pass1."),
-    # genotyping overrides (forwarded into params["genotyping"])
-    min_reads: Optional[int] = typer.Option( None, "--min-reads", help="Override genotyping minimum reads per barcode (default 100)."),
-    beta: Optional[float] = typer.Option(None, "--beta", help="Override genotyping softmax temperature beta (default 0.5)."),
-    w_as: Optional[float] = typer.Option(None, "--w-as", help="Override genotyping AS weight (default 0.5)."),
-    w_mapq: Optional[float] = typer.Option(None, "--w-mapq", help="Override genotyping MAPQ weight (default 1.0)."),
-    w_nm: Optional[float] = typer.Option(None, "--w-nm", help="Override genotyping NM weight (default 1.0, used as penalty)."),
-    ambient_const: Optional[float] = typer.Option(None, "--ambient-const", help="Override genotyping ambient_const (default 1e-3)."),
-    tau_drop: Optional[float] = typer.Option(None, "--tau-drop", help="Override genotyping tau_drop (default 8.0)."),
-    topk_genomes: Optional[int] = typer.Option(None, "--topk-genomes", help="Override genotyping topk_genomes (default 3)."),    
-    shards: Optional[int] = typer.Option(None, "--shards",help="Override genotyping shard count for pass-1 spill (default 32)."),
-    pass1_workers: Optional[int] = typer.Option(None, "--pass1-workers", help="Override genotyping pass-1 workers (default: = genotyping_threads)."),
-    winner_only: Optional[bool] = typer.Option(None, "--winner-only/--no-genotyping-winner-only", help="If set, restrict genotyping to winner reads only (no ambiguous per-read entries)."),
-    ratio_top1_top2_min: Optional[float] = typer.Option(2, "--ratio_top1_top2", help="Minimum p_top1/p_top2 ratio required to accept a confident single call (default 2)."),
+    # Core I/O and runtime
+    config: Path = typer.Option(
+        ...,
+        "--config",
+        "-c",
+        exists=True,
+        readable=True,
+        help="Single-sample JSON config."
+    ),
+    assign_glob: Optional[str] = typer.Option(
+        None,
+        "--assign",
+        help="Glob to assign outputs (parquet/csv/tsv). If omitted, inferred from config/workdir."
+    ),
+    outdir: Optional[Path] = typer.Option(
+        None,
+        "--outdir",
+        help="Override output directory (default: <workdir>/<sample>/final from config)."
+    ),
+    sample: Optional[str] = typer.Option(
+        None,
+        "--sample",
+        help="Override sample name from config."
+    ),
+    make_report: bool = typer.Option(
+        True,
+        "--report/--no-report",
+        help="Render QC PDF report (if implemented)."
+    ),
+    threads: int = typer.Option(
+        16,
+        "--threads",
+        help="Parallel workers for per-cell model selection."
+    ),
+    chunk_rows: int = typer.Option(
+        5_000_000,
+        "--chunk-rows",
+        help="Input chunk size (rows per chunk) for streaming read in pass1."
+    ),
+
+    # Genotyping overrides (forwarded into genotyper)
+    min_reads: Optional[int] = typer.Option(
+        None,
+        "--min-reads",
+        help="Override minimum reads per barcode for genotyping (default 100)."
+    ),
+    beta: Optional[float] = typer.Option(
+        None,
+        "--beta",
+        help="Override softmax temperature beta (default 0.5)."
+    ),
+    w_as: Optional[float] = typer.Option(
+        None,
+        "--w-as",
+        help="Override AS weight (default 0.5)."
+    ),
+    w_mapq: Optional[float] = typer.Option(
+        None,
+        "--w-mapq",
+        help="Override MAPQ weight (default 1.0)."
+    ),
+    w_nm: Optional[float] = typer.Option(
+        None,
+        "--w-nm",
+        help="Override NM weight (penalty; default 1.0)."
+    ),
+    ambient_const: Optional[float] = typer.Option(
+        None,
+        "--ambient-const",
+        help="Override ambient_const (per-read ambient mass; default 1e-3)."
+    ),
+    tau_drop: Optional[float] = typer.Option(
+        None,
+        "--tau-drop",
+        help="Override (currently unused) posterior-odds drop threshold tau_drop (default 8.0)."
+    ),
+    topk_genomes: Optional[int] = typer.Option(
+        None,
+        "--topk-genomes",
+        help="Override number of candidate genomes per barcode (default 3)."
+    ),
+    shards: Optional[int] = typer.Option(
+        None,
+        "--shards",
+        help="Override shard count for pass-1 spill (default 32)."
+    ),
+    pass1_workers: Optional[int] = typer.Option(
+        None,
+        "--pass1-workers",
+        help="Override pass-1 workers (default: = --threads)."
+    ),
+    winner_only: Optional[bool] = typer.Option(
+        None,
+        "--winner-only/--no-winner-only",
+        help=(
+            "If set, collapse each read to its top genome only "
+            "(winner-only mode: all non-ambient mass goes to argmax genome)."
+        ),
+    ),
+    ratio_top1_top2_min: Optional[float] = typer.Option(
+        None,
+        "--ratio-top1-top2-min",
+        help=(
+            "Override minimum p_top1/p_top2 ratio required to accept a confident "
+            "single call (default 3.0)."
+        ),
+    ),
+    single_mass_min: Optional[float] = typer.Option(
+        None,
+        "--single-mass-min",
+        help="Override purity threshold for single calls (default 0.7).",
+    ),
 ):
-    """Posterior-aware genotyping (merge + summarize + optional post-steps)."""
+    """
+    Posterior-aware genotyping (merge → per-cell genotype calls).
+    """
     from .genotyping import genotyping as _run_genotyping
     import glob as _glob
-
-    cfg = _json.loads(Path(config).read_text())
+    
+    cfg = _load_config(config)
     d = _cfg_dirs(cfg); _ensure_dirs(d)
 
     sample = sample or cfg["sample"]
@@ -414,7 +506,7 @@ def genotyping(
             str(chunks_dir / "**" / "*.tsv.gz"),
             str(chunks_dir / "**" / "*.csv.gz"),
         ]
-        matched = []
+        matched: List[str] = []
         for pat in candidate_patterns:
             matched.extend(_glob.glob(pat, recursive=True))
         if not matched:
@@ -431,42 +523,48 @@ def genotyping(
     if "sample" in cfg and cfg["sample"] != sample:
         typer.echo(f"[genotyping] warn: config sample={cfg['sample']} but CLI --sample={sample}")
 
-
-    # I/O hygiene
-    # Bound how many files genotyping tries to open in parallel downstream.
-    # Your genotyper already has a threads parameter; keep it smaller by default.
     threads = max(1, int(threads))
-    
     if threads > 32:
-        typer.echo(f"[genotyping] capping threads from {threads} to 16 for merge memory safety")
+        typer.echo(f"[genotyping] capping threads from {threads} to 32 for merge memory safety")
         threads = 32
 
-    typer.echo(f"[genotyping] sample={sample}  outdir={outdir}")
-    typer.echo(f"[genotyping] assign_glob={assign_glob}")
-    typer.echo(f"[genotyping] threads={threads}  report={'on' if make_report else 'off'}")
- 
+    if pass1_workers is None:
+        pass1_workers = threads
+    else:
+        pass1_workers = max(1, int(pass1_workers))
+
+    typer.echo(
+        "[genotyping] effective overrides: "
+        f"min_reads={min_reads}, beta={beta}, w_as={w_as}, "
+        f"w_mapq={w_mapq}, w_nm={w_nm}, ambient_const={ambient_const}, "
+        f"winner_only={winner_only}, ratio_top1_top2_min={ratio_top1_top2_min}, "
+        f"single_mass_min={single_mass_min}"
+    )
+
+    # Map CLI overrides to actual arguments, falling back to MergeConfig defaults
     _run_genotyping(
         assign=assign_glob,
         outdir=outdir,
         sample=sample,
         make_report=make_report,
-        threads=int(threads),
-        
-        # pass same valie to pass 1 
-        pass1_workers=threads,
-        # explicit numeric defaults to avoid OptionInfo leaking into pydantic:
-        beta=1,
-        w_as=1.0,
-        w_mapq=0.5,
-        w_nm=0.25,
-        ambient_const=1e-3,
-        min_reads=10,
-        tau_drop=8.0,
-        topk_genomes=3,
-        winner_only=False,
-        ratio_top1_top2_min=2,
-        single_mass_min=single_mass_min,
-)
+        threads=threads,
+        chunk_rows=chunk_rows,
+        pass1_workers=pass1_workers,
+        min_reads=min_reads if min_reads is not None else 10,
+        beta=beta if beta is not None else 1,
+        w_as=w_as if w_as is not None else 0.5,
+        w_mapq=w_mapq if w_mapq is not None else 1.0,
+        w_nm=w_nm if w_nm is not None else 1.0,
+        ambient_const=ambient_const if ambient_const is not None else 1e-3,
+        tau_drop=tau_drop if tau_drop is not None else 8.0,
+        topk_genomes=topk_genomes if topk_genomes is not None else 3,
+        winner_only=winner_only if winner_only is not None else False,
+        ratio_top1_top2_min=(
+            ratio_top1_top2_min if ratio_top1_top2_min is not None else 3.0
+        ),
+        single_mass_min=single_mass_min if single_mass_min is not None else 0.7,
+    )
+
 
 # @app.command()
 # def summarize(
