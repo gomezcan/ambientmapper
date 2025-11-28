@@ -132,6 +132,8 @@ class MergeConfig(BaseModel):
     shards: int = 32                  # number of barcode-hash shards
     chunk_rows: int = 5_000_000       # streaming chunk size for input TSVs
     winner_only: bool = False         # if True, collapse each read to its top genome only
+    ratio_top1_top2_min: float = 3.0  # NEW: min p_top1/p_top2 for confident singles
+
 
 # ------------------------------
 # I/O helpers
@@ -529,11 +531,14 @@ def _select_model_for_barcode(L_block: pd.DataFrame,
     if len(singles_sorted) == 2 and (singles_sorted[1]["bic"] - singles_sorted[0]["bic"]) < cfg.near_tie_margin:
         indist = (singles_sorted[0]["g1"], singles_sorted[1]["g1"])
 
-    if out["model"] == "single" and out["purity"] >= cfg.single_mass_min and \
-            (out["bic_doublet"] - out["bic_best"]) >= cfg.bic_margin:
+    if (out["model"] == "single" 
+        and out["purity"] >= cfg.single_mass_min
+        and (out["bic_doublet"] - out["bic_single"]) >= cfg.bic_margin
+        and (ratio12 >= cfg.ratio_top1_top2_min or math.isinf(ratio12))
+       ):
         call = "single"
     elif out["model"] == "doublet" and out["minor"] >= cfg.doublet_minor_min and \
-            (out["bic_single"] - out["bic_best"]) >= cfg.bic_margin:
+            (out["bic_single"] - out["bic_doublet"]) >= cfg.bic_margin:
         call = "doublet"
     elif indist is not None:
         call = "indistinguishable"
@@ -930,6 +935,10 @@ def genotyping(
     chunk_rows: int = typer.Option(1_000_000, help="Input chunk size for streaming read."),
     pass1_workers: Optional[int] = typer.Option(None, help="Parallel workers for Pass 1 (file-level). If None, use --threads."),
     winner_only: bool = typer.Option(True, help="If true, collapse each read to its top genome (winner-only mode)."),
+    ratio_top1_top2_min: float = typer.Option(
+        2.0,
+        help="Minimum p_top1/p_top2 ratio required to accept a confident single call."
+    ),
 ):
     """Run the two-pass pipeline: streaming posterior calc → ambient estimate → per-cell calls."""
     shards = _optint(shards, 32)
@@ -954,6 +963,7 @@ def genotyping(
         shards=shards,
         chunk_rows=chunk_rows,
         winner_only=winner_only,
+        ratio_top1_top2_min=ratio_top1_top2_min
     )
 
     outdir.mkdir(parents=True, exist_ok=True)
