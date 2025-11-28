@@ -286,7 +286,7 @@ def _run_genotyping(ctx: Ctx) -> None:
     chunk_rows = int(gconf.get("chunk_rows", 1_000_000))
 
     # New: winner-only flag
-    winner_only = bool(gconf.get("winner_only", False))
+    winner_only = bool(gconf.get("winner_only", True))
 
     threads = int(gconf.get("threads", threads_global))
     if threads < 1:
@@ -295,6 +295,16 @@ def _run_genotyping(ctx: Ctx) -> None:
     pass1_workers = gconf.get("pass1_workers", None)
     if pass1_workers is not None:
         pass1_workers = max(1, int(pass1_workers))
+
+    # Log the effective genotyping parameters
+    typer.echo(
+        "[genotyping] effective parameters: "
+        f"min_reads={min_reads}, beta={beta}, w_as={w_as}, "
+        f"w_mapq={w_mapq}, w_nm={w_nm}, ambient_const={ambient_const}, "
+        f"topk_genomes={topk_genomes}, shards={shards}, chunk_rows={chunk_rows}, "
+        f"threads={threads}, pass1_workers={pass1_workers or threads}, "
+        f"winner_only={winner_only}"
+    )
 
     _run(
         assign=assign_glob,
