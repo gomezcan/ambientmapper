@@ -371,6 +371,9 @@ def assign(
                 typer.echo(f"[assign/score] {done}/{total} chunks")
     typer.echo("[assign/score] done")
 
+##
+    
+
 @app.command()
 def genotyping(
     config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
@@ -380,6 +383,21 @@ def genotyping(
     make_report: bool = typer.Option(True, "--report/--no-report"),
     threads: int = typer.Option(16, "--threads", help="Parallel workers for per-cell model selection."),
     chunk_rows: int = typer.Option(5_000_000, "--chunk-rows", help="Input chunk size (rows per chunk) for streaming read in pass1."),
+    # genotyping overrides (forwarded into params["genotyping"])
+    min_reads: Optional[int] = typer.Option( None, "--genotyping-min-reads", help="Override genotyping minimum reads per barcode (default 100)."),
+    beta: Optional[float] = typer.Option(None, "--genotyping-beta", help="Override genotyping softmax temperature beta (default 0.5)."),
+    w_as: Optional[float] = typer.Option(None, "--genotyping-w-as", help="Override genotyping AS weight (default 0.5)."),
+    w_mapq: Optional[float] = typer.Option(None, "--genotyping-w-mapq", help="Override genotyping MAPQ weight (default 1.0)."),
+    w_nm: Optional[float] = typer.Option(None, "--genotyping-w-nm", help="Override genotyping NM weight (default 1.0, used as penalty)."),
+    ambient_const: Optional[float] = typer.Option(None, "--genotyping-ambient-const", help="Override genotyping ambient_const (default 1e-3)."),
+    tau_drop: Optional[float] = typer.Option(None, "--genotyping-tau-drop", help="Override genotyping tau_drop (default 8.0)."),
+    topk_genomes: Optional[int] = typer.Option(None, "--genotyping-topk-genomes", help="Override genotyping topk_genomes (default 3)."),
+    threads: Optional[int] = typer.Option(None, "--genotyping-threads", help="Override genotyping shard-level threads (default: pipeline --threads)."),
+    shards: Optional[int] = typer.Option(None, "--genotyping-shards",help="Override genotyping shard count for pass-1 spill (default 32)."),
+    chunk_rows: Optional[int] = typer.Option(None, "--genotyping-chunk-rows", help="Override genotyping pass-1 chunk_rows (default 1,000,000)."),
+    pass1_workers: Optional[int] = typer.Option(None, "--genotyping-pass1-workers", help="Override genotyping pass-1 workers (default: = genotyping_threads)."),
+    winner_only: Optional[bool] = typer.Option(None, "--genotyping-winner-only/--no-genotyping-winner-only", help="If set, restrict genotyping to winner reads only (no ambiguous per-read entries)."),
+    ratio_top1_top2_min: Optional[float] = typer.Option(2, "--genotyping-ratio_top1_top2", help="Minimum p_top1/p_top2 ratio required to accept a confident single call (default 2)."),
 ):
     """Posterior-aware genotyping (merge + summarize + optional post-steps)."""
     from .genotyping import genotyping as _run_genotyping
@@ -449,6 +467,7 @@ def genotyping(
         topk_genomes=3,
         winner_only=False,
         ratio_top1_top2_min=2,
+        single_mass_min=single_mass_min,
 )
 
 # @app.command()
@@ -583,7 +602,10 @@ def run(
         2, "--genotyping-ratio_top1_top2",
         help="Minimum p_top1/p_top2 ratio required to accept a confident single call (default 2).",
     ),
-
+    genotyping_single_mass_min: Optional[float] = typer.Option(
+        None,
+        help="Override purity threshold for single calls (default 0.7).",
+    ),
 ):
     """
     Run the full pipeline with pipeline-wide resume via sentinels.
@@ -628,11 +650,20 @@ def run(
         genotyping_conf["chunk_rows"] = int(genotyping_chunk_rows)
     if genotyping_pass1_workers is not None:
         genotyping_conf["pass1_workers"] = int(genotyping_pass1_workers)
+  
     # NEW: winner_only flag
     if genotyping_winner_only is not None:
         genotyping_conf["winner_only"] = genotyping_winner_only
     if genotyping_ratio_top1_top2_min is not None:
         genotyping_conf["ratio_top1_top2_min"] = genotyping_ratio_top1_top2_min
+
+    if genotyping_conf:
+         params_run["genotyping"] = genotyping_conf
+         typer.echo(
+             "[run] genotyping overrides: "
+             + ", ".join(f"{k}={v}" for k, v in genotyping_conf.items())
+         )
+
         
     params_run = {}
     if genotyping_conf:
