@@ -286,7 +286,7 @@ def _run_genotyping(ctx: Ctx) -> None:
     chunk_rows = int(gconf.get("chunk_rows", 1_000_000))
 
     # New: winner-only flag
-    winner_only = bool(gconf.get("winner_only", True))
+    winner_only = bool(gconf.get("winner_only", False))
 
     threads = int(gconf.get("threads", threads_global))
     if threads < 1:
