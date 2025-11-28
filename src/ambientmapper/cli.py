@@ -450,6 +450,11 @@ def genotyping(
         "--tau-drop",
         help="Override (currently unused) posterior-odds drop threshold tau_drop (default 8.0)."
     ),
+    bic_margin: Optional[float] = typer.Option(
+        None,
+        "--bic-margin",
+        help="Override BIC margin ΔBIC used to accept more complex models (default 6.0).",
+    ),
     topk_genomes: Optional[int] = typer.Option(
         None,
         "--topk-genomes",
@@ -538,7 +543,7 @@ def genotyping(
         f"min_reads={min_reads}, beta={beta}, w_as={w_as}, "
         f"w_mapq={w_mapq}, w_nm={w_nm}, ambient_const={ambient_const}, "
         f"winner_only={winner_only}, ratio_top1_top2_min={ratio_top1_top2_min}, "
-        f"single_mass_min={single_mass_min}"
+        f"single_mass_min={single_mass_min}, bic_margin={bic_margin}"
     )
 
     # Map CLI overrides to actual arguments, falling back to MergeConfig defaults
@@ -557,6 +562,7 @@ def genotyping(
         w_nm=w_nm if w_nm is not None else 1.0,
         ambient_const=ambient_const if ambient_const is not None else 1e-3,
         tau_drop=tau_drop if tau_drop is not None else 8.0,
+        bic_margin=bic_margin if bic_margin is not None else 6.0,
         topk_genomes=topk_genomes if topk_genomes is not None else 3,
         winner_only=winner_only if winner_only is not None else False,
         ratio_top1_top2_min=(
@@ -670,6 +676,11 @@ def run(
         None, "--genotyping-tau-drop",
         help="Override genotyping tau_drop (default 8.0).",
     ),
+    genotyping_bic_margin: Optional[float] = typer.Option(
+        None,
+        "--genotyping-bic-margin",
+        help="Override genotyping BIC margin ΔBIC (default 6.0).",
+    ),
     genotyping_topk_genomes: Optional[int] = typer.Option(
         None, "--genotyping-topk-genomes",
         help="Override genotyping topk_genomes (default 3).",
@@ -754,6 +765,8 @@ def run(
         genotyping_conf["ratio_top1_top2_min"] = float(genotyping_ratio_top1_top2_min)
     if genotyping_single_mass_min is not None:
         genotyping_conf["single_mass_min"] = float(genotyping_single_mass_min)
+    if genotyping_bic_margin is not None:
+        genotyping_conf["bic_margin"] = float(genotyping_bic_margin)
     
     params_run = {}
     if genotyping_conf:
