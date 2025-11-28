@@ -654,14 +654,6 @@ def run(
         genotyping_conf["winner_only"] = genotyping_winner_only
     if genotyping_ratio_top1_top2_min is not None:
         genotyping_conf["ratio_top1_top2_min"] = genotyping_ratio_top1_top2_min
-
-    if genotyping_conf:
-         params_run["genotyping"] = genotyping_conf
-         typer.echo(
-             "[run] genotyping overrides: "
-             + ", ".join(f"{k}={v}" for k, v in genotyping_conf.items())
-         )
-
         
     params_run = {}
     if genotyping_conf:
