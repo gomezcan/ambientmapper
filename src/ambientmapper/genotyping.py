@@ -934,10 +934,8 @@ def genotyping(
     chunk_rows: int = typer.Option(1_000_000, help="Input chunk size for streaming read."),
     pass1_workers: Optional[int] = typer.Option(None, help="Parallel workers for Pass 1 (file-level). If None, use --threads."),
     winner_only: bool = typer.Option(True, help="If true, collapse each read to its top genome (winner-only mode)."),
-    ratio_top1_top2_min: float = typer.Option(
-        2.0,
-        help="Minimum p_top1/p_top2 ratio required to accept a confident single call."
-    ),
+    ratio_top1_top2_min: float = typer.Option(2.0, help="Minimum p_top1/p_top2 ratio required to accept a confident single call."),
+    single_mass_min: float = typer.Option(0.7, help="Minimum (1 - alpha) purity needed to accept a single-genome call."),
 ):
     """Run the two-pass pipeline: streaming posterior calc → ambient estimate → per-cell calls."""
     shards = _optint(shards, 32)
@@ -962,7 +960,8 @@ def genotyping(
         shards=shards,
         chunk_rows=chunk_rows,
         winner_only=winner_only,
-        ratio_top1_top2_min=ratio_top1_top2_min
+        ratio_top1_top2_min=ratio_top1_top2_min,
+        single_mass_min=single_mass_min,
     )
 
     outdir.mkdir(parents=True, exist_ok=True)
