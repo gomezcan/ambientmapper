@@ -302,7 +302,6 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
             out["L"] = L
             out["L_amb"] = L_amb
             records.append(out)
-
     return pd.concat(records, ignore_index=True)
 
 
