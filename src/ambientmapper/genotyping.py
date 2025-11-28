@@ -929,7 +929,7 @@ def genotyping(
     shards: int = typer.Option(32, help="Number of on-disk shards for pass-1 spill."),
     chunk_rows: int = typer.Option(1_000_000, help="Input chunk size for streaming read."),
     pass1_workers: Optional[int] = typer.Option(None, help="Parallel workers for Pass 1 (file-level). If None, use --threads."),
-    winner_only: bool = typer.Option(False, help="If true, collapse each read to its top genome (winner-only mode)."),
+    winner_only: bool = typer.Option(True, help="If true, collapse each read to its top genome (winner-only mode)."),
 ):
     """Run the two-pass pipeline: streaming posterior calc → ambient estimate → per-cell calls."""
     shards = _optint(shards, 32)
