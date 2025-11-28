@@ -525,6 +525,7 @@ def run(
     assign_edges_workers: Optional[int] = typer.Option(None, "--assign-edges-workers"),
     assign_edges_max_reads: Optional[int] = typer.Option(None, "--assign-edges-max-reads"),
     ecdf_workers: Optional[int] = typer.Option(None, "--ecdf-workers"),    
+    
     # genotyping overrides (forwarded into params["genotyping"])
     genotyping_min_reads: Optional[int] = typer.Option(
         None, "--genotyping-min-reads",
@@ -631,8 +632,10 @@ def run(
     # NEW: winner_only flag
     if genotyping_winner_only is not None:
         genotyping_conf["winner_only"] = genotyping_winner_only
+    if genotyping_ratio_top1_top2_min is not None:
+        genotyping_conf["ratio_top1_top2_min"] = genotyping_ratio_top1_top2_min
     if genotyping_conf:
-        params["genotyping"] = genotyping_conf
+        params_run["genotyping"] = genotyping_conf
 
      
     def _do_one(cfg: dict):
