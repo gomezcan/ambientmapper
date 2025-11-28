@@ -132,7 +132,7 @@ class MergeConfig(BaseModel):
     shards: int = 32                  # number of barcode-hash shards
     chunk_rows: int = 5_000_000       # streaming chunk size for input TSVs
     winner_only: bool = False         # if True, collapse each read to its top genome only
-    ratio_top1_top2_min: float = 3.0  # NEW: min p_top1/p_top2 for confident singles
+    ratio_top1_top2_min: float = 2.0  # NEW: min p_top1/p_top2 for confident singles
 
 
 # ------------------------------
