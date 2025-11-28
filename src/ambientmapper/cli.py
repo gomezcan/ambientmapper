@@ -447,7 +447,8 @@ def genotyping(
         min_reads=10,
         tau_drop=8.0,
         topk_genomes=3,
-        winner_only=True,
+        winner_only=False,
+        ratio_top1_top2_min=2,
 )
 
 # @app.command()
@@ -576,6 +577,10 @@ def run(
     genotyping_winner_only: Optional[bool] = typer.Option(
         None, "--genotyping-winner-only/--no-genotyping-winner-only",
         help="If set, restrict genotyping to winner reads only (no ambiguous per-read entries).",
+    ),
+    genotyping_ratio_top1_top2_min: Optional[float] = typer.Option(
+        2, "--genotyping-ratio_top1_top2",
+        help="Minimum p_top1/p_top2 ratio required to accept a confident single call (default 2).",
     ),
 
 ):
