@@ -292,6 +292,7 @@ def _run_genotyping(ctx: Ctx) -> None:
     winner_only = bool(gconf.get("winner_only", False))
     ratio_top1_top2_min = float(gconf.get("tau_drop", 2))
     single_mass_min = float(gconf.get("single_mass_min", 0.7))
+    bic_margin = float(gconf.get("bic_margin", 6.0))
 
     threads = int(gconf.get("threads", threads_global))
     if threads < 1:
@@ -310,7 +311,8 @@ def _run_genotyping(ctx: Ctx) -> None:
         f"threads={threads}, pass1_workers={pass1_workers or threads}, "
         f"winner_only={winner_only}, "
         f"ratio_top1_top2={ratio_top1_top2_min}, "
-        f"single_mass_min={single_mass_min}, "
+        f"single_mass_min={single_mass_min}, ",
+        f"bic_margin={bic_margin}, "
     )
 
     _run(
@@ -324,6 +326,7 @@ def _run_genotyping(ctx: Ctx) -> None:
         w_nm=w_nm,
         ambient_const=ambient_const,
         tau_drop=tau_drop,
+        bic_margin=bic_margin
         topk_genomes=topk_genomes,
         make_report=True,
         threads=threads,
