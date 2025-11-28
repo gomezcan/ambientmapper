@@ -604,8 +604,6 @@ def run(
 
     # Build genotyping overrides for pipeline._run_genotyping
     genotyping_conf: Dict[str, object] = {}
-    params_run = {}
-
     if genotyping_min_reads is not None:
         genotyping_conf["min_reads"] = int(genotyping_min_reads)
     if genotyping_beta is not None:
@@ -635,9 +633,14 @@ def run(
         genotyping_conf["winner_only"] = genotyping_winner_only
     if genotyping_ratio_top1_top2_min is not None:
         genotyping_conf["ratio_top1_top2_min"] = genotyping_ratio_top1_top2_min
+        
+    params_run = {}
     if genotyping_conf:
         params_run["genotyping"] = genotyping_conf
-
+        typer.echo(
+            "[run] genotyping overrides: "
+            + ", ".join(f"{k}={v}" for k, v in genotyping_conf.items())
+        )
      
     def _do_one(cfg: dict):
         _apply_assign_overrides(
