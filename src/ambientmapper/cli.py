@@ -439,14 +439,15 @@ def genotyping(
         # pass same valie to pass 1 
         pass1_workers=threads,
         # explicit numeric defaults to avoid OptionInfo leaking into pydantic:
-        beta=0.5,
+        beta=1,
         w_as=1.0,
         w_mapq=0.5,
         w_nm=0.25,
         ambient_const=1e-3,
-        min_reads=100,
+        min_reads=10,
         tau_drop=8.0,
         topk_genomes=3,
+        winner_only=True,
 )
 
 # @app.command()
@@ -572,6 +573,11 @@ def run(
         None, "--genotyping-pass1-workers",
         help="Override genotyping pass-1 workers (default: = genotyping_threads).",
     ),
+    genotyping_winner_only: Optional[bool] = typer.Option(
+        None, "--genotyping-winner-only/--no-genotyping-winner-only",
+        help="If set, restrict genotyping to winner reads only (no ambiguous per-read entries).",
+    ),
+
 ):
     """
     Run the full pipeline with pipeline-wide resume via sentinels.
@@ -617,6 +623,11 @@ def run(
         genotyping_conf["chunk_rows"] = int(genotyping_chunk_rows)
     if genotyping_pass1_workers is not None:
         genotyping_conf["pass1_workers"] = int(genotyping_pass1_workers)
+    # NEW: winner_only flag
+    if genotyping_winner_only is not None:
+        genotyping_conf["winner_only"] = genotyping_winner_only
+    if genotyping_conf:
+        params["genotyping"] = genotyping_conf
 
      
     def _do_one(cfg: dict):
