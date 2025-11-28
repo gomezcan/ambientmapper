@@ -287,6 +287,7 @@ def _run_genotyping(ctx: Ctx) -> None:
 
     # New: winner-only flag
     winner_only = bool(gconf.get("winner_only", False))
+    ratio_top1_top2_min = float(gconf.get("tau_drop", 2))
 
     threads = int(gconf.get("threads", threads_global))
     if threads < 1:
@@ -303,7 +304,8 @@ def _run_genotyping(ctx: Ctx) -> None:
         f"w_mapq={w_mapq}, w_nm={w_nm}, ambient_const={ambient_const}, "
         f"topk_genomes={topk_genomes}, shards={shards}, chunk_rows={chunk_rows}, "
         f"threads={threads}, pass1_workers={pass1_workers or threads}, "
-        f"winner_only={winner_only}"
+        f"winner_only={winner_only}, "
+        f"ratio_top1_top2={ratio_top1_top2_min}, "
     )
 
     _run(
@@ -323,7 +325,8 @@ def _run_genotyping(ctx: Ctx) -> None:
         shards=shards,
         chunk_rows=chunk_rows,
         pass1_workers=pass1_workers,
-        winner_only=winner_only,   # <-- pass through
+        winner_only=winner_only,   
+        ratio_top1_top2_min = ratio_top1_top2_min,
     )
 
 def _run_interpool(ctx: Ctx) -> None:
