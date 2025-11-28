@@ -267,15 +267,15 @@ def _run_genotyping(ctx: Ctx) -> None:
     # Genotyping-specific overrides from params (set by CLI `run`)
     gconf = ctx.params.get("genotyping", {}) or {}
 
-    min_reads = int(gconf.get("min_reads", 100))
-    beta = float(gconf.get("beta", 0.5))
+    min_reads = int(gconf.get("min_reads", 5))
+    beta = float(gconf.get("beta", 1))
     w_as = float(gconf.get("w_as", 0.5))
     w_mapq = float(gconf.get("w_mapq", 1.0))
     w_nm = float(gconf.get("w_nm", 1.0))
     ambient_const = float(gconf.get("ambient_const", 1e-3))
     tau_drop = float(gconf.get("tau_drop", 8.0))
-    topk_genomes = int(gconf.get("topk_genomes", 3))
-    shards = int(gconf.get("shards", 32))
+    topk_genomes = int(gconf.get("topk_genomes", 2))
+    shards = int(gconf.get("shards", 40))
     chunk_rows = int(gconf.get("chunk_rows", 1_000_000))
 
     threads = int(gconf.get("threads", threads_global))
@@ -303,6 +303,7 @@ def _run_genotyping(ctx: Ctx) -> None:
         shards=shards,
         chunk_rows=chunk_rows,
         pass1_workers=pass1_workers,
+        winner_only=winner_only,
     )
 
 def _run_interpool(ctx: Ctx) -> None:
