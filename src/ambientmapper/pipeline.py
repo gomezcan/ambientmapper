@@ -294,7 +294,7 @@ def _run_genotyping(ctx: Ctx) -> None:
     single_mass_min = float(gconf.get("single_mass_min", 0.7))
     ratio_top1_top2_min = float(gconf.get("ratio_top1_top2_min", 2.0))
     bic_margin = float(gconf.get("bic_margin", 6.0))
-    doublet_minor_min = float(gconf.get("doublet_minor_min", cfg_model.get("doublet_minor_min", 0.20)))
+    doublet_minor_min = float(gconf.get("doublet_minor_min", 0.2))
 
 
     threads = int(gconf.get("threads", threads_global))
