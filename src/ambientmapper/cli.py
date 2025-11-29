@@ -555,20 +555,18 @@ def genotyping(
         threads=threads,
         chunk_rows=chunk_rows,
         pass1_workers=pass1_workers,
-        min_reads=min_reads if min_reads is not None else 10,
-        beta=beta if beta is not None else 1,
-        w_as=w_as if w_as is not None else 0.5,
-        w_mapq=w_mapq if w_mapq is not None else 1.0,
-        w_nm=w_nm if w_nm is not None else 1.0,
-        ambient_const=ambient_const if ambient_const is not None else 1e-3,
-        tau_drop=tau_drop if tau_drop is not None else 8.0,
-        bic_margin=bic_margin if bic_margin is not None else 6.0,
-        topk_genomes=topk_genomes if topk_genomes is not None else 3,
-        winner_only=winner_only if winner_only is not None else False,
-        ratio_top1_top2_min=(
-            ratio_top1_top2_min if ratio_top1_top2_min is not None else 3.0
-        ),
-        single_mass_min=single_mass_min if single_mass_min is not None else 0.7,
+        min_reads=(min_reads if min_reads is not None else 10),
+        beta=(beta if beta is not None else 1),
+        w_as=(w_as if w_as is not None else 0.5),
+        w_mapq=(w_mapq if w_mapq is not None else 1.0),
+        w_nm=(w_nm if w_nm is not None else 1.0),
+        ambient_const=(ambient_const if ambient_const is not None else 1e-3),
+        tau_drop=(tau_drop if tau_drop is not None else 8.0),
+        bic_margin=(bic_margin if bic_margin is not None else 6.0),
+        topk_genomes=(topk_genomes if topk_genomes is not None else 3),
+        winner_only=(winner_only if winner_only is not None else False),
+        ratio_top1_top2_min=(ratio_top1_top2_min is not None else 3.0),
+        single_mass_min=(single_mass_min if single_mass_min is not None else 0.7),
     )
 
 
@@ -648,69 +646,53 @@ def run(
     ecdf_workers: Optional[int] = typer.Option(None, "--ecdf-workers"),    
     
     # genotyping overrides (forwarded into params["genotyping"])
-    genotyping_min_reads: Optional[int] = typer.Option(
-        None, "--genotyping-min-reads",
+    genotyping_min_reads: Optional[int] = typer.Option(None, "--genotyping-min-reads",
         help="Override genotyping minimum reads per barcode (default 100).",
     ),
-    genotyping_beta: Optional[float] = typer.Option(
-        None, "--genotyping-beta",
+    genotyping_beta: Optional[float] = typer.Option(None, "--genotyping-beta",
         help="Override genotyping softmax temperature beta (default 0.5).",
     ),
-    genotyping_w_as: Optional[float] = typer.Option(
-        None, "--genotyping-w-as",
+    genotyping_w_as: Optional[float] = typer.Option(None, "--genotyping-w-as",
         help="Override genotyping AS weight (default 0.5).",
     ),
-    genotyping_w_mapq: Optional[float] = typer.Option(
-        None, "--genotyping-w-mapq",
+    genotyping_w_mapq: Optional[float] = typer.Option(None, "--genotyping-w-mapq",
         help="Override genotyping MAPQ weight (default 1.0).",
     ),
-    genotyping_w_nm: Optional[float] = typer.Option(
-        None, "--genotyping-w-nm",
+    genotyping_w_nm: Optional[float] = typer.Option(None, "--genotyping-w-nm",
         help="Override genotyping NM weight (default 1.0, used as penalty).",
     ),
-    genotyping_ambient_const: Optional[float] = typer.Option(
-        None, "--genotyping-ambient-const",
+    genotyping_ambient_const: Optional[float] = typer.Option(None, "--genotyping-ambient-const",
         help="Override genotyping ambient_const (default 1e-3).",
     ),
-    genotyping_tau_drop: Optional[float] = typer.Option(
-        None, "--genotyping-tau-drop",
+    genotyping_tau_drop: Optional[float] = typer.Option(None, "--genotyping-tau-drop",
         help="Override genotyping tau_drop (default 8.0).",
     ),
-    genotyping_bic_margin: Optional[float] = typer.Option(
-        None,
+    genotyping_bic_margin: Optional[float] = typer.Option(None,
         "--genotyping-bic-margin",
         help="Override genotyping BIC margin ΔBIC (default 6.0).",
     ),
-    genotyping_topk_genomes: Optional[int] = typer.Option(
-        None, "--genotyping-topk-genomes",
+    genotyping_topk_genomes: Optional[int] = typer.Option(None, "--genotyping-topk-genomes",
         help="Override genotyping topk_genomes (default 3).",
     ),
-    genotyping_threads: Optional[int] = typer.Option(
-        None, "--genotyping-threads",
+    genotyping_threads: Optional[int] = typer.Option(None, "--genotyping-threads",
         help="Override genotyping shard-level threads (default: pipeline --threads).",
     ),
-    genotyping_shards: Optional[int] = typer.Option(
-        None, "--genotyping-shards",
+    genotyping_shards: Optional[int] = typer.Option(None, "--genotyping-shards",
         help="Override genotyping shard count for pass-1 spill (default 32).",
     ),
-    genotyping_chunk_rows: Optional[int] = typer.Option(
-        None, "--genotyping-chunk-rows",
+    genotyping_chunk_rows: Optional[int] = typer.Option(None, "--genotyping-chunk-rows",
         help="Override genotyping pass-1 chunk_rows (default 1,000,000).",
     ),
-    genotyping_pass1_workers: Optional[int] = typer.Option(
-        None, "--genotyping-pass1-workers",
+    genotyping_pass1_workers: Optional[int] = typer.Option(None, "--genotyping-pass1-workers",
         help="Override genotyping pass-1 workers (default: = genotyping_threads).",
     ),
-    genotyping_winner_only: Optional[bool] = typer.Option(
-        None, "--genotyping-winner-only/--no-genotyping-winner-only",
+    genotyping_winner_only: Optional[bool] = typer.Option(None, "--genotyping-winner-only/--no-genotyping-winner-only",
         help="If set, restrict genotyping to winner reads only (no ambiguous per-read entries).",
     ),
-    genotyping_ratio_top1_top2_min: Optional[float] = typer.Option(
-        2, "--genotyping-ratio-top1-top2-min",
+    genotyping_ratio_top1_top2_min: Optional[float] = typer.Option(None, "--genotyping-ratio-top1-top2-min",
         help="Minimum p_top1/p_top2 ratio required to accept a confident single call (default 2).",
     ),
-    genotyping_single_mass_min: Optional[float] = typer.Option(
-        None, "--genotyping-single-mass-min",
+    genotyping_single_mass_min: Optional[float] = typer.Option(None, "--genotyping-single-mass-min",
         help="Override purity threshold for single calls (default 0.7).",
     ),
 ):
