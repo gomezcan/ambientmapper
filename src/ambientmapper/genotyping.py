@@ -974,7 +974,7 @@ def genotyping(
         winner_only=winner_only,
         ratio_top1_top2_min=ratio_top1_top2_min,
         single_mass_min=single_mass_min,
-        doublet-minor-min=doublet-minor-min,
+        doublet_minor_min=doublet_minor_min,
     )
 
     outdir.mkdir(parents=True, exist_ok=True)
