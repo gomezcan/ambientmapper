@@ -311,7 +311,7 @@ def _run_genotyping(ctx: Ctx) -> None:
         f"winner_only={winner_only}, "
         f"ratio_top1_top2={ratio_top1_top2_min}, "
         f"single_mass_min={single_mass_min}, ",
-        f"bic_margin={bic_margin}, "
+        f"abic_margin={bic_margin}"
     )
 
     _run(
