@@ -304,17 +304,15 @@ def _run_genotyping(ctx: Ctx) -> None:
         pass1_workers = max(1, int(pass1_workers))
 
     # Log the effective genotyping parameters
-    typer.echo(
+    # Log the effective genotyping parameters (single positional argument!)
+    msg = (
         "[genotyping] effective parameters: "
         f"min_reads={min_reads}, beta={beta}, w_as={w_as}, "
         f"w_mapq={w_mapq}, w_nm={w_nm}, ambient_const={ambient_const}, "
-        f"topk_genomes={topk_genomes}, shards={shards}, chunk_rows={chunk_rows}, "
-        f"threads={threads}, pass1_workers={pass1_workers or threads}, "
-        f"winner_only={winner_only}, "
-        f"ratio_top1_top2={ratio_top1_top2_min}, "
-        f"single_mass_min={single_mass_min}, ",
-        f"abic_margin={bic_margin}"
+        f"single_mass_min={single_mass_min}, bic_margin={bic_margin}, "
+        f"ratio_top1_top2_min={ratio_top1_top2_min}, winner_only={winner_only}"
     )
+    typer.echo(msg)
 
     _run(
         assign=assign_glob,
