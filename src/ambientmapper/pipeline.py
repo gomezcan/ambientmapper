@@ -256,6 +256,8 @@ def _run_assign(ctx: Ctx) -> None:
 
 def _run_genotyping(ctx: Ctx) -> None:
     from .genotyping import genotyping as _run
+    import typer
+
     cfg = ctx.cfg
     d = ctx.dirs
 
