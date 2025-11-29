@@ -120,7 +120,7 @@ class MergeConfig(BaseModel):
     p_eps: float = 1e-3               # floor for p-value penalty gamma = max(eps,1-p)
     min_reads: int = 100              # minimum reads to attempt a confident call
     single_mass_min: float = 0.85     # mass threshold for single call
-    doublet_minor_min: float = 0.20   # minor fraction threshold for doublet
+    doublet_minor_min: float = 0.20   # minor fraction threshold for doublet    
     bic_margin: float = 6.0           # ΔBIC to accept more complex model
     near_tie_margin: float = 2.0      # ΔBIC below which genomes are indistinguishable
     tau_drop: float = 8.0             # posterior-odds threshold (now unused)
@@ -937,6 +937,7 @@ def genotyping(
     ambient_const: float = typer.Option(1e-3, help="Ambient constant mass per read before normalization."),
     tau_drop: float = typer.Option(8.0, help="(unused) Posterior-odds threshold for drops."),
     bic_margin: float = typer.Option(6.0, "--bic-margin", help="ΔBIC margin required to accept a more complex model (default 6.0).",),
+    doublet_minor_min: float = typer.Option(0.2, "--doublet-minor-min", help="Minor-fraction threshold for calling doublets (default 0.20).",),
     topk_genomes: int = typer.Option(3, help="Number of candidate genomes per barcode to consider."),
     make_report: bool = typer.Option(True, help="(unused) Render QC PDF report."),
     threads: int = typer.Option(1, help="Parallel workers for per-cell model selection (Pass 2)."),
