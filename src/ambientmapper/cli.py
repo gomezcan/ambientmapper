@@ -692,6 +692,9 @@ def run(
     genotyping_ratio_top1_top2_min: Optional[float] = typer.Option(None, "--genotyping-ratio-top1-top2-min",
         help="Minimum p_top1/p_top2 ratio required to accept a confident single call (default 2).",
     ),
+    genotyping_doublet_minor_min: Optional[float] = typer.Option(None, "--genotyping-doublet-minor-min",
+        help="Override minor-fraction threshold for calling doublets (default 0.20).",
+    ),
     genotyping_single_mass_min: Optional[float] = typer.Option(None, "--genotyping-single-mass-min",
         help="Override purity threshold for single calls (default 0.7).",
     ),
@@ -749,6 +752,9 @@ def run(
         genotyping_conf["single_mass_min"] = float(genotyping_single_mass_min)
     if genotyping_bic_margin is not None:
         genotyping_conf["bic_margin"] = float(genotyping_bic_margin)
+    if genotyping_doublet_minor_min is not None:
+        genotyping_conf["doublet_minor_min"] = float(genotyping_doublet_minor_min)
+
     
     params_run = {}
     if genotyping_conf:
