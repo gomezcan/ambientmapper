@@ -294,6 +294,8 @@ def _run_genotyping(ctx: Ctx) -> None:
     single_mass_min = float(gconf.get("single_mass_min", 0.7))
     ratio_top1_top2_min = float(gconf.get("ratio_top1_top2_min", 2.0))
     bic_margin = float(gconf.get("bic_margin", 6.0))
+    doublet_minor_min = float(gconf.get("doublet_minor_min", cfg_model.get("doublet_minor_min", 0.20)))
+
 
     threads = int(gconf.get("threads", threads_global))
     if threads < 1:
@@ -310,7 +312,7 @@ def _run_genotyping(ctx: Ctx) -> None:
         f"min_reads={min_reads}, beta={beta}, w_as={w_as}, "
         f"w_mapq={w_mapq}, w_nm={w_nm}, ambient_const={ambient_const}, "
         f"single_mass_min={single_mass_min}, bic_margin={bic_margin}, "
-        f"ratio_top1_top2_min={ratio_top1_top2_min}, winner_only={winner_only}"
+        f"ratio_top1_top2_min={ratio_top1_top2_min}, winner_only={winner_only}, doublet_minor_min={doublet_minor_min}"
     )
     typer.echo(msg)
 
@@ -335,6 +337,7 @@ def _run_genotyping(ctx: Ctx) -> None:
         winner_only=winner_only,   
         ratio_top1_top2_min = ratio_top1_top2_min,
         single_mass_min=single_mass_min,
+        doublet_minor_min=doublet_minor_min,
     )
 
 def _run_interpool(ctx: Ctx) -> None:
