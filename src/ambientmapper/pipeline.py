@@ -286,12 +286,11 @@ def _run_genotyping(ctx: Ctx) -> None:
     shards = int(gconf.get("shards", 32))
     chunk_rows = int(gconf.get("chunk_rows", 1_000_000))
     winner_only = bool(gconf.get("winner_only", False))
-    ratio_top1_top2_min = float(gconf.get("ratio_top1_top2_min", 2.0))
-
+    
     # New: winner-only flag
     winner_only = bool(gconf.get("winner_only", False))
-    ratio_top1_top2_min = float(gconf.get("tau_drop", 2))
     single_mass_min = float(gconf.get("single_mass_min", 0.7))
+    ratio_top1_top2_min = float(gconf.get("ratio_top1_top2_min", 2.0))
     bic_margin = float(gconf.get("bic_margin", 6.0))
 
     threads = int(gconf.get("threads", threads_global))
