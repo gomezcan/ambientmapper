@@ -565,7 +565,7 @@ def genotyping(
         bic_margin=(bic_margin if bic_margin is not None else 6.0),
         topk_genomes=(topk_genomes if topk_genomes is not None else 3),
         winner_only=(winner_only if winner_only is not None else False),
-        ratio_top1_top2_min=(ratio_top1_top2_min is not None else 3.0),
+        ratio_top1_top2_min=(ratio_top1_top2_min if ratio_top1_top2_min is not None else 3.0),
         single_mass_min=(single_mass_min if single_mass_min is not None else 0.7),
     )
 
