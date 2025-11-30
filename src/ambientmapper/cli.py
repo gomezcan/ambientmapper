@@ -445,11 +445,6 @@ def genotyping(
         "--ambient-const",
         help="Override ambient_const (per-read ambient mass; default 1e-3)."
     ),
-    tau_drop: Optional[float] = typer.Option(
-        None,
-        "--tau-drop",
-        help="Override (currently unused) posterior-odds drop threshold tau_drop (default 8.0)."
-    ),
     bic_margin: Optional[float] = typer.Option(
         None,
         "--bic-margin",
@@ -725,9 +720,7 @@ def run(
     if genotyping_w_nm is not None:
         genotyping_conf["w_nm"] = float(genotyping_w_nm)
     if genotyping_ambient_const is not None:
-        genotyping_conf["ambient_const"] = float(genotyping_ambient_const)
-    if genotyping_tau_drop is not None:
-        genotyping_conf["tau_drop"] = float(genotyping_tau_drop)
+        genotyping_conf["ambient_const"] = float(genotyping_ambient_const)    
     if genotyping_topk_genomes is not None:
         genotyping_conf["topk_genomes"] = int(genotyping_topk_genomes)
     if genotyping_threads is not None:
