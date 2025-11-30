@@ -283,7 +283,6 @@ def _run_genotyping(ctx: Ctx) -> None:
     w_mapq = float(gconf.get("w_mapq", 1.0))
     w_nm = float(gconf.get("w_nm", 1.0))
     ambient_const = float(gconf.get("ambient_const", 1e-3))
-    tau_drop = float(gconf.get("tau_drop", 8.0))
     topk_genomes = int(gconf.get("topk_genomes", 3))
     shards = int(gconf.get("shards", 32))
     chunk_rows = int(gconf.get("chunk_rows", 1_000_000))
@@ -325,8 +324,7 @@ def _run_genotyping(ctx: Ctx) -> None:
         w_as=w_as,
         w_mapq=w_mapq,
         w_nm=w_nm,
-        ambient_const=ambient_const,
-        tau_drop=tau_drop,
+        ambient_const=ambient_const,        
         bic_margin=bic_margin,
         topk_genomes=topk_genomes,
         make_report=True,
