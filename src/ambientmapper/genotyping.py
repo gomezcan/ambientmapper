@@ -120,7 +120,6 @@ class MergeConfig(BaseModel):
     doublet_minor_min: float = 0.20   # minor fraction threshold for doublet
     bic_margin: float = 6.0           # ΔBIC to accept more complex model
     near_tie_margin: float = 2.0      # |ΔBIC| below which models are considered tied
-    tau_drop: float = 8.0             # (unused)
 
     alpha_grid: float = 0.02          # step for ambient fraction grid in [0, 0.5]
     rho_grid: float = 0.05            # step for doublet mixture grid in [0.1, 0.9]
@@ -1003,8 +1002,7 @@ def genotyping(
         w_mapq=w_mapq,
         w_nm=w_nm,
         ambient_const=ambient_const,
-        min_reads=min_reads,
-        tau_drop=tau_drop,
+        min_reads=min_reads,        
         bic_margin=bic_margin,
         topk_genomes=topk_genomes,
         sample=sample,
