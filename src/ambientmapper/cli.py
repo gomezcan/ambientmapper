@@ -398,11 +398,6 @@ def genotyping(
         "--sample",
         help="Override sample name from config."
     ),
-    make_report: bool = typer.Option(
-        True,
-        "--report/--no-report",
-        help="Render QC PDF report (if implemented)."
-    ),
     threads: int = typer.Option(
         16,
         "--threads",
