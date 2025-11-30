@@ -540,8 +540,7 @@ def genotyping(
     _run_genotyping(
         assign=assign_glob,
         outdir=outdir,
-        sample=sample,
-        make_report=make_report,
+        sample=sample,        
         threads=threads,
         chunk_rows=chunk_rows,
         pass1_workers=pass1_workers,
