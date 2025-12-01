@@ -1013,6 +1013,14 @@ def genotyping(
     threads = max(1, int(threads))
     pass1_workers = max(1, int(pass1_workers or threads))
 
+    # Handle floats that might come in as OptionInfo
+    def _optfloat(x, default):
+        if hasattr(x, "default"): return float(x.default)
+        return float(x) if x is not None else default
+
+    tau_drop_val = _optfloat(tau_drop, 8.0)
+
+  
     cfg = MergeConfig(
         beta=beta,
         w_as=w_as,
@@ -1020,7 +1028,7 @@ def genotyping(
         w_nm=w_nm,
         ambient_const=ambient_const,
         min_reads=min_reads,
-        #tau_drop=tau_drop,
+        tau_drop=tau_drop_val,
         bic_margin=bic_margin,
         topk_genomes=topk_genomes,
         sample=sample,
