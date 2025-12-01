@@ -122,7 +122,7 @@ class MergeConfig(BaseModel):
     doublet_minor_min: float = 0.20   # minor fraction threshold for doublet
     bic_margin: float = 6.0           # ΔBIC to accept more complex model
     near_tie_margin: float = 2.0      # |ΔBIC| below which models are considered tied
-    #tau_drop: float = 8.0             # (unused; reserved for per-read drop table)
+    tau_drop: float = 8.0             # (unused; reserved for per-read drop table)
 
     alpha_grid: float = 0.02          # step for ambient fraction grid in [0, 0.5]
     rho_grid: float = 0.05            # step for doublet mixture grid in [0.1, 0.9]
@@ -982,7 +982,7 @@ def genotyping(
     w_mapq: float = typer.Option(1.0, help="Weight for MAPQ."),
     w_nm: float = typer.Option(1.0, help="Weight for NM (penalty)."),
     ambient_const: float = typer.Option(1e-3, help="Ambient constant."),
-    #tau_drop: float = typer.Option(8.0, help="Unused (reserved)."),
+    tau_drop: float = typer.Option(8.0, help="Unused (reserved)."),
     bic_margin: float = typer.Option(
         6.0, "--bic-margin", help="ΔBIC margin for complex model (default 6.0)."
     ),
