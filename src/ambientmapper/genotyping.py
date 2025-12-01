@@ -122,7 +122,7 @@ class MergeConfig(BaseModel):
     doublet_minor_min: float = 0.20   # minor fraction threshold for doublet
     bic_margin: float = 6.0           # ΔBIC to accept more complex model
     near_tie_margin: float = 2.0      # |ΔBIC| below which models are considered tied
-    tau_drop: float = 8.0             # (unused; reserved for per-read drop table)
+    #tau_drop: float = 8.0             # (unused; reserved for per-read drop table)
 
     alpha_grid: float = 0.02          # step for ambient fraction grid in [0, 0.5]
     rho_grid: float = 0.05            # step for doublet mixture grid in [0.1, 0.9]
@@ -982,7 +982,7 @@ def genotyping(
     w_mapq: float = typer.Option(1.0, help="Weight for MAPQ."),
     w_nm: float = typer.Option(1.0, help="Weight for NM (penalty)."),
     ambient_const: float = typer.Option(1e-3, help="Ambient constant."),
-    tau_drop: float = typer.Option(8.0, help="Unused (reserved)."),
+    #tau_drop: float = typer.Option(8.0, help="Unused (reserved)."),
     bic_margin: float = typer.Option(
         6.0, "--bic-margin", help="ΔBIC margin for complex model (default 6.0)."
     ),
@@ -990,7 +990,7 @@ def genotyping(
         0.2, "--doublet-minor-min", help="Minor-fraction threshold for doublets (default 0.20)."
     ),
     topk_genomes: int = typer.Option(3, help="Candidate genomes per barcode."),
-    make_report: bool = typer.Option(True, help="Unused (reserved)."),
+    #make_report: bool = typer.Option(True, help="Unused (reserved)."),
     threads: int = typer.Option(1, help="Pass-2 workers."),
     shards: int = typer.Option(32, help="Pass-1 spill shards."),
     chunk_rows: int = typer.Option(1_000_000, help="Input chunk size."),
@@ -1020,7 +1020,7 @@ def genotyping(
         w_nm=w_nm,
         ambient_const=ambient_const,
         min_reads=min_reads,
-        tau_drop=tau_drop,
+        #tau_drop=tau_drop,
         bic_margin=bic_margin,
         topk_genomes=topk_genomes,
         sample=sample,
