@@ -63,9 +63,11 @@ Outputs (current design)
   - <outdir>/<sample>_expected_counts_by_genome.csv
       Barcode × genome expected-count matrix (debug/inspection).
 
-This version implements "Single-by-Default" logic and "Winner-Only" filtering
-for robust handling of highly similar genomes.
-
+This version implements:
+  * Winner-only fast path (per-read best alignment, constant L with ambient)
+  * Full probabilistic slow path (per-read soft posteriors via z-scored scores)
+  * "Single-by-default" calling: assume single unless doublet evidence is strong,
+    with an intermediate indistinguishable state for near-ties.
 """
 
 from __future__ import annotations
@@ -78,7 +80,7 @@ import shutil
 import warnings
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -86,7 +88,7 @@ import typer
 from pydantic import BaseModel
 from tqdm import tqdm
 
-# Optional plotting imports
+# Optional plotting imports (not used here, but kept for potential reports)
 try:
     import matplotlib.pyplot as plt  # noqa: F401
     import seaborn as sns  # noqa: F401
@@ -116,10 +118,11 @@ class MergeConfig(BaseModel):
     p_eps: float = 1e-3               # floor for p-value penalty gamma = max(eps, 1-p)
 
     min_reads: int = 100              # minimum reads to attempt a confident call
-    single_mass_min: float = 0.85     # mass threshold for single call
+    single_mass_min: float = 0.85     # mass/purity threshold for single call
     doublet_minor_min: float = 0.20   # minor fraction threshold for doublet
     bic_margin: float = 6.0           # ΔBIC to accept more complex model
     near_tie_margin: float = 2.0      # |ΔBIC| below which models are considered tied
+    tau_drop: float = 8.0             # (unused; reserved for per-read drop table)
 
     alpha_grid: float = 0.02          # step for ambient fraction grid in [0, 0.5]
     rho_grid: float = 0.05            # step for doublet mixture grid in [0.1, 0.9]
@@ -225,7 +228,7 @@ def _optint(x: Any, default: int) -> int:
 # ------------------------------
 
 def _zscore_series(x: np.ndarray) -> np.ndarray:
-    # robust z: center by median, scale by MAD (fallback to std if MAD small)
+    """Robust z-score: median/MAD, fallback to std."""
     med = np.median(x)
     mad = np.median(np.abs(x - med))
     if mad < 1e-6:
@@ -236,40 +239,77 @@ def _zscore_series(x: np.ndarray) -> np.ndarray:
 
 
 def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame:
-    """Compute L_{r,g} with local per-read z-scoring.
-    
-    If cfg.winner_only is True, collapse each read to its top genome:
-      - keep only the argmax-L genome row
-      - assign it all non-ambient mass (1 - L_amb), with L_amb unchanged.
+    """
+    Compute posteriors L_{r,g}.
+
+    Fast path (winner_only=True):
+      - Pick the best alignment per read based on (AS, MAPQ, NM)
+      - Assign L = const, L_amb = const_amb, independent of scores.
+
+    Slow path (winner_only=False):
+      - Within-read robust z-scoring of AS/MAPQ/NM
+      - Combine into S, apply softmax with ambient_const.
     """
     missing = REQUIRED_COLS - set(df.columns)
     if missing:
         raise ValueError(f"assign table missing required columns: {missing}")
 
-    # Build a per-read key for grouping
     df = df.copy()
+    # unique read id
     df["_rid"] = df["barcode"].astype(str) + "::" + df["read_id"].astype(str)
 
-    # --- Robust z-scaling within each read ---
-    S_parts = []
+    # ---------------------------------------------------------
+    # FAST PATH: Winner-Only
+    # ---------------------------------------------------------
+    if cfg.winner_only:
+        # Ensure required score columns exist
+        for col in ("AS", "MAPQ", "NM"):
+            if col not in df.columns:
+                raise ValueError("winner_only=True requires AS, MAPQ, NM columns")
+
+        # Invert AS and MAPQ (since sort is ascending) and keep NM as is
+        df["_sort_as"] = -df["AS"].fillna(-9999)
+        df["_sort_mapq"] = -df["MAPQ"].fillna(-1)
+        df["_sort_nm"] = df["NM"].fillna(9999)
+
+        df = df.sort_values(
+            by=["_rid", "_sort_as", "_sort_mapq", "_sort_nm"],
+            ascending=[True, True, True, True],
+        )
+        # winner per read
+        out = df.drop_duplicates(subset=["_rid"], keep="first").copy()
+
+        denom = 1.0 + cfg.ambient_const
+        out["L"] = 1.0 / denom
+        out["L_amb"] = cfg.ambient_const / denom
+
+        return out[["barcode", "read_id", "genome", "L", "L_amb"]].reset_index(drop=True)
+
+    # ---------------------------------------------------------
+    # SLOW PATH: Full Probabilistic Model
+    # ---------------------------------------------------------
+
+    # Optimize groupby by using integer codes for _rid
+    df["_rid_code"] = df["_rid"].astype("category").cat.codes
+
+    S_parts: List[np.ndarray] = []
 
     if "AS" in df.columns:
-        S_as = df.groupby("_rid", observed=True)["AS"].transform(
+        S_as = df.groupby("_rid_code", observed=True)["AS"].transform(
             lambda s: _zscore_series(s.to_numpy(dtype=float))
         )
         S_parts.append(cfg.w_as * S_as.to_numpy(dtype=float))
 
     if "MAPQ" in df.columns:
-        S_mq = df.groupby("_rid", observed=True)["MAPQ"].transform(
+        S_mq = df.groupby("_rid_code", observed=True)["MAPQ"].transform(
             lambda s: _zscore_series(s.to_numpy(dtype=float))
         )
         S_parts.append(cfg.w_mapq * S_mq.to_numpy(dtype=float))
 
     if "NM" in df.columns:
-        S_nm = df.groupby("_rid", observed=True)["NM"].transform(
+        S_nm = df.groupby("_rid_code", observed=True)["NM"].transform(
             lambda s: _zscore_series(s.to_numpy(dtype=float))
         )
-        # lower NM is better -> negative weight
         S_parts.append(-cfg.w_nm * S_nm.to_numpy(dtype=float))
 
     if S_parts:
@@ -277,7 +317,7 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
     else:
         S = np.zeros(len(df), dtype=float)
 
-    # p-value penalty (global scale is fine for probabilities)
+    # p-value penalty
     if "p_as" in df.columns or "p_mq" in df.columns:
         pa = df["p_as"].to_numpy(dtype=float) if "p_as" in df.columns else np.ones(len(df))
         pm = df["p_mq"].to_numpy(dtype=float) if "p_mq" in df.columns else np.ones(len(df))
@@ -288,32 +328,14 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
 
     w = np.exp(cfg.beta * S) * gamma
 
-    # Sum of w per read + ambient
     df["_tmp_w"] = w
-    w_sum = df.groupby("_rid", observed=True)["_tmp_w"].transform("sum")
+    w_sum = df.groupby("_rid_code", observed=True)["_tmp_w"].transform("sum")
     total = w_sum + cfg.ambient_const
 
-    L = w / total
-    L_amb = cfg.ambient_const / total
+    df["L"] = w / total
+    df["L_amb"] = cfg.ambient_const / total
 
-    if cfg.winner_only:
-        # Keep only the top genome per read, give it all non-ambient mass
-        df["L"] = L
-        df["L_amb"] = L_amb
-        
-        # Sort desc by L to put winner first, then drop dups keeping first
-        df = df.sort_values(["_rid", "L"], ascending=[True, False])
-        df = df.drop_duplicates(subset=["_rid"], keep="first")
-        
-        # Snap probability to 1.0 (minus ambient)
-        df["L"] = 1.0 - df["L_amb"]
-        out = df[["barcode", "read_id", "genome", "L", "L_amb"]].reset_index(drop=True)
-    else:
-        df["L"] = L
-        df["L_amb"] = L_amb
-        out = df[["barcode", "read_id", "genome", "L", "L_amb"]].reset_index(drop=True)
-
-    return out
+    return df[["barcode", "read_id", "genome", "L", "L_amb"]].reset_index(drop=True)
 
 
 def _aggregate_expected_counts_from_chunk(Ldf: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -387,21 +409,14 @@ def _select_model_for_barcode(
     cfg: MergeConfig,
     candidate_genomes: Sequence[str],
 ) -> Dict[str, Any]:
+    """Per-barcode model selection (single vs doublet) + single-by-default calling."""
     read_count = int(L_block["read_id"].nunique())
 
-    # New: hard floor on coverage
-    if read_count < cfg.min_reads:
-        mass = (
-            L_block.groupby("genome", observed=True)["L"]
-            .sum()
-            .sort_values(ascending=False)
-        )
-        genomes_sorted = mass.index.to_list()
-        top_genome = genomes_sorted[0] if len(genomes_sorted) > 0 else None
-
+    # If no candidates or too few reads, early ambiguous
+    if not candidate_genomes or read_count < cfg.min_reads:
         return {
             "model": None,
-            "genome_1": top_genome,
+            "genome_1": None,
             "genome_2": None,
             "alpha": np.nan,
             "rho": np.nan,
@@ -421,7 +436,7 @@ def _select_model_for_barcode(
             "p_top3": 0.0,
             "top3_sum": 0.0,
             "entropy": 0.0,
-            "top_genome": top_genome,
+            "top_genome": None,
             "suspect_multiplet": False,
             "multiplet_reason": "",
             "ratio_top1_top2": np.nan,
@@ -431,7 +446,7 @@ def _select_model_for_barcode(
             "contam_reads_top2": 0.0,
             "contam_reads_non_top1": 0.0,
         }
-      
+
     alphas = np.arange(0.0, cfg.max_alpha + 1e-9, cfg.alpha_grid)
     rhos = np.arange(0.1, 0.9 + 1e-9, cfg.rho_grid)
 
@@ -545,7 +560,7 @@ def _select_model_for_barcode(
     out["minor"] = float(minor)
 
     # ---------------- Call decision logic (Single-by-Default) ----------------
-    
+
     # 1) Strong Doublet Gate
     is_strong_doublet = (
         out["model"] == "doublet"
@@ -560,7 +575,7 @@ def _select_model_for_barcode(
         call = "doublet"
     else:
         # 2) Fallback to Single/Ambiguous/Indistinguishable
-        
+
         # Check for indistinguishable tie first
         is_near_tie = (
             len(genomes_sorted) >= 2
@@ -616,8 +631,8 @@ def _select_model_for_barcode(
     out["contam_reads_top2"] = frac_top2_reads
     out["contam_reads_non_top1"] = float(1.0 - frac_top1_reads)
 
-    # Multiplet suspicion (Diagnostic)
-    suspect = False
+    # Multiplet suspicion (diagnostic only)
+    suspect = False    # pragma: no cover
     reasons: List[str] = []
 
     weak_doublet_edge = (
@@ -958,7 +973,7 @@ def _process_shard_worker(
 
 @app.command("genotyping")
 def genotyping(
-    assign: str = typer.Option(..., help="Path or glob to assign outputs."),
+    assign: str = typer.Option(..., help="Path or glob to assign outputs (*.tsv[.gz])."),
     outdir: Path = typer.Option(Path("merge_out"), help="Output directory."),
     sample: str = typer.Option("sample", help="Sample name."),
     min_reads: int = typer.Option(100, help="Minimum reads to attempt confident calls."),
@@ -966,19 +981,21 @@ def genotyping(
     w_as: float = typer.Option(0.5, help="Weight for AS."),
     w_mapq: float = typer.Option(1.0, help="Weight for MAPQ."),
     w_nm: float = typer.Option(1.0, help="Weight for NM (penalty)."),
-    ambient_const: float = typer.Option(1e-3, help="Ambient constant."),    
+    ambient_const: float = typer.Option(1e-3, help="Ambient constant."),
+    tau_drop: float = typer.Option(8.0, help="Unused (reserved)."),
     bic_margin: float = typer.Option(
         6.0, "--bic-margin", help="ΔBIC margin for complex model (default 6.0)."
     ),
     doublet_minor_min: float = typer.Option(
         0.2, "--doublet-minor-min", help="Minor-fraction threshold for doublets (default 0.20)."
     ),
-    topk_genomes: int = typer.Option(3, help="Candidate genomes per barcode."),    
-    threads: int = typer.Option(1, help="Pass 2 workers."),
-    shards: int = typer.Option(32, help="Pass 1 spill shards."),
+    topk_genomes: int = typer.Option(3, help="Candidate genomes per barcode."),
+    make_report: bool = typer.Option(True, help="Unused (reserved)."),
+    threads: int = typer.Option(1, help="Pass-2 workers."),
+    shards: int = typer.Option(32, help="Pass-1 spill shards."),
     chunk_rows: int = typer.Option(1_000_000, help="Input chunk size."),
     pass1_workers: Optional[int] = typer.Option(
-        None, help="Pass 1 workers. Default: = threads."
+        None, help="Pass-1 workers. Default: = threads."
     ),
     winner_only: bool = typer.Option(
         True, help="Collapse each read to top genome."
@@ -1002,7 +1019,8 @@ def genotyping(
         w_mapq=w_mapq,
         w_nm=w_nm,
         ambient_const=ambient_const,
-        min_reads=min_reads,        
+        min_reads=min_reads,
+        tau_drop=tau_drop,
         bic_margin=bic_margin,
         topk_genomes=topk_genomes,
         sample=sample,
@@ -1027,6 +1045,11 @@ def genotyping(
 
     typer.echo("[2/5] Estimating ambient profile")
     low_reads = set(N_all[N_all["n_reads"] < 200]["barcode"])
+    if not low_reads:
+        warnings.warn(
+            "No low-read barcodes found; ambient will be estimated from all reads."
+        )
+
     mix: Dict[str, float] = {}
     for shard_fp in sorted(shard_dir.glob("shard_*.tsv.gz")):
         for chunk in _iter_shard_rows(shard_fp):
@@ -1040,14 +1063,13 @@ def genotyping(
 
     if not mix:
         genomes = sorted(C_all["genome"].unique())
-        if len(genomes) == 0:
-           eta = pd.Series(dtype=float)
+        if genomes:
+            eta = pd.Series({g: 1.0 / len(genomes) for g in genomes})
         else:
-           eta = pd.Series({g: 1.0 / len(genomes) for g in genomes})
+            eta = pd.Series(dtype=float)
     else:
         s = sum(mix.values())
         eta = pd.Series({g: v / s for g, v in mix.items()})
-    
 
     typer.echo("[3/5] Selecting top-k candidate genomes")
     def _topk_genomes_per_barcode(C: pd.DataFrame, k: int) -> Dict[str, List[str]]:
@@ -1077,19 +1099,25 @@ def genotyping(
                 rows.extend(shard_rows)
 
     calls = pd.DataFrame(rows)
+
+    # Best genotype per cell: prefer top_genome, fall back to genome_1
     if "top_genome" in calls.columns:
         calls["best_genome"] = calls["top_genome"].fillna(calls["genome_1"])
     else:
         calls["best_genome"] = calls["genome_1"]
 
     def _status_flag(call: str) -> str:
-        if call == "single": return "single"
-        if call == "doublet": return "double"
-        if call == "indistinguishable": return "low_confidence"
+        if call == "single":
+            return "single"
+        if call == "doublet":
+            return "double"
+        if call == "indistinguishable":
+            return "low_confidence"
         return "ambiguous"
 
     calls["status_flag"] = calls["call"].astype(str).map(_status_flag)
 
+    # Legacy-compatible summary
     legacy = calls.copy()
     legacy["AssignedGenome"] = legacy["best_genome"].fillna("")
     pass_mask = legacy["call"].isin(["single", "doublet", "indistinguishable"])
