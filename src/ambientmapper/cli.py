@@ -11,6 +11,9 @@ import json as _json
 from .pipeline import run_pipeline
 
 app = typer.Typer(help="ambientmapper: local-first ambient cleaning pipeline")
+app.add_typer(decontam_app, name="decontam")
+app.add_typer(clean_bams_app, name="clean-bams")
+
 
 # ----------------
 # Helpers
