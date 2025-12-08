@@ -10,7 +10,13 @@ import json as _json
 # pipeline runner
 from .pipeline import run_pipeline
 
+# NEW: import the sub-apps
+from .decontam import app as decontam_app
+from .clean_bams import app as clean_bams_app
+
 app = typer.Typer(help="ambientmapper: local-first ambient cleaning pipeline")
+
+# attach subcommands
 app.add_typer(decontam_app, name="decontam")
 app.add_typer(clean_bams_app, name="clean-bams")
 
