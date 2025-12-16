@@ -18,8 +18,6 @@ from .utils import (
     build_barcode_to_sample,
 )
 
-app = typer.Typer(help="Generate barcode + read-level decontamination decisions.")
-
 
 def _bc_seq(barcode: str) -> str:
     """Extract sequence part of barcode (remove suffix -Sample, -1, etc)."""
@@ -58,8 +56,38 @@ def _build_bcseq_to_expected_genome(
     bc_to_sample = build_barcode_to_sample(well_to_barcode, well_to_sample)
     return {str(k): str(v) for k, v in bc_to_sample.items()}
 
+app = typer.Typer(
+    help="Generate barcode + read-level decontamination decisions.",
+    add_completion=False,
+    invoke_without_command=True,
+    no_args_is_help=True,
+)
 
-@app.command("run")
+def _infer_sample_name_from_cells_calls(cells_calls: Path) -> str:
+    bn = cells_calls.name
+    return bn.replace("_cells_calls.tsv.gz", "").replace("_cells_calls.tsv", "")
+
+def _infer_sample_root_from_cells_calls(cells_calls: Path) -> Optional[Path]:
+    """
+    Expect: <workdir>/<sample>/final/<sample>_cells_calls.tsv(.gz)
+    Return: <workdir>/<sample> (the sample root) or None.
+    """
+    p = cells_calls.resolve()
+    if p.parent.name != "final":
+        return None
+    # .../<workdir>/<sample>/final/<file>
+    sample_root = p.parent.parent
+    if not sample_root.exists():
+        return None
+    return sample_root
+
+def _default_assign_glob(sample_root: Path, sample_name: str) -> str:
+    # Your real tree: <sample_root>/cell_map_ref_chunks/<sample>_chunk*_filtered.tsv.gz
+    return str(sample_root / "cell_map_ref_chunks" / f"{sample_name}_chunk*_filtered.tsv.gz")
+
+
+
+@app.callback(invoke_without_command=True)
 def decontam_cmd(
     cells_calls: Path = typer.Option(
         ...,
@@ -75,9 +103,8 @@ def decontam_cmd(
     design_file: Optional[Path] = typer.Option(
         None,
         "--design-file",
-        exists=True,
-        readable=True,
         help="Optional design file. If provided enables design-aware mode.",
+        readable=True,        
     ),
     layout_file: str = typer.Option(
         "DEFAULT",
@@ -144,6 +171,21 @@ def decontam_cmd(
         bn = cells_calls.name
         sample_name = bn.replace("_cells_calls.tsv.gz", "").replace("_cells_calls.tsv", "")
 
+    cells_calls = cells_calls.expanduser().resolve()
+    if sample_name is None:
+        sample_name = _infer_sample_name_from_cells_calls(cells_calls)
+    sample_root = _infer_sample_root_from_cells_calls(cells_calls)
+
+    # Optional: if we want out_dir to be optional in the future, this is the default:
+    # if out_dir is None and sample_root is not None:
+    #     out_dir = sample_root / "final" / "decontam"
+
+    # Auto-assign-glob if user didn't provide read-level inputs
+    if assignments is None and (assign_glob is None or not assign_glob.strip()):
+    if sample_root is not None:
+        assign_glob = _default_assign_glob(sample_root, sample_name)
+        typer.echo(f"[decontam] auto --assign-glob: {assign_glob}")
+    
     # ------------------------------------------------------------------
     # 1) Load per-barcode calls & Build Design Map
     # ------------------------------------------------------------------
