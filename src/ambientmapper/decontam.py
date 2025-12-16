@@ -1,10 +1,11 @@
-# ambientmapper/decontam.py
+# src/ambientmapper/decontam.py
 from __future__ import annotations
 
 import gzip
 import json
+import glob
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 import pandas as pd
 import typer
@@ -17,7 +18,12 @@ from .utils import (
     build_barcode_to_sample,
 )
 
-app = typer.Typer(help="AmbientMapper decontamination decision engine.")
+app = typer.Typer(help="Generate barcode + read-level decontamination decisions.")
+
+
+def _bc_seq(barcode: str) -> str:
+    """Extract sequence part of barcode (remove suffix -Sample, -1, etc)."""
+    return str(barcode).split("-")[0]
 
 
 def _build_bcseq_to_expected_genome(
@@ -27,35 +33,22 @@ def _build_bcseq_to_expected_genome(
     """
     Build bc_seq -> expected_genome map.
 
-    Two supported formats for design_path:
-
-    1) Direct mapping TSV with header:
-         barcode  expected_genome
-         GTTACCCTGTACAATC   B73
-         ...
-
-       In this case, layout_path is ignored.
-
-    2) Pool ranges format (no header), e.g.:
-         B73   A1-4,B1-4,C1-4,...
-         At    A9-12,B9-12,...
-
-       Combined with the 96-well layout, this yields:
-         well_id        -> tn5_bc
-         sample/genome  -> wells
-         tn5_bc         -> sample/genome
+    Supports:
+      (1) TSV with header: barcode  expected_genome
+      (2) Pool ranges file: genome <tab> wells (A1-4,B1-4,...), using a 96-well layout
     """
     design_path = Path(design_path)
     layout_path = Path(layout_path)
 
-    # Try direct "barcode / expected_genome" format first.
+    # Try direct barcode mapping format first
     try:
-        df = pd.read_csv(design_path, sep="\t")
+        df = pd.read_csv(design_path, sep="\t", dtype=str)
     except Exception:
         df = None
 
     if df is not None and {"barcode", "expected_genome"}.issubset(df.columns):
         df = df[["barcode", "expected_genome"]].astype(str)
+        df["barcode"] = df["barcode"].map(_bc_seq)
         return dict(zip(df["barcode"], df["expected_genome"]))
 
     # Fallback: pool ranges + layout
@@ -63,434 +56,369 @@ def _build_bcseq_to_expected_genome(
     well_to_sample = build_well_to_sample(sample_to_wells)
     well_to_barcode = load_barcode_layout(layout_path)
     bc_to_sample = build_barcode_to_sample(well_to_barcode, well_to_sample)
-    # Here "sample" is your genome ID (e.g. B73, At)
-    return bc_to_sample
+    return {str(k): str(v) for k, v in bc_to_sample.items()}
 
 
-@app.command("decontam")
+@app.command("run")
 def decontam_cmd(
     cells_calls: Path = typer.Option(
         ...,
         exists=True,
-        help="Per-barcode calls TSV/TSV.GZ.",
+        readable=True,
+        help="*_cells_calls.tsv(.gz) from genotyping.",
     ),
     out_dir: Path = typer.Option(
         ...,
-        help="Output directory for decontam results.",
+        help="Output directory for decontam artifacts.",
     ),
+    # Design / Layout
     design_file: Optional[Path] = typer.Option(
         None,
         "--design-file",
         exists=True,
-        help=(
-            "Optional design file. "
-            "If provided, enables design-aware mode using the bundled 96-well layout "
-            "or a custom layout. Supported formats:\n"
-            "  (1) TSV with 'barcode' and 'expected_genome' columns.\n"
-            "  (2) Pool ranges text file, e.g. "
-            "'B73\\tA1-4,B1-4,...', 'At\\tA9-12,...'."
-        ),
+        readable=True,
+        help="Optional design file. If provided enables design-aware mode.",
     ),
     layout_file: str = typer.Option(
         "DEFAULT",
         "--layout-file",
-        help=(
-            'Layout file path, or "DEFAULT" to use bundled 96-well Tn5 layout. '
-            "Used only if --design-file is provided and is in pool-ranges format."
-        ),
+        help='Layout path for well-range design files, or "DEFAULT" (bundled).',
     ),
+    strict_design_drop_mismatch: bool = typer.Option(
+        True,
+        "--strict-design-drop-mismatch/--no-strict-design-drop-mismatch",
+        help="If strict, drop whole barcode when expected genome is not in top3.",
+    ),
+    # Assignment inputs
     assignments: Optional[Path] = typer.Option(
         None,
         "--assignments",
         exists=True,
-        help=(
-            "Optional per-read assignments TSV(.gz) with at least columns "
-            "'barcode', 'read_id', 'genome'. When provided, a "
-            "<sample>_reads_to_drop.tsv.gz file is generated and "
-            "barcode summaries are updated with per-barcode read counts and "
-            "fraction_removed."
-        ),
+        readable=True,
+        help="Single assignment chunk path (tsv/tsv.gz).",
     ),
-    chunksize: int = typer.Option(
-        1_000_000,
-        help="Chunk size (rows) for streaming --assignments TSV.",
-    ),
-    strict_design_drop_mismatch: bool = typer.Option(
-        True,
-        help=(
-            "In design-aware mode, if expected genome is not among "
-            "top1–top3 genomes for a barcode, drop the barcode entirely. "
-            "If False, keep the barcode but restrict it to the expected genome."
-        ),
-    ),
-    sample_name: Optional[str] = typer.Option(
+    assign_glob: Optional[str] = typer.Option(
         None,
-        help=(
-            "Optional sample name; default is inferred from cells_calls basename "
-            "(prefix before '_cells_calls.tsv[.gz]')."
-        ),
+        "--assign-glob",
+        help="Glob for assign chunks (e.g. 'SM2/cell_map_ref_chunks/SM2_chunk*_filtered.tsv.gz').",
     ),
+    # Column overrides (assign outputs)
+    read_id_col: str = typer.Option("Read", "--read-id-col", help="Column for Read ID"),
+    barcode_col: str = typer.Option("BC", "--barcode-col", help="Column for Barcode"),
+    genome_col: str = typer.Option("Genome", "--genome-col", help="Column for Genome"),
+    class_col: str = typer.Option(
+        "assigned_class",
+        "--class-col",
+        help="Column for classification (winner/ambiguous).",
+    ),
+    p_as_col: str = typer.Option("p_as", "--p-as-col", help="Column for assignment p-value"),
+    # Logic configuration
+    decontam_alpha: Optional[float] = typer.Option(
+        None,
+        "--decontam-alpha",
+        help="If set, redefine 'winner' using p_as <= alpha (where p_as exists).",
+    ),
+    require_p_as: bool = typer.Option(
+        False,
+        "--require-p-as",
+        help="If True and --decontam-alpha is set, treat missing p_as as non-winner.",
+    ),
+    # Misc
+    sample_name: Optional[str] = typer.Option(None, "--sample-name", help="Output prefix."),
+    chunksize: int = typer.Option(1_000_000, "--chunksize", help="Pandas chunk size."),
 ):
     """
-    Generate decontamination decisions.
+    Generate decontamination decisions (barcode + read level).
 
     Outputs:
       - <sample>_barcode_summary.tsv.gz
       - <sample>_barcodes_to_drop.tsv.gz
       - <sample>_per_barcode_rules.tsv.gz
+      - <sample>_reads_to_drop.tsv.gz  (only if assignment files are provided)
       - <sample>_decontam_params.json
-      - <sample>_reads_to_drop.tsv.gz   (only if --assignments is provided)
     """
     out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if sample_name is None:
         bn = cells_calls.name
-        sample_name = (
-            bn.replace("_cells_calls.tsv.gz", "")
-            .replace("_cells_calls.tsv", "")
-        )
+        sample_name = bn.replace("_cells_calls.tsv.gz", "").replace("_cells_calls.tsv", "")
 
     # ------------------------------------------------------------------
-    # 1. Load per-barcode calls
+    # 1) Load per-barcode calls & Build Design Map
     # ------------------------------------------------------------------
+    typer.echo(f"[decontam] Loading cell calls: {cells_calls}")
     calls = pd.read_csv(cells_calls, sep="\t")
 
-    required_cols = {
-        "barcode",
-        "genome_top1",
-        "mass_top1",
-        "genome_top2",
-        "mass_top2",
-        "genome_top3",
-        "mass_top3",
-    }
-    missing = required_cols - set(calls.columns)
-    if missing:
-        raise ValueError(
-            f"{cells_calls} missing required columns: "
-            f"{', '.join(sorted(missing))}"
-        )
+    need_calls = {"barcode", "genome_top1", "genome_top2", "genome_top3"}
+    miss = need_calls - set(calls.columns)
+    if miss:
+        raise ValueError(f"{cells_calls} missing columns: {sorted(miss)}")
 
-    # ------------------------------------------------------------------
-    # 2. Determine strategy & build expected-genome map if needed
-    # ------------------------------------------------------------------
+    calls["barcode"] = calls["barcode"].astype(str)
+    calls["bc_seq"] = calls["barcode"].map(_bc_seq)
+
     bcseq_to_expected: Optional[Dict[str, str]] = None
     if design_file is not None:
-        typer.echo(f"[decontam] Design file provided: {design_file}")
-        typer.echo("[decontam] Using Strategy A: design-aware decontamination")
+        typer.echo(f"[decontam] Strategy A: Design-Aware ({design_file})")
 
         if layout_file == "DEFAULT":
             layout_path = get_default_layout_path()
         else:
-            layout_path = Path(layout_file)
+            layout_path = Path(layout_file).expanduser().resolve()
+            if not layout_path.exists():
+                raise FileNotFoundError(f"--layout-file not found: {layout_path}")
 
-        bcseq_to_expected = _build_bcseq_to_expected_genome(
-            layout_path=layout_path,
-            design_path=design_file,
-        )
+        bcseq_to_expected = _build_bcseq_to_expected_genome(layout_path, design_file)
+        if not bcseq_to_expected:
+            raise ValueError(f"Design parsing produced an empty bc->expected map: {design_file}")
     else:
-        typer.echo("[decontam] No design file. Using Strategy B: agnostic mode")
+        typer.echo("[decontam] Strategy B: Agnostic (Allowed = Top1)")
 
-    # Containers
+    # ------------------------------------------------------------------
+    # 2) Per-barcode allowed genome decision (keyed by bc_seq)
+    # ------------------------------------------------------------------
+    allowed_genome_map: Dict[str, str] = {}
+    barcodes_to_drop_set: set[str] = set()
+
     barcode_summary_rows = []
     barcodes_to_drop_rows = []
     per_barcode_rules_rows = []
 
-    # Internal state for downstream read-level decontam
-    barcodes_to_drop_set: set[str] = set()
-    allowed_genome_map: Dict[str, str] = {}
+    for row in calls.itertuples(index=False):
+        bc_full = str(row.barcode)
+        bc_seq_val = str(row.bc_seq)
 
-    # ------------------------------------------------------------------
-    # 3. Iterate barcodes and define allowed genome per barcode
-    # ------------------------------------------------------------------
-    for row in calls.itertuples():
-        barcode = row.barcode
-        bc_seq = str(barcode).split("-")[0]
+        g1 = str(row.genome_top1)
+        g2 = str(row.genome_top2)
+        g3 = str(row.genome_top3)
 
-        G1, M1 = row.genome_top1, row.mass_top1
-        G2, M2 = row.genome_top2, row.mass_top2
-        G3, M3 = row.genome_top3, row.mass_top3
-
-        strategy = "A" if bcseq_to_expected is not None else "B"
+        expected: Optional[str] = None
+        allowed: Optional[str] = None
         action = "keep_cleaned"
-        expected_genome: Optional[str] = None
-        allowed_genome: Optional[str] = None
-
-        is_doublet_candidate = False
-        is_highly_ambiguous = False
         notes = ""
 
-        # -------------------------
-        # Strategy A: design-aware
-        # -------------------------
         if bcseq_to_expected is not None:
-            expected_genome = bcseq_to_expected.get(bc_seq)
-
-            if expected_genome is None:
-                # Unknown barcode (Tn5) in design
+            expected = bcseq_to_expected.get(bc_seq_val)
+            if expected is None:
                 action = "drop_barcode"
-                notes = "expected_genome_missing"
-                barcodes_to_drop_rows.append(
-                    {
-                        "barcode": barcode,
-                        "reason": "unknown_in_design",
-                    }
-                )
-                barcodes_to_drop_set.add(barcode)
+                notes = "unknown_in_design"
             else:
-                # Check match against top1–top3
-                if expected_genome == G1:
-                    allowed_genome = expected_genome
-                    notes = f"design_match_top1:{G1}"
-                elif expected_genome == G2:
-                    allowed_genome = expected_genome
-                    notes = f"design_match_top2:top1={G1},top2={G2}"
-                elif expected_genome == G3:
-                    allowed_genome = expected_genome
-                    notes = (
-                        f"design_match_top3:top1={G1},top2={G2},top3={G3}"
-                    )
+                if expected == g1:
+                    allowed = expected
+                    notes = "design_match_top1"
+                elif expected == g2:
+                    allowed = expected
+                    notes = "design_match_top2"
+                elif expected == g3:
+                    allowed = expected
+                    notes = "design_match_top3"
                 else:
-                    # Expected genome not in top3
                     if strict_design_drop_mismatch:
                         action = "drop_barcode"
-                        notes = (
-                            f"design_mismatch_strict:"
-                            f"expected={expected_genome},"
-                            f"top1={G1},top2={G2},top3={G3}"
-                        )
-                        barcodes_to_drop_rows.append(
-                            {
-                                "barcode": barcode,
-                                "reason": "design_mismatch",
-                            }
-                        )
-                        barcodes_to_drop_set.add(barcode)
+                        notes = "design_mismatch_strict"
                     else:
-                        # Lenient: keep barcode, restrict to expected genome
-                        allowed_genome = expected_genome
-                        notes = (
-                            f"design_mismatch_lenient:"
-                            f"expected={expected_genome},"
-                            f"top1={G1},top2={G2},top3={G3}"
-                        )
-
-        # -------------------------
-        # Strategy B: design-agnostic
-        # -------------------------
+                        allowed = expected
+                        notes = "design_mismatch_lenient"
         else:
-            # Keep barcode; allowed genome = top1
-            allowed_genome = G1
+            allowed = g1
+            notes = "agnostic_top1"
 
-        # Record rule if we are keeping the barcode and have an allowed genome
-        if action != "drop_barcode" and allowed_genome is not None:
-            per_barcode_rules_rows.append(
-                {
-                    "barcode": barcode,
-                    # Semantic: keep only this genome, drop others.
-                    "drop_genome_ne": allowed_genome,
-                }
+        if action == "drop_barcode":
+            barcodes_to_drop_set.add(bc_seq_val)
+            barcodes_to_drop_rows.append(
+                {"barcode": bc_full, "bc_seq": bc_seq_val, "reason": notes}
             )
-            allowed_genome_map[str(barcode)] = str(allowed_genome)
-
-        # Basic ambiguity flags (QC)
-        if M2 > 0 and M1 > 0:
-            ratio = M1 / M2 if M2 > 0 else float("inf")
-            if ratio < 2.0:
-                is_doublet_candidate = True
-                if notes:
-                    notes += ";"
-                notes += (
-                    f"doublet_candidate:top1={G1},top2={G2},ratio={ratio:.2f}"
-                )
-
-        # Example ambiguous flag: more than 2 genomes with non-trivial mass
-        n_nontrivial = sum(m > 0.05 for m in [M1, M2, M3])
-        if n_nontrivial > 2:
-            is_highly_ambiguous = True
-            if notes:
-                notes += ";"
-            notes += "highly_ambiguous_top3"
-
-        # Placeholder; updated later if --assignments is provided
-        fraction_removed = None
+        elif allowed is not None:
+            allowed_genome_map[bc_seq_val] = str(allowed)
+            per_barcode_rules_rows.append(
+                {"barcode": bc_full, "bc_seq": bc_seq_val, "drop_genome_ne": str(allowed)}
+            )
 
         barcode_summary_rows.append(
             {
-                "barcode": barcode,
-                "bc_seq": bc_seq,
-                "expected_genome": expected_genome,
-                "allowed_genome": allowed_genome,
-                "genome_top1": G1,
-                "mass_top1": M1,
-                "genome_top2": G2,
-                "mass_top2": M2,
-                "genome_top3": G3,
-                "mass_top3": M3,
-                "strategy": strategy,
+                "barcode": bc_full,
+                "bc_seq": bc_seq_val,
+                "expected_genome": expected,
+                "allowed_genome": allowed,
                 "action": action,
-                "fraction_removed": fraction_removed,
-                "is_doublet_candidate": is_doublet_candidate,
-                "is_highly_ambiguous": is_highly_ambiguous,
                 "notes": notes,
+                "strategy": "A" if (bcseq_to_expected is not None) else "B",
             }
         )
 
     # ------------------------------------------------------------------
-    # 4. Optional: per-read decontam from assignments
+    # 3) Identify assignment files
+    # ------------------------------------------------------------------
+    input_files: List[Path] = []
+
+    if assignments:
+        input_files.append(Path(assignments).expanduser().resolve())
+
+    if assign_glob:
+        assign_glob = assign_glob.strip() or None
+    if assign_glob:
+        found = sorted(glob.glob(assign_glob, recursive=True))
+        if not found:
+            typer.echo(f"[decontam] Warning: No files matched glob: {assign_glob}", err=True)
+        input_files.extend([Path(f).resolve() for f in found])
+
+    input_files = sorted(set(input_files))
+
+    if not input_files:
+        typer.echo("[decontam] No assignment files found. Skipping read-level logic.")
+
+    # ------------------------------------------------------------------
+    # 4) Process read assignments → reads_to_drop.tsv.gz
     # ------------------------------------------------------------------
     reads_to_drop_path: Optional[Path] = None
+    reads_total_map: Dict[str, int] = {}
+    reads_dropped_map: Dict[str, int] = {}
 
-    if assignments is not None:
-        typer.echo(f"[decontam] Streaming assignments from {assignments}")
+    warned_missing_p_as = False
 
-        # For QC: per-barcode read counts
-        reads_total: Dict[str, int] = {}
-        reads_dropped: Dict[str, int] = {}
-
+    if input_files:
         reads_to_drop_path = out_dir / f"{sample_name}_reads_to_drop.tsv.gz"
+        typer.echo(f"[decontam] Processing {len(input_files)} assignment files...")
         with gzip.open(reads_to_drop_path, "wt") as fh:
-            # Header
-            fh.write(
-                "read_id\tbarcode\tallowed_genome\twinner_genome\treason\n"
-            )
+            fh.write("read_id\tbarcode\tbc_seq\tallowed_genome\twinner_genome\tp_as\treason\n")
 
-            # Stream in chunks
-            is_first_chunk = True
-            for chunk in pd.read_csv(
-                assignments,
-                sep="\t",
-                chunksize=chunksize,
-                dtype=str,
-            ):
-                if is_first_chunk:
-                    required_assign_cols = {"barcode", "read_id", "genome"}
-                    missing_assign = required_assign_cols - set(chunk.columns)
-                    if missing_assign:
-                        raise ValueError(
-                            f"{assignments} missing required columns: "
-                            f"{', '.join(sorted(missing_assign))}"
+            for fp in input_files:
+                typer.echo(f"  -> Streaming {fp.name}")
+
+                for chunk in pd.read_csv(fp, sep="\t", chunksize=chunksize, dtype=str):
+                    required_in_chunk = {read_id_col, barcode_col, genome_col, class_col}
+                    missing_cols = required_in_chunk - set(chunk.columns)
+                    if missing_cols:
+                        raise ValueError(f"File {fp.name} missing columns: {sorted(missing_cols)}")
+
+                    bc_full_series = chunk[barcode_col].astype(str)
+                    bc_seq_series = bc_full_series.map(_bc_seq)
+
+                    allowed_series = bc_seq_series.map(allowed_genome_map)
+                    mask_drop_barcode = bc_seq_series.isin(barcodes_to_drop_set) | allowed_series.isna()
+
+                    winner_genome = chunk[genome_col].astype(str)
+                    mask_mismatch = (~mask_drop_barcode) & (winner_genome != allowed_series)
+
+                    # Winner definition
+                    class_series = chunk[class_col].astype(str)
+                    is_winner_default = (class_series == "winner")
+
+                    has_p_col = (p_as_col in chunk.columns)
+                    p_raw = chunk[p_as_col] if has_p_col else pd.Series(pd.NA, index=chunk.index)
+
+                    if decontam_alpha is not None and not has_p_col and not warned_missing_p_as:
+                        typer.echo(
+                            f"[decontam] Warning: --decontam-alpha set but column '{p_as_col}' not found "
+                            f"in {fp.name}; falling back to '{class_col}' only for those files.",
+                            err=True,
                         )
-                    is_first_chunk = False
+                        warned_missing_p_as = True
 
-                # Ensure we have the expected columns as strings
-                chunk["barcode"] = chunk["barcode"].astype(str)
-                chunk["read_id"] = chunk["read_id"].astype(str)
-                chunk["genome"] = chunk["genome"].astype(str)
+                    if decontam_alpha is not None and has_p_col:
+                        p_vals = pd.to_numeric(p_raw, errors="coerce")
+                        has_p = p_vals.notna()
+                        is_winner_override = has_p & (p_vals <= float(decontam_alpha))
+                        if require_p_as:
+                            is_confident = is_winner_override
+                        else:
+                            is_confident = is_winner_override | ((~has_p) & is_winner_default)
+                    else:
+                        is_confident = is_winner_default
 
-                # Map barcode → allowed genome
-                chunk["allowed_genome"] = chunk["barcode"].map(
-                    allowed_genome_map
-                )
+                    mask_mismatch_conf = mask_mismatch & is_confident
+                    mask_drop_read = mask_drop_barcode | mask_mismatch_conf
 
-                # Drop-barcode flag: explicitly dropped in design logic OR
-                # barcode has no allowed genome.
-                chunk["drop_barcode"] = (
-                    chunk["barcode"].isin(barcodes_to_drop_set)
-                    | chunk["allowed_genome"].isna()
-                )
+                    # Totals always
+                    counts_total = bc_seq_series.value_counts()
+                    for b, c in counts_total.items():
+                        reads_total_map[b] = reads_total_map.get(b, 0) + int(c)
 
-                # Winner mismatch: barcode kept but genome != allowed_genome
-                chunk["drop_winner"] = (
-                    ~chunk["drop_barcode"]
-                    & (chunk["genome"] != chunk["allowed_genome"])
-                )
+                    if not mask_drop_read.any():
+                        continue
 
-                mask_drop = chunk["drop_barcode"] | chunk["drop_winner"]
+                    counts_dropped = bc_seq_series[mask_drop_read].value_counts()
+                    for b, c in counts_dropped.items():
+                        reads_dropped_map[b] = reads_dropped_map.get(b, 0) + int(c)
 
-                # Reason column
-                chunk["reason"] = "winner_not_allowed"
-                chunk.loc[chunk["drop_barcode"], "reason"] = "drop_barcode"
+                    reasons = pd.Series("", index=chunk.index, dtype=object)
+                    reasons.loc[mask_drop_barcode] = "drop_barcode"
 
-                # Write dropped reads (append, no header)
-                drop_df = chunk.loc[
-                    mask_drop,
-                    [
-                        "read_id",
-                        "barcode",
-                        "allowed_genome",
-                        "genome",
-                        "reason",
-                    ],
-                ]
-                drop_df.to_csv(
-                    fh,
-                    sep="\t",
-                    header=False,
-                    index=False,
-                )
+                    if decontam_alpha is not None and has_p_col:
+                        p_vals2 = pd.to_numeric(p_raw, errors="coerce")
+                        has_p2 = p_vals2.notna()
+                        mask_p_conf = mask_mismatch_conf & has_p2 & (p_vals2 <= float(decontam_alpha))
+                        mask_class_conf = mask_mismatch_conf & ~mask_p_conf
+                        reasons.loc[mask_p_conf] = "mismatch_winner_pvalue"
+                        reasons.loc[mask_class_conf] = "mismatch_winner_class"
+                    else:
+                        reasons.loc[mask_mismatch_conf] = "mismatch_winner"
 
-                # Update per-barcode counts
-                total_counts = chunk["barcode"].value_counts()
-                drop_counts = chunk.loc[mask_drop, "barcode"].value_counts()
+                    out_df = pd.DataFrame(
+                        {
+                            "read_id": chunk[read_id_col].astype(str),
+                            "barcode": bc_full_series,
+                            "bc_seq": bc_seq_series,
+                            "allowed_genome": allowed_series.fillna(""),
+                            "winner_genome": winner_genome,
+                            "p_as": p_raw.fillna("").astype(str),
+                            "reason": reasons,
+                        }
+                    )
 
-                for bc, n in total_counts.items():
-                    reads_total[bc] = reads_total.get(bc, 0) + int(n)
-
-                for bc, n in drop_counts.items():
-                    reads_dropped[bc] = reads_dropped.get(bc, 0) + int(n)
+                    out_df.loc[mask_drop_read].to_csv(fh, sep="\t", header=False, index=False)
 
         typer.echo(f"[decontam] Wrote {reads_to_drop_path}")
 
-        # Update barcode_summary_rows with read stats
-        bs = pd.DataFrame.from_records(barcode_summary_rows)
-        bs.set_index("barcode", inplace=True, drop=False)
+    # ------------------------------------------------------------------
+    # 5) Finalize summary stats
+    # ------------------------------------------------------------------
+    barcode_summary = pd.DataFrame.from_records(barcode_summary_rows)
+    barcode_summary["reads_total"] = barcode_summary["bc_seq"].map(reads_total_map).fillna(0).astype(int)
+    barcode_summary["reads_dropped"] = barcode_summary["bc_seq"].map(reads_dropped_map).fillna(0).astype(int)
 
-        # Map counts
-        bs["reads_total"] = bs["barcode"].map(reads_total).fillna(0).astype(int)
-        bs["reads_dropped"] = (
-            bs["barcode"].map(reads_dropped).fillna(0).astype(int)
-        )
-
-        # Fraction removed; 0 if no reads
-        with pd.option_context("mode.use_inf_as_na", True):
-            frac = bs["reads_dropped"] / bs["reads_total"].replace(0, pd.NA)
-        bs["fraction_removed"] = frac
-
-        barcode_summary = bs.reset_index(drop=True)
-    else:
-        # No assignments: just materialize DataFrame as-is
-        barcode_summary = pd.DataFrame.from_records(barcode_summary_rows)
+    mask_nz = barcode_summary["reads_total"] > 0
+    barcode_summary["fraction_removed"] = 0.0
+    barcode_summary.loc[mask_nz, "fraction_removed"] = (
+        barcode_summary.loc[mask_nz, "reads_dropped"] / barcode_summary.loc[mask_nz, "reads_total"]
+    )
 
     # ------------------------------------------------------------------
-    # 5. Save outputs
+    # 6) Write artifacts
     # ------------------------------------------------------------------
-    barcodes_to_drop = pd.DataFrame.from_records(barcodes_to_drop_rows)
-    per_barcode_rules = pd.DataFrame.from_records(per_barcode_rules_rows)
-
     barcode_summary_path = out_dir / f"{sample_name}_barcode_summary.tsv.gz"
     barcodes_to_drop_path = out_dir / f"{sample_name}_barcodes_to_drop.tsv.gz"
-    per_barcode_rules_path = (
-        out_dir / f"{sample_name}_per_barcode_rules.tsv.gz"
-    )
+    per_barcode_rules_path = out_dir / f"{sample_name}_per_barcode_rules.tsv.gz"
     params_path = out_dir / f"{sample_name}_decontam_params.json"
 
     barcode_summary.to_csv(barcode_summary_path, sep="\t", index=False)
-
-    # Always write barcodes_to_drop file (even if empty, with header)
-    barcodes_to_drop.to_csv(barcodes_to_drop_path, sep="\t", index=False)
-
-    per_barcode_rules.to_csv(per_barcode_rules_path, sep="\t", index=False)
+    pd.DataFrame.from_records(barcodes_to_drop_rows).to_csv(barcodes_to_drop_path, sep="\t", index=False)
+    pd.DataFrame.from_records(per_barcode_rules_rows).to_csv(per_barcode_rules_path, sep="\t", index=False)
 
     params = {
         "cells_calls": str(cells_calls),
-        "design_file": str(design_file) if design_file is not None else None,
+        "out_dir": str(out_dir),
+        "design_file": str(design_file) if design_file else None,
         "layout_file": layout_file,
-        "assignments": str(assignments) if assignments is not None else None,
-        "chunksize": chunksize,
         "strict_design_drop_mismatch": strict_design_drop_mismatch,
-        "sample_name": sample_name,
-        "reads_to_drop": (
-            str(reads_to_drop_path) if reads_to_drop_path is not None else None
-        ),
+        "assignments": str(assignments) if assignments else None,
+        "assign_glob": assign_glob,
+        "read_id_col": read_id_col,
+        "barcode_col": barcode_col,
+        "genome_col": genome_col,
+        "class_col": class_col,
+        "p_as_col": p_as_col,
+        "decontam_alpha": decontam_alpha,
+        "require_p_as": require_p_as,
+        "chunksize": chunksize,
+        "reads_to_drop": str(reads_to_drop_path) if reads_to_drop_path else None,
     }
-    with params_path.open("w") as fh:
-        json.dump(params, fh, indent=2)
+    with params_path.open("w") as f:
+        json.dump(params, f, indent=2)
 
     typer.echo(f"[decontam] Wrote {barcode_summary_path}")
     typer.echo(f"[decontam] Wrote {barcodes_to_drop_path}")
     typer.echo(f"[decontam] Wrote {per_barcode_rules_path}")
     typer.echo(f"[decontam] Wrote {params_path}")
-    if reads_to_drop_path is not None:
-        typer.echo(f"[decontam] Wrote {reads_to_drop_path}")
+    typer.echo("[decontam] Done.")
