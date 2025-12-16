@@ -12,7 +12,9 @@ from .pipeline import run_pipeline
 
 # NEW: import the sub-apps
 from .decontam import app as decontam_app
-from .clean_bams import app as clean_bams_app
+from .clean_bams import clean_bams_cmd
+app.command("clean-bams")(clean_bams_cmd)
+
 
 app = typer.Typer(help="ambientmapper: local-first ambient cleaning pipeline")
 
@@ -566,19 +568,6 @@ def genotyping(
         single_mass_min=(single_mass_min if single_mass_min is not None else 0.7),
     )
 
-
-# @app.command()
-# def summarize(
-#     config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
-#     assign_glob: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs (parquet/tsv/csv)"),
-# ):
-#     """[Deprecated] Back-compat wrapper to new merge.summarize."""
-#     from .merge import run as posterior_merge_run
-#     cfg = json.loads(Path(config).read_text()); d = _cfg_dirs(cfg); _ensure_dirs(d)
-#     if not assign_glob:
-#         assign_glob = str(d["chunks"] / "**" / "*")
-#     posterior_merge_run(assign=assign_glob, outdir=d["final"], sample=cfg["sample"], make_report=True)
-#     typer.echo(f"[summarize] outputs in {d['final']}")
 
 @app.command()
 def interpool(
