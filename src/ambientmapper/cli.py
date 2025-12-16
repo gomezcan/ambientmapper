@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+
+import csv, hashlib, json, time
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import json, csv, hashlib, time
-import typer
 from typing import Dict, List, Optional
 import json as _json
 
-# pipeline runner
+import typer
+
 from .pipeline import run_pipeline
 
-# NEW: import the sub-apps
+# sub-apps / commands
 from .decontam import app as decontam_app
 from .clean_bams import clean_bams_cmd
-app.command("clean-bams")(clean_bams_cmd)
-
 
 app = typer.Typer(help="ambientmapper: local-first ambient cleaning pipeline")
 
 # attach subcommands
 app.add_typer(decontam_app, name="decontam")
-app.add_typer(clean_bams_app, name="clean-bams")
-
+app.command("clean-bams")(clean_bams_cmd)
 
 # ----------------
 # Helpers
