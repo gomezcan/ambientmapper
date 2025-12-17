@@ -18,10 +18,40 @@ from .utils import (
     build_barcode_to_sample,
 )
 
+app = typer.Typer(
+    help="Generate barcode + read-level decontamination decisions.",
+    add_completion=False,
+    invoke_without_command=True,
+    no_args_is_help=True,
+)
 
+# -------------------------
+# Helpers
+# -------------------------
 def _bc_seq(barcode: str) -> str:
     """Extract sequence part of barcode (remove suffix -Sample, -1, etc)."""
     return str(barcode).split("-")[0]
+
+
+def _infer_sample_name_from_cells_calls(cells_calls: Path) -> str:
+    bn = cells_calls.name
+    return bn.replace("_cells_calls.tsv.gz", "").replace("_cells_calls.tsv", "")
+
+
+def _infer_sample_root_from_cells_calls(cells_calls: Path) -> Optional[Path]:
+    """
+    Expect: <workdir>/<sample>/final/<sample>_cells_calls.tsv(.gz)
+    Return: <workdir>/<sample> (the sample root) or None.
+    """
+    p = cells_calls.resolve()
+    if p.parent.name != "final":
+        return None
+    sample_root = p.parent.parent  # .../<workdir>/<sample>
+    return sample_root if sample_root.exists() else None
+
+
+def _default_assign_glob(sample_root: Path, sample_name: str) -> str:
+    return str(sample_root / "cell_map_ref_chunks" / f"{sample_name}_chunk*_filtered.tsv.gz")
 
 
 def _build_bcseq_to_expected_genome(
@@ -38,7 +68,7 @@ def _build_bcseq_to_expected_genome(
     design_path = Path(design_path)
     layout_path = Path(layout_path)
 
-    # Try direct barcode mapping format first
+    # Try direct barcode mapping TSV first
     try:
         df = pd.read_csv(design_path, sep="\t", dtype=str)
     except Exception:
@@ -55,36 +85,6 @@ def _build_bcseq_to_expected_genome(
     well_to_barcode = load_barcode_layout(layout_path)
     bc_to_sample = build_barcode_to_sample(well_to_barcode, well_to_sample)
     return {str(k): str(v) for k, v in bc_to_sample.items()}
-
-app = typer.Typer(
-    help="Generate barcode + read-level decontamination decisions.",
-    add_completion=False,
-    invoke_without_command=True,
-    no_args_is_help=True,
-)
-
-def _infer_sample_name_from_cells_calls(cells_calls: Path) -> str:
-    bn = cells_calls.name
-    return bn.replace("_cells_calls.tsv.gz", "").replace("_cells_calls.tsv", "")
-
-def _infer_sample_root_from_cells_calls(cells_calls: Path) -> Optional[Path]:
-    """
-    Expect: <workdir>/<sample>/final/<sample>_cells_calls.tsv(.gz)
-    Return: <workdir>/<sample> (the sample root) or None.
-    """
-    p = cells_calls.resolve()
-    if p.parent.name != "final":
-        return None
-    # .../<workdir>/<sample>/final/<file>
-    sample_root = p.parent.parent
-    if not sample_root.exists():
-        return None
-    return sample_root
-
-def _default_assign_glob(sample_root: Path, sample_name: str) -> str:
-    # Your real tree: <sample_root>/cell_map_ref_chunks/<sample>_chunk*_filtered.tsv.gz
-    return str(sample_root / "cell_map_ref_chunks" / f"{sample_name}_chunk*_filtered.tsv.gz")
-
 
 
 @app.callback(invoke_without_command=True)
@@ -103,8 +103,8 @@ def decontam_cmd(
     design_file: Optional[Path] = typer.Option(
         None,
         "--design-file",
+        readable=True,
         help="Optional design file. If provided enables design-aware mode.",
-        readable=True,        
     ),
     layout_file: str = typer.Option(
         "DEFAULT",
@@ -164,28 +164,27 @@ def decontam_cmd(
       - <sample>_reads_to_drop.tsv.gz  (only if assignment files are provided)
       - <sample>_decontam_params.json
     """
-    out_dir = out_dir.resolve()
+    cells_calls = cells_calls.expanduser().resolve()
+    out_dir = out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if sample_name is None:
-        bn = cells_calls.name
-        sample_name = bn.replace("_cells_calls.tsv.gz", "").replace("_cells_calls.tsv", "")
-
-    cells_calls = cells_calls.expanduser().resolve()
-    if sample_name is None:
         sample_name = _infer_sample_name_from_cells_calls(cells_calls)
+
     sample_root = _infer_sample_root_from_cells_calls(cells_calls)
 
-    # Optional: if we want out_dir to be optional in the future, this is the default:
-    # if out_dir is None and sample_root is not None:
-    #     out_dir = sample_root / "final" / "decontam"
+    # Validate optional design_file if provided
+    if design_file is not None:
+        design_file = Path(design_file).expanduser().resolve()
+        if not design_file.exists():
+            raise FileNotFoundError(f"--design-file not found: {design_file}")
 
     # Auto-assign-glob if user didn't provide read-level inputs
     if assignments is None and (assign_glob is None or not assign_glob.strip()):
-    if sample_root is not None:
-        assign_glob = _default_assign_glob(sample_root, sample_name)
-        typer.echo(f"[decontam] auto --assign-glob: {assign_glob}")
-    
+        if sample_root is not None:
+            assign_glob = _default_assign_glob(sample_root, sample_name)
+            typer.echo(f"[decontam] auto --assign-glob: {assign_glob}")
+
     # ------------------------------------------------------------------
     # 1) Load per-barcode calls & Build Design Map
     # ------------------------------------------------------------------
@@ -223,9 +222,9 @@ def decontam_cmd(
     allowed_genome_map: Dict[str, str] = {}
     barcodes_to_drop_set: set[str] = set()
 
-    barcode_summary_rows = []
-    barcodes_to_drop_rows = []
-    per_barcode_rules_rows = []
+    barcode_summary_rows: List[dict] = []
+    barcodes_to_drop_rows: List[dict] = []
+    per_barcode_rules_rows: List[dict] = []
 
     for row in calls.itertuples(index=False):
         bc_full = str(row.barcode)
@@ -247,24 +246,18 @@ def decontam_cmd(
                 notes = "unknown_in_design"
             else:
                 if expected == g1:
-                    allowed = expected
-                    notes = "design_match_top1"
+                    allowed, notes = expected, "design_match_top1"
                 elif expected == g2:
-                    allowed = expected
-                    notes = "design_match_top2"
+                    allowed, notes = expected, "design_match_top2"
                 elif expected == g3:
-                    allowed = expected
-                    notes = "design_match_top3"
+                    allowed, notes = expected, "design_match_top3"
                 else:
                     if strict_design_drop_mismatch:
-                        action = "drop_barcode"
-                        notes = "design_mismatch_strict"
+                        action, notes = "drop_barcode", "design_mismatch_strict"
                     else:
-                        allowed = expected
-                        notes = "design_mismatch_lenient"
+                        allowed, notes = expected, "design_mismatch_lenient"
         else:
-            allowed = g1
-            notes = "agnostic_top1"
+            allowed, notes = g1, "agnostic_top1"
 
         if action == "drop_barcode":
             barcodes_to_drop_set.add(bc_seq_val)
@@ -294,15 +287,19 @@ def decontam_cmd(
     # ------------------------------------------------------------------
     input_files: List[Path] = []
 
-    if assignments:
+    if assignments is not None:
         input_files.append(Path(assignments).expanduser().resolve())
 
-    if assign_glob:
+    if assign_glob is not None:
         assign_glob = assign_glob.strip() or None
+
     if assign_glob:
         found = sorted(glob.glob(assign_glob, recursive=True))
         if not found:
-            typer.echo(f"[decontam] Warning: No files matched glob: {assign_glob}", err=True)
+            raise FileNotFoundError(
+                f"[decontam] No assignment files matched: {assign_glob}\n"
+                f"Expected files like: {sample_name}_chunk*_filtered.tsv.gz under cell_map_ref_chunks/."
+            )
         input_files.extend([Path(f).resolve() for f in found])
 
     input_files = sorted(set(input_files))
@@ -322,6 +319,7 @@ def decontam_cmd(
     if input_files:
         reads_to_drop_path = out_dir / f"{sample_name}_reads_to_drop.tsv.gz"
         typer.echo(f"[decontam] Processing {len(input_files)} assignment files...")
+
         with gzip.open(reads_to_drop_path, "wt") as fh:
             fh.write("read_id\tbarcode\tbc_seq\tallowed_genome\twinner_genome\tp_as\treason\n")
 
@@ -343,17 +341,18 @@ def decontam_cmd(
                     winner_genome = chunk[genome_col].astype(str)
                     mask_mismatch = (~mask_drop_barcode) & (winner_genome != allowed_series)
 
-                    # Winner definition
+                    # Default winner definition
                     class_series = chunk[class_col].astype(str)
                     is_winner_default = (class_series == "winner")
 
+                    # p_as handling
                     has_p_col = (p_as_col in chunk.columns)
                     p_raw = chunk[p_as_col] if has_p_col else pd.Series(pd.NA, index=chunk.index)
 
                     if decontam_alpha is not None and not has_p_col and not warned_missing_p_as:
                         typer.echo(
                             f"[decontam] Warning: --decontam-alpha set but column '{p_as_col}' not found "
-                            f"in {fp.name}; falling back to '{class_col}' only for those files.",
+                            f"in {fp.name}; falling back to '{class_col}' for those files.",
                             err=True,
                         )
                         warned_missing_p_as = True
@@ -369,6 +368,7 @@ def decontam_cmd(
                     else:
                         is_confident = is_winner_default
 
+                    # Drop only confident mismatches + all reads from dropped barcodes
                     mask_mismatch_conf = mask_mismatch & is_confident
                     mask_drop_read = mask_drop_barcode | mask_mismatch_conf
 
@@ -408,7 +408,6 @@ def decontam_cmd(
                             "reason": reasons,
                         }
                     )
-
                     out_df.loc[mask_drop_read].to_csv(fh, sep="\t", header=False, index=False)
 
         typer.echo(f"[decontam] Wrote {reads_to_drop_path}")
