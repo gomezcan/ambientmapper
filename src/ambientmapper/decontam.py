@@ -90,6 +90,9 @@ def _design_key(barcode: str, mode: str, n: int) -> str:
     else:
         base = s.split("-")[0]
 
+    # normalize: remove separators used in layout (and sometimes in barcodes)
+    base = base.replace("_", "").replace(":", "").replace(".", "")
+    
     if mode == "before-dash":
         return base
 
