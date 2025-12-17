@@ -51,6 +51,7 @@ def _infer_sample_root_from_cells_calls(cells_calls: Path) -> Optional[Path]:
 
 
 def _default_assign_glob(sample_root: Path, sample_name: str) -> str:
+    # <sample_root>/cell_map_ref_chunks/<sample>_chunk*_filtered.tsv.gz
     return str(sample_root / "cell_map_ref_chunks" / f"{sample_name}_chunk*_filtered.tsv.gz")
 
 
@@ -87,6 +88,31 @@ def _build_bcseq_to_expected_genome(
     return {str(k): str(v) for k, v in bc_to_sample.items()}
 
 
+def _col_first(df: pd.DataFrame, cols: list[str]) -> Optional[str]:
+    for c in cols:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _norm_str(x) -> str:
+    if x is None:
+        return ""
+    s = str(x).strip()
+    if s.lower() == "nan":
+        return ""
+    return s
+
+
+def _row_candidates_from_calls(row, candidate_cols: list[str]) -> list[str]:
+    out: list[str] = []
+    for c in candidate_cols:
+        v = _norm_str(getattr(row, c, ""))
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
 @app.callback(invoke_without_command=True)
 def decontam_cmd(
     cells_calls: Path = typer.Option(
@@ -103,8 +129,8 @@ def decontam_cmd(
     design_file: Optional[Path] = typer.Option(
         None,
         "--design-file",
-        readable=True,
         help="Optional design file. If provided enables design-aware mode.",
+        readable=True,
     ),
     layout_file: str = typer.Option(
         "DEFAULT",
@@ -114,7 +140,7 @@ def decontam_cmd(
     strict_design_drop_mismatch: bool = typer.Option(
         True,
         "--strict-design-drop-mismatch/--no-strict-design-drop-mismatch",
-        help="If strict, drop whole barcode when expected genome is not in top3.",
+        help="If strict, drop whole barcode when expected genome is not among candidates (top3 or genome_1/2).",
     ),
     # Assignment inputs
     assignments: Optional[Path] = typer.Option(
@@ -186,19 +212,34 @@ def decontam_cmd(
             typer.echo(f"[decontam] auto --assign-glob: {assign_glob}")
 
     # ------------------------------------------------------------------
-    # 1) Load per-barcode calls & Build Design Map
+    # 1) Load per-barcode calls & build schema
     # ------------------------------------------------------------------
     typer.echo(f"[decontam] Loading cell calls: {cells_calls}")
-    calls = pd.read_csv(cells_calls, sep="\t")
+    calls = pd.read_csv(cells_calls, sep="\t", dtype=str)
 
-    need_calls = {"barcode", "genome_top1", "genome_top2", "genome_top3"}
-    miss = need_calls - set(calls.columns)
-    if miss:
-        raise ValueError(f"{cells_calls} missing columns: {sorted(miss)}")
+    if "barcode" not in calls.columns:
+        raise ValueError(f"{cells_calls} missing required column: 'barcode'")
+
+    best_col = _col_first(calls, ["best_genome", "top_genome", "genome_top1"])
+    if best_col is None:
+        raise ValueError(
+            f"{cells_calls} missing a best-genome column. Expected one of: best_genome, top_genome, genome_top1"
+        )
+
+    if {"genome_top1", "genome_top2", "genome_top3"}.issubset(calls.columns):
+        candidate_cols = ["genome_top1", "genome_top2", "genome_top3"]
+    else:
+        candidate_cols = []
+        for c in ["top_genome", "best_genome", "genome_1", "genome_2"]:
+            if c in calls.columns and c not in candidate_cols:
+                candidate_cols.append(c)
 
     calls["barcode"] = calls["barcode"].astype(str)
     calls["bc_seq"] = calls["barcode"].map(_bc_seq)
 
+    # ------------------------------------------------------------------
+    # 1b) Build design map (optional)
+    # ------------------------------------------------------------------
     bcseq_to_expected: Optional[Dict[str, str]] = None
     if design_file is not None:
         typer.echo(f"[decontam] Strategy A: Design-Aware ({design_file})")
@@ -214,7 +255,7 @@ def decontam_cmd(
         if not bcseq_to_expected:
             raise ValueError(f"Design parsing produced an empty bc->expected map: {design_file}")
     else:
-        typer.echo("[decontam] Strategy B: Agnostic (Allowed = Top1)")
+        typer.echo(f"[decontam] Strategy B: Agnostic (Allowed = {best_col})")
 
     # ------------------------------------------------------------------
     # 2) Per-barcode allowed genome decision (keyed by bc_seq)
@@ -227,53 +268,57 @@ def decontam_cmd(
     per_barcode_rules_rows: List[dict] = []
 
     for row in calls.itertuples(index=False):
-        bc_full = str(row.barcode)
-        bc_seq_val = str(row.bc_seq)
+        bc_full = _norm_str(getattr(row, "barcode", ""))
+        bc_seq_val = _norm_str(getattr(row, "bc_seq", ""))
 
-        g1 = str(row.genome_top1)
-        g2 = str(row.genome_top2)
-        g3 = str(row.genome_top3)
+        best = _norm_str(getattr(row, best_col, ""))
+        cands = _row_candidates_from_calls(row, candidate_cols)
 
         expected: Optional[str] = None
         allowed: Optional[str] = None
         action = "keep_cleaned"
         notes = ""
 
-        if bcseq_to_expected is not None:
-            expected = bcseq_to_expected.get(bc_seq_val)
-            if expected is None:
+        if not bc_seq_val:
+            action = "drop_barcode"
+            notes = "empty_bc_seq"
+        elif bcseq_to_expected is not None:
+            expected = _norm_str(bcseq_to_expected.get(bc_seq_val))
+            if not expected:
                 action = "drop_barcode"
                 notes = "unknown_in_design"
+            elif expected in cands:
+                allowed = expected
+                notes = "design_match_candidate"
             else:
-                if expected == g1:
-                    allowed, notes = expected, "design_match_top1"
-                elif expected == g2:
-                    allowed, notes = expected, "design_match_top2"
-                elif expected == g3:
-                    allowed, notes = expected, "design_match_top3"
+                if strict_design_drop_mismatch:
+                    action = "drop_barcode"
+                    notes = "design_mismatch_strict"
                 else:
-                    if strict_design_drop_mismatch:
-                        action, notes = "drop_barcode", "design_mismatch_strict"
-                    else:
-                        allowed, notes = expected, "design_mismatch_lenient"
+                    allowed = expected
+                    notes = "design_mismatch_lenient"
         else:
-            allowed, notes = g1, "agnostic_top1"
+            if not best:
+                action = "drop_barcode"
+                notes = "no_best_genome"
+            else:
+                allowed = best
+                notes = f"agnostic_{best_col}"
 
         if action == "drop_barcode":
             barcodes_to_drop_set.add(bc_seq_val)
-            barcodes_to_drop_rows.append(
-                {"barcode": bc_full, "bc_seq": bc_seq_val, "reason": notes}
-            )
-        elif allowed is not None:
-            allowed_genome_map[bc_seq_val] = str(allowed)
-            per_barcode_rules_rows.append(
-                {"barcode": bc_full, "bc_seq": bc_seq_val, "drop_genome_ne": str(allowed)}
-            )
+            barcodes_to_drop_rows.append({"barcode": bc_full, "bc_seq": bc_seq_val, "reason": notes})
+        elif allowed:
+            allowed_genome_map[bc_seq_val] = allowed
+            per_barcode_rules_rows.append({"barcode": bc_full, "bc_seq": bc_seq_val, "drop_genome_ne": allowed})
 
         barcode_summary_rows.append(
             {
                 "barcode": bc_full,
                 "bc_seq": bc_seq_val,
+                "best_genome_col": best_col,
+                "best_genome": best,
+                "candidates": ",".join(cands),
                 "expected_genome": expected,
                 "allowed_genome": allowed,
                 "action": action,
@@ -313,7 +358,6 @@ def decontam_cmd(
     reads_to_drop_path: Optional[Path] = None
     reads_total_map: Dict[str, int] = {}
     reads_dropped_map: Dict[str, int] = {}
-
     warned_missing_p_as = False
 
     if input_files:
@@ -341,11 +385,9 @@ def decontam_cmd(
                     winner_genome = chunk[genome_col].astype(str)
                     mask_mismatch = (~mask_drop_barcode) & (winner_genome != allowed_series)
 
-                    # Default winner definition
                     class_series = chunk[class_col].astype(str)
                     is_winner_default = (class_series == "winner")
 
-                    # p_as handling
                     has_p_col = (p_as_col in chunk.columns)
                     p_raw = chunk[p_as_col] if has_p_col else pd.Series(pd.NA, index=chunk.index)
 
@@ -368,11 +410,9 @@ def decontam_cmd(
                     else:
                         is_confident = is_winner_default
 
-                    # Drop only confident mismatches + all reads from dropped barcodes
                     mask_mismatch_conf = mask_mismatch & is_confident
                     mask_drop_read = mask_drop_barcode | mask_mismatch_conf
 
-                    # Totals always
                     counts_total = bc_seq_series.value_counts()
                     for b, c in counts_total.items():
                         reads_total_map[b] = reads_total_map.get(b, 0) + int(c)
@@ -454,6 +494,8 @@ def decontam_cmd(
         "require_p_as": require_p_as,
         "chunksize": chunksize,
         "reads_to_drop": str(reads_to_drop_path) if reads_to_drop_path else None,
+        "best_col": best_col,
+        "candidate_cols": candidate_cols,
     }
     with params_path.open("w") as f:
         json.dump(params, f, indent=2)
@@ -463,3 +505,4 @@ def decontam_cmd(
     typer.echo(f"[decontam] Wrote {per_barcode_rules_path}")
     typer.echo(f"[decontam] Wrote {params_path}")
     typer.echo("[decontam] Done.")
+
