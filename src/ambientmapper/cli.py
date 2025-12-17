@@ -13,7 +13,10 @@ from .pipeline import run_pipeline
 
 # sub-apps / commands
 from .decontam import app as decontam_app
+app.add_typer(decontam_app, name="decontam")
+
 from .clean_bams import clean_bams_cmd
+app.command("clean-bams")(clean_bams_cmd)
 
 app = typer.Typer(help="ambientmapper: local-first ambient cleaning pipeline")
 
