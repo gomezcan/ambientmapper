@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import csv
+from typing import Dict, List, Tuple, Optional
 from pathlib import Path
-from typing import Dict, Optional
+
 
 import pandas as pd
 
