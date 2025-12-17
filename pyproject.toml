@@ -33,6 +33,9 @@ where = ["src"]
 [tool.pytest.ini_options]
 addopts = "-q"
 
+[tool.setuptools.package-data]
+ambientmapper = ["data/*.txt"]
+
 [project.optional-dependencies]
 test = ["pytest>=7"]
 
