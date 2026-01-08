@@ -660,6 +660,7 @@ def run(
     genotyping_threads: Optional[int] = typer.Option(None, "--genotyping-threads"),
     genotyping_shards: Optional[int] = typer.Option(None, "--genotyping-shards"),
     genotyping_chunk_rows: Optional[int] = typer.Option(None, "--genotyping-chunk-rows"),
+    genotyping_pass1_workers: Optional[int] = typer.Option(None, "--genotyping-pass1-workers", help="Pass-1 workers for genotyping."),
     genotyping_pass2_chunksize: Optional[int] = typer.Option(None, "--genotyping-pass2-chunksize"),
     genotyping_winner_only: Optional[bool] = typer.Option(None, "--genotyping-winner-only/--no-genotyping-winner-only"),
     genotyping_doublet_minor_min: Optional[float] = typer.Option(None, "--genotyping-doublet-minor-min"),
@@ -711,6 +712,8 @@ def run(
         genotyping_conf["shards"] = int(genotyping_shards)
     if genotyping_chunk_rows is not None:
         genotyping_conf["chunk_rows"] = int(genotyping_chunk_rows)
+    if genotyping_pass1_workers is not None:
+        genotyping_conf["pass1_workers"] = int(genotyping_pass1_workers)
     if genotyping_pass2_chunksize is not None:
         genotyping_conf["pass2_chunksize"] = int(genotyping_pass2_chunksize)
     if genotyping_winner_only is not None:
