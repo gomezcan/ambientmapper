@@ -664,6 +664,7 @@ def run(
     genotyping_winner_only: Optional[bool] = typer.Option(None, "--genotyping-winner-only/--no-genotyping-winner-only"),
     genotyping_doublet_minor_min: Optional[float] = typer.Option(None, "--genotyping-doublet-minor-min"),
     genotyping_single_mass_min: Optional[float] = typer.Option(None, "--genotyping-single-mass-min"),
+    genotyping_ratio_top1_top2_min: Optional[float] = typer.Option(None, "--genotyping-ratio-top1-top2-min", help="Minimum p_top1/p_top2 ratio."),
 
     # empty / ambient overrides
     genotyping_eta_iters: Optional[int] = typer.Option(None, "--genotyping-eta-iters"),
@@ -718,6 +719,9 @@ def run(
         genotyping_conf["doublet_minor_min"] = float(genotyping_doublet_minor_min)
     if genotyping_single_mass_min is not None:
         genotyping_conf["single_mass_min"] = float(genotyping_single_mass_min)
+    if genotyping_ratio_top1_top2_min is not None:
+        genotyping_conf["ratio_top1_top2_min"] = float(genotyping_ratio_top1_top2_min)
+
 
     if genotyping_eta_iters is not None:
         genotyping_conf["eta_iters"] = int(genotyping_eta_iters)
