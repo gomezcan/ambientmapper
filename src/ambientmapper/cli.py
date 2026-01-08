@@ -655,8 +655,7 @@ def run(
     ecdf_workers: Optional[int] = typer.Option(None, "--ecdf-workers"),
 
     # genotyping overrides (forwarded into params['genotyping'])
-    genotyping_min_reads: Optional[int] = typer.Option(None, "--genotyping-min-reads"),
-    genotyping_ratio_top1_top2_min: Optional[float] = typer.Option(None, "--genotyping-ratio-top1-top2-min",help="Genotyping: min top1/top2 dominance ratio for single calls."),
+    genotyping_min_reads: Optional[int] = typer.Option(None, "--genotyping-min-reads"),    
     genotyping_beta: Optional[float] = typer.Option(None, "--genotyping-beta"),
     genotyping_w_as: Optional[float] = typer.Option(None, "--genotyping-w-as"),
     genotyping_w_mapq: Optional[float] = typer.Option(None, "--genotyping-w-mapq"),
@@ -672,7 +671,7 @@ def run(
     genotyping_winner_only: Optional[bool] = typer.Option(None, "--genotyping-winner-only/--no-genotyping-winner-only"),
     genotyping_doublet_minor_min: Optional[float] = typer.Option(None, "--genotyping-doublet-minor-min"),
     genotyping_single_mass_min: Optional[float] = typer.Option(None, "--genotyping-single-mass-min"),
-    genotyping_ratio_top1_top2_min: Optional[float] = typer.Option(None, "--genotyping-ratio-top1-top2-min", help="Minimum p_top1/p_top2 ratio."),
+    genotyping_ratio_top1_top2_min: Optional[float] = typer.Option(None, "--genotyping-ratio-top1-top2-min", help="min top1/top2 dominance ratio for single calls."),    
 
     # empty / ambient overrides
     genotyping_eta_iters: Optional[int] = typer.Option(None, "--genotyping-eta-iters"),
