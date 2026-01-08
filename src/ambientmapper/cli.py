@@ -458,6 +458,7 @@ def genotyping(
 
     # Performance
     threads: Optional[int] = typer.Option(None, "--threads", help="Pass-2 workers (model selection)."),
+    pass1_workers: Optional[int] = typer.Option(None, "--pass1-workers", help="Pass-1 workers (file-parallel)."),
     shards: Optional[int] = typer.Option(None, "--shards", help="Shard count for pass-1 spill (default 32)."),
     chunk_rows: Optional[int] = typer.Option(None, "--chunk-rows", help="Pass-1 input chunk size (rows)."),
     pass2_chunksize: Optional[int] = typer.Option(None, "--pass2-chunksize", help="Pass-2 shard chunk size (rows)."),
@@ -563,6 +564,8 @@ def genotyping(
         kwargs["topk_genomes"] = max(1, int(topk_genomes))
     if single_mass_min is not None:
         kwargs["single_mass_min"] = float(single_mass_min)
+    if pass1_workers is not None:
+        kwargs["pass1_workers"] = max(1, int(pass1_workers))
 
     if eta_iters is not None:
         kwargs["eta_iters"] = max(0, int(eta_iters))
