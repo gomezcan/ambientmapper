@@ -467,6 +467,7 @@ def genotyping(
     winner_only: Optional[bool] = typer.Option(None, "--winner-only/--no-winner-only", help="Winner-only mode (default true)."),
 
     # Single/Doublet modeling
+    ratio_top1_top2_min: Optional[float] = typer.Option(None, "--ratio-top1-top2-min", help="Min top1/top2 dominance ratio for single calls."),
     min_reads: Optional[int] = typer.Option(None, "--min-reads", help="Min reads to fit single/doublet."),
     beta: Optional[float] = typer.Option(None, "--beta", help="Softmax temperature (probabilistic mode)."),
     w_as: Optional[float] = typer.Option(None, "--w-as", help="AS weight (probabilistic mode)."),
@@ -546,6 +547,8 @@ def genotyping(
 
     if min_reads is not None:
         kwargs["min_reads"] = max(1, int(min_reads))
+    if ratio_top1_top2_min is not None:
+        kwargs["ratio_top1_top2_min"] = float(ratio_top1_top2_min)
     if beta is not None:
         kwargs["beta"] = float(beta)
     if w_as is not None:
@@ -653,6 +656,7 @@ def run(
 
     # genotyping overrides (forwarded into params['genotyping'])
     genotyping_min_reads: Optional[int] = typer.Option(None, "--genotyping-min-reads"),
+    genotyping_ratio_top1_top2_min: Optional[float] = typer.Option(None, "--genotyping-ratio-top1-top2-min",help="Genotyping: min top1/top2 dominance ratio for single calls."),
     genotyping_beta: Optional[float] = typer.Option(None, "--genotyping-beta"),
     genotyping_w_as: Optional[float] = typer.Option(None, "--genotyping-w-as"),
     genotyping_w_mapq: Optional[float] = typer.Option(None, "--genotyping-w-mapq"),
