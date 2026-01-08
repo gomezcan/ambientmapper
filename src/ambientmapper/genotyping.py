@@ -740,6 +740,7 @@ def genotyping(
     shards: int = typer.Option(32, help="Number of spill shards."),
     threads: int = typer.Option(1, help="Pass-2 workers."),
     chunk_rows: int = typer.Option(5_000_000, help="Pass-1 input chunksize."),
+    pass1_workers: Optional[int] = typer.Option(None, help="Pass-1 workers."),
     pass2_chunksize: int = typer.Option(200_000, help="Pass-2 shard chunksize."),
     winner_only: bool = typer.Option(True, help="Winner-only mode (default)."),
 
