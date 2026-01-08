@@ -84,6 +84,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import typer
+from typer.models import OptionInfo
 from pydantic import BaseModel
 from tqdm import tqdm
 
@@ -799,6 +800,8 @@ def _pass2_worker(args) -> List[Dict[str, Any]]:
 
     return rows
 
+def _unwrap_optioninfo(x):
+    return x.default if isinstance(x, OptionInfo) else x
 
 # ------------------------------
 # Main
@@ -853,22 +856,22 @@ def genotyping(
         shards=shards,
         chunk_rows=chunk_rows,
         pass1_workers=int(pass1_workers) if pass1_workers is not None else 1,
-        pass2_chunksize=pass2_chunksize,
+        pass2_chunksize=_unwrap_optioninfo(pass2_chunksize),
         winner_only=winner_only,
         beta=beta,
         w_as=w_as,
         w_mapq=w_mapq,
         w_nm=w_nm,
-        ambient_const=ambient_const,
-        empty_bic_margin=empty_bic_margin,
-        empty_top1_max=empty_top1_max,
-        empty_ratio12_max=empty_ratio12_max,
-        empty_entropy_min=empty_entropy_min,
-        empty_reads_max=empty_reads_max,
-        bic_margin=bic_margin,
-        doublet_minor_min=doublet_minor_min,
-        eta_iters=eta_iters,
-        eta_seed_quantile=eta_seed_quantile,
+        ambient_const=_unwrap_optioninfo(ambient_const),
+        empty_bic_margin=_unwrap_optioninfo(empty_bic_margin),
+        empty_top1_max=_unwrap_optioninfo(empty_top1_max),
+        empty_ratio12_max=_unwrap_optioninfo(empty_ratio12_max),
+        empty_entropy_min=_unwrap_optioninfo(empty_entropy_min),
+        empty_reads_max=_unwrap_optioninfo(empty_reads_max),
+        bic_margin=_unwrap_optioninfo(bic_margin),
+        doublet_minor_min=_unwrap_optioninfo(doublet_minor_min),
+        eta_iters=_unwrap_optioninfo(eta_iters),
+        eta_seed_quantile=_unwrap_optioninfo(eta_seed_quantile),
         topk_genomes=topk_genomes,
     )
 
