@@ -132,6 +132,7 @@ class MergeConfig(BaseModel):
     chunk_rows: int = 5_000_000         # pass1 chunk size
     pass2_chunksize: int = 200_000      # pass2 shard read chunks
     winner_only: bool = True
+    pass1_workers: int = 1
 
 
 # ------------------------------
@@ -651,36 +652,40 @@ def _pass1_stream_build(assign_glob: str, cfg: MergeConfig, tmp_dir: Path) -> Tu
     if not files:
         raise FileNotFoundError(f"No files for {assign_glob}")
 
-    shard_dir = tmp_dir / "L_shards"
-    handles = _open_shard_handles(shard_dir, cfg.shards)
-    headers = {i: False for i in range(cfg.shards)}
+    # per-worker shard outputs
+    workers = max(1, int(getattr(cfg, "pass1_workers", 1) or 1))
+    workers = min(workers, len(files))
 
+    worker_root = tmp_dir / "L_shards_workers"
+    worker_root.mkdir(parents=True, exist_ok=True)
+
+    # run pass1
     C_parts: List[pd.DataFrame] = []
     N_parts: List[pd.DataFrame] = []
 
-    for fp in tqdm(files, desc="[pass1] streaming"):
-        try:
-            it = pd.read_csv(fp, sep="\t", chunksize=cfg.chunk_rows, low_memory=False)
-            for raw in it:
-                df = _coerce_assign_schema(raw)
-                df = _reduce_alignments_to_per_genome(df).dropna(subset=["barcode", "read_id", "genome"])
-                if df.empty:
-                    continue
+    if workers == 1:
+        wd = worker_root / "w000"
+        wd.mkdir(parents=True, exist_ok=True)
+        for fp in tqdm(files, desc="[pass1] streaming"):
+            C_one, N_one = _pass1_process_one_file(fp, cfg, wd)
+            C_parts.append(C_one)
+            N_parts.append(N_one)
+    else:
+        def _job(i_fp: Tuple[int, Path]) -> Tuple[int, pd.DataFrame, pd.DataFrame]:
+            i, fp = i_fp
+            wd = worker_root / f"w{i:03d}"
+            wd.mkdir(parents=True, exist_ok=True)
+            C_one, N_one = _pass1_process_one_file(fp, cfg, wd)
+            return i, C_one, N_one
 
-                Ldf = _compute_read_posteriors(df, cfg)
-                C, N = _aggregate_expected_counts_from_chunk(Ldf)
-                C_parts.append(C)
-                N_parts.append(N)
-                _write_L_chunk_to_shards(Ldf, handles, cfg.shards, headers)
-        except Exception as e:
-            typer.echo(f"[warn] skipping {fp}: {e}")
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_job, (i, fp)) for i, fp in enumerate(files)]
+            for fut in tqdm(futures, desc=f"[pass1] files (workers={workers})"):
+                _, C_one, N_one = fut.result()
+                C_parts.append(C_one)
+                N_parts.append(N_one)
 
-    for h in handles:
-        try:
-            h.close()
-        except Exception:
-            pass
-
+    # merge expected counts
     if C_parts:
         C_all = (
             pd.concat(C_parts, ignore_index=True)
@@ -701,7 +706,77 @@ def _pass1_stream_build(assign_glob: str, cfg: MergeConfig, tmp_dir: Path) -> Tu
     else:
         N_all = pd.DataFrame(columns=["barcode", "n_reads"])
 
+    # merge worker shard gzip members → final shard_dir
+    shard_dir = tmp_dir / "L_shards"
+    worker_dirs = sorted([p for p in worker_root.glob("w*") if p.is_dir()])
+    _merge_worker_shards(worker_dirs, shard_dir, cfg.shards)
+
     return C_all, N_all, shard_dir
+
+
+def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    handles = _open_shard_handles(shard_dir, cfg.shards)
+    headers = {i: False for i in range(cfg.shards)}
+    C_parts: List[pd.DataFrame] = []
+    N_parts: List[pd.DataFrame] = []
+
+    try:
+        it = pd.read_csv(fp, sep="\t", chunksize=cfg.chunk_rows, low_memory=False)
+        for raw in it:
+            df = _coerce_assign_schema(raw)
+            df = _reduce_alignments_to_per_genome(df).dropna(subset=["barcode", "read_id", "genome"])
+            if df.empty:
+                continue
+
+            Ldf = _compute_read_posteriors(df, cfg)
+            C, N = _aggregate_expected_counts_from_chunk(Ldf)
+            C_parts.append(C)
+            N_parts.append(N)
+            _write_L_chunk_to_shards(Ldf, handles, cfg.shards, headers)
+    finally:
+        for h in handles:
+            try:
+                h.close()
+            except Exception:
+                pass
+
+    if C_parts:
+        C_one = (
+            pd.concat(C_parts, ignore_index=True)
+            .groupby(["barcode", "genome"], observed=True)["C"]
+            .sum()
+            .reset_index()
+        )
+    else:
+        C_one = pd.DataFrame(columns=["barcode", "genome", "C"])
+
+    if N_parts:
+        N_one = (
+            pd.concat(N_parts, ignore_index=True)
+            .groupby("barcode", observed=True)["n_reads"]
+            .sum()
+            .reset_index()
+        )
+    else:
+        N_one = pd.DataFrame(columns=["barcode", "n_reads"])
+
+    return C_one, N_one
+
+
+def _merge_worker_shards(worker_dirs: List[Path], out_shard_dir: Path, shards: int) -> None:
+    out_shard_dir.mkdir(parents=True, exist_ok=True)
+    for si in range(shards):
+        out_fp = out_shard_dir / f"shard_{si:02d}.tsv.gz"
+        # overwrite if exists
+        if out_fp.exists():
+            out_fp.unlink()
+
+        with open(out_fp, "ab") as w:
+            for wd in worker_dirs:
+                part = wd / f"shard_{si:02d}.tsv.gz"
+                if part.exists() and part.stat().st_size > 0:
+                    with open(part, "rb") as r:
+                        shutil.copyfileobj(r, w, length=1024 * 1024)
 
 
 def _pass2_worker(args) -> List[Dict[str, Any]]:
@@ -773,6 +848,7 @@ def genotyping(
         min_reads=min_reads,
         shards=shards,
         chunk_rows=chunk_rows,
+        pass1_workers=int(pass1_workers) if pass1_workers is not None else 1,
         pass2_chunksize=pass2_chunksize,
         winner_only=winner_only,
         beta=beta,
