@@ -207,6 +207,12 @@ def _write_gzip_df(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, sep="\t", index=False, compression="gzip")
 
+def _pass1_job(i: int, fp: Path, cfg: MergeConfig, worker_root: Path) -> Tuple[int, pd.DataFrame, pd.DataFrame]:
+    wd = worker_root / f"w{i:03d}"
+    wd.mkdir(parents=True, exist_ok=True)
+    C_one, N_one = _pass1_process_one_file(fp, cfg, wd)
+    return i, C_one, N_one
+
 
 # ------------------------------
 # Core math
@@ -671,16 +677,12 @@ def _pass1_stream_build(assign_glob: str, cfg: MergeConfig, tmp_dir: Path) -> Tu
             C_one, N_one = _pass1_process_one_file(fp, cfg, wd)
             C_parts.append(C_one)
             N_parts.append(N_one)
-    else:
-        def _job(i_fp: Tuple[int, Path]) -> Tuple[int, pd.DataFrame, pd.DataFrame]:
-            i, fp = i_fp
-            wd = worker_root / f"w{i:03d}"
-            wd.mkdir(parents=True, exist_ok=True)
-            C_one, N_one = _pass1_process_one_file(fp, cfg, wd)
-            return i, C_one, N_one
-
+    else:        
         with ProcessPoolExecutor(max_workers=workers) as ex:
-            futures = [ex.submit(_job, (i, fp)) for i, fp in enumerate(files)]
+            futures = [
+              ex.submit(_pass1_job, i, fp, cfg, worker_root)
+              for i, fp in enumerate(files)
+            ]
             for fut in tqdm(futures, desc=f"[pass1] files (workers={workers})"):
                 _, C_one, N_one = fut.result()
                 C_parts.append(C_one)
