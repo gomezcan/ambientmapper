@@ -1,75 +1,35 @@
+```python
 #!/usr/bin/env python3
 """
-ambientmapper genotyping — posterior-aware merge → per-cell genotype calls (+ optional decontam)
+src/ambientmapper/genotyping.py
+
+ambientmapper genotyping — posterior-aware merge → per-cell genotype calls (+ empty-aware)
 
 This module consumes per-read, multi-genome evidence exported by `assign` and
-emits per-cell genotype calls: {single, doublet, indistinguishable, ambiguous}.
+emits per-cell genotype calls: {single, doublet, indistinguishable, ambiguous, empty}.
 All decisions are data-driven from `assign` outputs (no plate/design priors here).
-An optional QC report and per-read drop list (for single/indistinguishable calls)
-are produced to aid downstream cleaning.
 
 Two-pass execution
   Pass 1: Stream input TSV(.gz) chunks → compute per-read posteriors L(r,g),
           accumulate expected counts C(b,g) + n_reads(b), and spill per-read L
           into barcode-hashed shard files on disk.
-  Pass 2: Walk shard files → group rows per barcode → model selection (single vs
-          doublet with ambient) → write calls and optional read-drop table.
+  Pass 2: Walk shard files → group rows per barcode → model selection (empty vs
+          single vs doublet with ambient) → write calls.
 
-CLI (Typer):
-  ambientmapper genotyping \
-      --assign 'work/cell_map_ref_chunks/*_filtered.tsv.gz' \
-      --outdir work/merge --sample SAMPLE \
-      [--min-reads 300] [--beta 0.5] [--tau-drop 8] \
-      [--topk-genomes 3] [--ambient-const 1e-3] \
-      [--winner-only/--no-winner-only] \
-      [--report/--no-report] [--threads 1]
+Key output contract (updated)
+  - ALWAYS write one row per barcode that reaches inference inclusion:
+      <outdir>/<sample>_cells_calls.tsv.gz
+    including call="empty" rows (empties are NOT dropped before writing).
 
-Inputs expected from `assign` (flexible; auto-detected when possible)
-  Required columns (after coercion):
-    - barcode (str)
-    - read_id (str)
-    - genome (str)
-  Recommended score columns (any subset; improves separation):
-    - AS   (alignment score; higher is better)
-    - MAPQ (mapping quality; higher is better)
-    - NM   (edits/mismatches; lower is better)
-  Optional per-read ambiguity p-values (if your assign pipeline emits them):
-    - p_as, p_mq  — in [0,1]; smaller = stronger winner-vs-runner-up evidence
+Empty gate update (entropy_norm)
+  - Add entropy_norm in [0,1] computed with K_eff = topk_genomes (Option 1).
+  - Empty gate uses entropy_norm >= empty_entropy_norm_min.
 
-High-level behavior
-  1) Schema-coerce and collapse to one row per (barcode, read_id, genome):
-       AS=max; MAPQ=max; NM=min; p_* = min
-  2) For each read, fuse available scores with robust z-scaling and a p-value
-     penalty; softmax (temperature beta) + tiny ambient mass → soft posteriors L(r,g).
-     If --winner-only is enabled, each read is collapsed to its top genome,
-     and that genome receives all non-ambient mass (1 - L_amb).
-  3) Aggregate expected counts per (barcode, genome): C(b,g) = Σ_r L(r,g).
-     Estimate an ambient profile eta(g) from low-read barcodes (<200 reads).
-  4) For each barcode, pick top-k candidate genomes by C(b,g). Grid-search
-     single vs doublet models with ambient (alpha) and, for doublets, mixture (rho);
-     select by BIC with conservative margins.
-  5) Emit call + QC metrics.
-
-Outputs (current design)
-  - <outdir>/<sample>_cells_calls.tsv.gz
-      One row per barcode with:
-        call, genome_1, genome_2, alpha, rho, purity, minor,
-        bic_best, bic_single, bic_doublet, delta_bic,
-        n_reads, n_effective, concordance, indistinguishable_set, notes,
-        p_top1, p_top2, p_top3, top3_sum, entropy,
-        top_genome, best_genome, status_flag, ...
-  - <outdir>/<sample>_BCs_PASS_by_mapping.csv
-      Legacy-compatible summary: barcode, AssignedGenome (=best_genome), call, purity, n_reads.
-  - <outdir>/<sample>_expected_counts_by_genome.csv
-      Barcode × genome expected-count matrix (debug/inspection).
-  - <outdir>/<sample>_eta_iter*.json and <outdir>/<sample>_eta_final.json
-
-Key features:
-  * Winner-only (default): each read collapses to its best genome (plus ambient mass).
-  * Probabilistic (optional): within-read z-scored fusion of AS/MAPQ/NM + p-value penalty.
-  * Explicit empty model: compare Empty vs Single vs Doublet using BIC.
-  * Iterative ambient learning: re-estimate eta(g) from inferred empties.
-  """
+Notes
+  - Winner-only mode requires AS, MAPQ, NM.
+  - Probabilistic mode fuses AS/MAPQ/NM + p-value penalty.
+  - Empty model compares against best non-empty BIC with conservative gates.
+"""
 from __future__ import annotations
 
 import glob
@@ -105,7 +65,7 @@ class MergeConfig(BaseModel):
     p_eps: float = 1e-3
 
     # Calling thresholds
-    min_reads: int = 100              # minimum reads to fit Single/Doublet
+    min_reads: int = 100              # minimum reads to fit Single/Doublet (inference inclusion is separate if you add it later)
     single_mass_min: float = 0.85     # purity threshold for Single
     doublet_minor_min: float = 0.20   # minor fraction threshold for Doublet
     bic_margin: float = 6.0           # ΔBIC required to accept Doublet over Single
@@ -118,14 +78,14 @@ class MergeConfig(BaseModel):
     empty_bic_margin: float = 10.0
     empty_top1_max: float = 0.6
     empty_ratio12_max: float = 1.5
-    empty_entropy_min: float = 0.8
+    empty_entropy_norm_min: float = 0.8  # NEW: normalized entropy gate
     empty_reads_max: Optional[int] = None
 
     # Search grid
     alpha_grid: float = 0.02
     rho_grid: float = 0.05
     max_alpha: float = 0.5
-    topk_genomes: int = 3
+    topk_genomes: int = 3  # also used as K_eff for entropy_norm
 
     # System
     sample: str = "sample"
@@ -206,6 +166,7 @@ def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
 def _write_gzip_df(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, sep="\t", index=False, compression="gzip")
+
 
 def _pass1_job(i: int, fp: Path, cfg: MergeConfig, worker_root: Path) -> Tuple[int, pd.DataFrame, pd.DataFrame]:
     wd = worker_root / f"w{i:03d}"
@@ -336,7 +297,6 @@ def _loglik_empty(L_block: pd.DataFrame, eta: pd.Series) -> float:
     genomes = L_block["genome"].astype(str)
     eta_row = eta.reindex(genomes).fillna(0.0).to_numpy(dtype=float)
 
-    # if eta has tiny floor, this should be safe; keep clip anyway
     wL = eta_row * L_block["L"].to_numpy(dtype=float)
 
     tmp = L_block[["read_id"]].copy()
@@ -411,7 +371,23 @@ def _select_model_for_barcode(
     p2 = float(props[1]) if len(props) > 1 else 0.0
     p3 = float(props[2]) if len(props) > 2 else 0.0
     top3_sum = p1 + p2 + p3
+
+    # entropy (natural log)
     entropy = float(-np.sum(props * np.log(np.clip(props, 1e-12, 1.0)))) if tot > 0 else 0.0
+
+    # entropy_norm using Option 1: K_eff = cfg.topk_genomes
+    K_eff = int(cfg.topk_genomes) if int(cfg.topk_genomes) > 0 else 1
+    Hmax = math.log(K_eff) if K_eff > 1 else 0.0
+    if Hmax > 0:
+        entropy_norm = entropy / Hmax
+        if entropy_norm < 0.0:
+            entropy_norm = 0.0
+        elif entropy_norm > 1.0:
+            entropy_norm = 1.0
+    else:
+        entropy_norm = 0.0
+
+    # ratio: if p2==0 => Inf (and will fail empty gate)
     ratio12 = (p1 / p2) if p2 > 0 else float("inf")
     top_genome = genomes_sorted[0] if genomes_sorted else None
 
@@ -423,6 +399,7 @@ def _select_model_for_barcode(
         "p_top3": p3,
         "top3_sum": top3_sum,
         "entropy": entropy,
+        "entropy_norm": float(entropy_norm),
         "ratio_top1_top2": ratio12,
         "top_genome": top_genome,
         "call": "ambiguous",
@@ -431,6 +408,9 @@ def _select_model_for_barcode(
         "bic_single": float("inf"),
         "bic_doublet": float("inf"),
         "bic_best": float("inf"),
+        "bic_best_non_empty": float("inf"),
+        "delta_empty": float("nan"),
+        "delta_math": float("nan"),
         "model": None,
         "genome_1": None,
         "genome_2": None,
@@ -487,6 +467,7 @@ def _select_model_for_barcode(
 
     out["bic_single"] = best_single["bic"] if best_single else float("inf")
     out["bic_doublet"] = best_doublet["bic"] if best_doublet else float("inf")
+    out["delta_math"] = float(out["bic_doublet"] - out["bic_single"])
 
     # Best non-empty model
     best_non_empty: Optional[Dict[str, Any]]
@@ -496,6 +477,8 @@ def _select_model_for_barcode(
         best_non_empty = best_single or best_doublet
 
     bic_non_empty = best_non_empty["bic"] if best_non_empty else float("inf")
+    out["bic_best_non_empty"] = float(bic_non_empty)
+    out["delta_empty"] = float(bic_non_empty - bic_empty) if math.isfinite(bic_non_empty) else float("inf")
 
     # -------------------------
     # Empty gate (conservative)
@@ -503,7 +486,7 @@ def _select_model_for_barcode(
     is_empty_best = (bic_empty < bic_non_empty)
     bic_margin_ok = (bic_non_empty - bic_empty) >= cfg.empty_bic_margin
     weak_dominance = (p1 <= cfg.empty_top1_max) and (ratio12 <= cfg.empty_ratio12_max)
-    diffuse = (entropy >= cfg.empty_entropy_min)
+    diffuse = (entropy_norm >= cfg.empty_entropy_norm_min)
     ceiling_ok = (read_count <= cfg.empty_reads_max) if cfg.empty_reads_max is not None else True
 
     if is_empty_best and bic_margin_ok and weak_dominance and diffuse and ceiling_ok:
@@ -521,7 +504,7 @@ def _select_model_for_barcode(
 
     # If no non-empty fit (e.g., low depth), fall back
     if best_non_empty is None:
-        out.update({"call": "ambiguous", "status_flag": "low_depth"})
+        out.update({"call": "ambiguous", "status_flag": "low_depth", "bic_best": bic_empty})
         return out
 
     # -------------------------
@@ -637,7 +620,6 @@ def _iter_shard_rows(shard_fp: Path, chunksize: int) -> Iterator[pd.DataFrame]:
         return
 
     for chunk in it:
-        # remove shard header-lines (if any)
         chunk = chunk[chunk["barcode"] != "barcode"]
         chunk = chunk.dropna(subset=["barcode", "read_id", "genome"])
         if chunk.empty:
@@ -659,14 +641,12 @@ def _pass1_stream_build(assign_glob: str, cfg: MergeConfig, tmp_dir: Path) -> Tu
     if not files:
         raise FileNotFoundError(f"No files for {assign_glob}")
 
-    # per-worker shard outputs
     workers = max(1, int(getattr(cfg, "pass1_workers", 1) or 1))
     workers = min(workers, len(files))
 
     worker_root = tmp_dir / "L_shards_workers"
     worker_root.mkdir(parents=True, exist_ok=True)
 
-    # run pass1
     C_parts: List[pd.DataFrame] = []
     N_parts: List[pd.DataFrame] = []
 
@@ -677,18 +657,17 @@ def _pass1_stream_build(assign_glob: str, cfg: MergeConfig, tmp_dir: Path) -> Tu
             C_one, N_one = _pass1_process_one_file(fp, cfg, wd)
             C_parts.append(C_one)
             N_parts.append(N_one)
-    else:        
+    else:
         with ProcessPoolExecutor(max_workers=workers) as ex:
             futures = [
-              ex.submit(_pass1_job, i, fp, cfg, worker_root)
-              for i, fp in enumerate(files)
+                ex.submit(_pass1_job, i, fp, cfg, worker_root)
+                for i, fp in enumerate(files)
             ]
             for fut in tqdm(futures, desc=f"[pass1] files (workers={workers})"):
                 _, C_one, N_one = fut.result()
                 C_parts.append(C_one)
                 N_parts.append(N_one)
 
-    # merge expected counts
     if C_parts:
         C_all = (
             pd.concat(C_parts, ignore_index=True)
@@ -709,7 +688,6 @@ def _pass1_stream_build(assign_glob: str, cfg: MergeConfig, tmp_dir: Path) -> Tu
     else:
         N_all = pd.DataFrame(columns=["barcode", "n_reads"])
 
-    # merge worker shard gzip members → final shard_dir
     shard_dir = tmp_dir / "L_shards"
     worker_dirs = sorted([p for p in worker_root.glob("w*") if p.is_dir()])
     _merge_worker_shards(worker_dirs, shard_dir, cfg.shards)
@@ -770,7 +748,6 @@ def _merge_worker_shards(worker_dirs: List[Path], out_shard_dir: Path, shards: i
     out_shard_dir.mkdir(parents=True, exist_ok=True)
     for si in range(shards):
         out_fp = out_shard_dir / f"shard_{si:02d}.tsv.gz"
-        # overwrite if exists
         if out_fp.exists():
             out_fp.unlink()
 
@@ -802,8 +779,10 @@ def _pass2_worker(args) -> List[Dict[str, Any]]:
 
     return rows
 
+
 def _unwrap_optioninfo(x):
     return x.default if isinstance(x, OptionInfo) else x
+
 
 # ------------------------------
 # Main
@@ -837,7 +816,7 @@ def genotyping(
     empty_bic_margin: float = typer.Option(10.0, help="Min ΔBIC (non-empty - empty) to call empty."),
     empty_top1_max: float = typer.Option(0.6, help="Max top1 mass to allow empty."),
     empty_ratio12_max: float = typer.Option(1.5, help="Max top1/top2 ratio to allow empty."),
-    empty_entropy_min: float = typer.Option(0.8, help="Min entropy to allow empty."),
+    empty_entropy_norm_min: float = typer.Option(0.8, help="Min entropy_norm to allow empty."),
     empty_reads_max: Optional[int] = typer.Option(None, help="Optional ceiling for empty calls."),
 
     # Doublet gates
@@ -847,9 +826,9 @@ def genotyping(
     # Ambient iteration
     eta_iters: int = typer.Option(2, help="Iterations for ambient refinement."),
     eta_seed_quantile: float = typer.Option(0.02, help="Seed eta from bottom quantile of n_reads."),
-    topk_genomes: int = typer.Option(3, help="Top-K candidate genomes per barcode."),
+    topk_genomes: int = typer.Option(3, help="Top-K candidate genomes per barcode (also K_eff for entropy_norm)."),
 ):
-    """Run iterative empty-aware genotyping."""
+    """Run iterative empty-aware genotyping (writes empties into *_cells_calls.tsv.gz)."""
     cfg = MergeConfig(
         sample=sample,
         min_reads=min_reads,
@@ -868,7 +847,7 @@ def genotyping(
         empty_bic_margin=_unwrap_optioninfo(empty_bic_margin),
         empty_top1_max=_unwrap_optioninfo(empty_top1_max),
         empty_ratio12_max=_unwrap_optioninfo(empty_ratio12_max),
-        empty_entropy_min=_unwrap_optioninfo(empty_entropy_min),
+        empty_entropy_norm_min=_unwrap_optioninfo(empty_entropy_norm_min),
         empty_reads_max=_unwrap_optioninfo(empty_reads_max),
         bic_margin=_unwrap_optioninfo(bic_margin),
         doublet_minor_min=_unwrap_optioninfo(doublet_minor_min),
@@ -877,6 +856,7 @@ def genotyping(
         topk_genomes=topk_genomes,
     )
 
+    outdir = outdir.expanduser().resolve()
     outdir.mkdir(parents=True, exist_ok=True)
     tmp_dir = outdir / f"tmp_{sample}"
     if tmp_dir.exists():
@@ -915,27 +895,20 @@ def genotyping(
                     mix[str(g)] = mix.get(str(g), 0.0) + float(v)
 
         eps = 1e-12
-        if not all_genomes:
-            # fallback: if no genomes known, return empty series
-            if not mix:
-                return pd.Series(dtype=float)
-            allg = sorted(mix.keys())
-        else:
-            allg = all_genomes
+        allg = all_genomes if all_genomes else sorted(mix.keys())
+
+        if not allg:
+            return pd.Series(dtype=float)
 
         if not mix:
-            # uniform fallback over known genomes
-            if not allg:
-                return pd.Series(dtype=float)
             eta0 = pd.Series({g: 1.0 / len(allg) for g in allg})
-            # ensure strictly positive
             eta0 = eta0 + eps
             return eta0 / eta0.sum()
 
-        eta = pd.Series(mix, dtype=float).reindex(allg).fillna(0.0)
-        eta = eta + eps
-        eta = eta / eta.sum()
-        return eta
+        eta_s = pd.Series(mix, dtype=float).reindex(allg).fillna(0.0)
+        eta_s = eta_s + eps
+        eta_s = eta_s / eta_s.sum()
+        return eta_s
 
     # seed eta from low-depth tail
     typer.echo(f"[2/5] Ambient refinement (eta): seed from bottom quantile={cfg.eta_seed_quantile}")
@@ -993,6 +966,7 @@ def genotyping(
     else:
         calls["best_genome"] = calls.get("genome_1", "")
 
+    # Output contract: DO NOT drop empties here
     _write_gzip_df(calls, outdir / f"{sample}_cells_calls.tsv.gz")
 
     # legacy PASS: exclude empties
@@ -1015,3 +989,4 @@ def genotyping(
 
 if __name__ == "__main__":
     app()
+```
