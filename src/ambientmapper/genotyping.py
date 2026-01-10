@@ -1,4 +1,3 @@
-```python
 #!/usr/bin/env python3
 """
 src/ambientmapper/genotyping.py
@@ -989,4 +988,3 @@ def genotyping(
 
 if __name__ == "__main__":
     app()
-```
