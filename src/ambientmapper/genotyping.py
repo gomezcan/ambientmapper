@@ -796,7 +796,7 @@ def genotyping(
 
     # Core
     min_reads: int = typer.Option(100, help="Min reads to fit Single/Doublet models."),
-    single_mass_min: float = typer.Option(0.85, help="Purity threshold for single calls."),
+    single_mass_min: float = typer.Option(0.7, help="Purity threshold for single calls."),
     ratio_top1_top2_min: float = typer.Option(2.0, help="Min top1/top2 dominance ratio for single calls."),
     shards: int = typer.Option(32, help="Number of spill shards."),
     threads: int = typer.Option(1, help="Pass-2 workers."),
