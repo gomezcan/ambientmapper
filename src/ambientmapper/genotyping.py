@@ -549,7 +549,7 @@ def _select_model_for_barcode(
         len(genomes_sorted) >= 2
         and abs(delta) < cfg.near_tie_margin
         and ratio12 < cfg.ratio_top1_top2_min
-        and p1 >= cfg.single_mass_min
+        and p1 < cfg.single_mass_min
     )
     if is_near_tie:
         out.update(
