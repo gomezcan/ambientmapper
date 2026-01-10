@@ -66,7 +66,7 @@ class MergeConfig(BaseModel):
 
     # Calling thresholds
     min_reads: int = 100              # minimum reads to fit Single/Doublet (inference inclusion is separate if you add it later)
-    single_mass_min: float = 0.85     # purity threshold for Single
+    single_mass_min: float = 0.7      # purity threshold for Single
     doublet_minor_min: float = 0.20   # minor fraction threshold for Doublet
     bic_margin: float = 6.0           # ΔBIC required to accept Doublet over Single
     near_tie_margin: float = 2.0      # tie band for Indistinguishable
