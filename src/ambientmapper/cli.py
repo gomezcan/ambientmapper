@@ -451,11 +451,16 @@ def assign(
 @app.command()
 def genotyping(
     # Core I/O and runtime
-    config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True, help="Single-sample JSON config."),
     assign_glob: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs. If omitted, inferred."),
     outdir: Optional[Path] = typer.Option(None, "--outdir", help="Override output directory (default: <workdir>/<sample>/final)."),
     sample: Optional[str] = typer.Option(None, "--sample", help="Override sample name from config."),
+    config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True, help="Single-sample JSON config."),    
 
+    # Core # Single/Doublet modeling
+    min_reads: Optional[int] = typer.Option(None, "--min-reads", help="Min reads to fit single/doublet."),
+    single_mass_min: Optional[float] = typer.Option(None, "--single-mass-min", help="Purity threshold for single calls."),    
+    ratio_top1_top2_min: Optional[float] = typer.Option(None, "--ratio-top1-top2-min", help="Min top1/top2 dominance ratio for single calls."),
+    
     # Performance
     threads: Optional[int] = typer.Option(None, "--threads", help="Pass-2 workers (model selection)."),
     pass1_workers: Optional[int] = typer.Option(None, "--pass1-workers", help="Pass-1 workers (file-parallel)."),
@@ -466,27 +471,29 @@ def genotyping(
     # Mode
     winner_only: Optional[bool] = typer.Option(None, "--winner-only/--no-winner-only", help="Winner-only mode (default true)."),
 
-    # Single/Doublet modeling
-    ratio_top1_top2_min: Optional[float] = typer.Option(None, "--ratio-top1-top2-min", help="Min top1/top2 dominance ratio for single calls."),
-    min_reads: Optional[int] = typer.Option(None, "--min-reads", help="Min reads to fit single/doublet."),
+    # Fusion
     beta: Optional[float] = typer.Option(None, "--beta", help="Softmax temperature (probabilistic mode)."),
     w_as: Optional[float] = typer.Option(None, "--w-as", help="AS weight (probabilistic mode)."),
     w_mapq: Optional[float] = typer.Option(None, "--w-mapq", help="MAPQ weight (probabilistic mode)."),
     w_nm: Optional[float] = typer.Option(None, "--w-nm", help="NM weight (probabilistic mode)."),
     ambient_const: Optional[float] = typer.Option(None, "--ambient-const", help="Per-read ambient mass."),
-    bic_margin: Optional[float] = typer.Option(None, "--bic-margin", help="ΔBIC required to accept doublet over single."),
-    doublet_minor_min: Optional[float] = typer.Option(None, "--doublet-minor-min", help="Min minor fraction for doublet."),
-    topk_genomes: Optional[int] = typer.Option(None, "--topk-genomes", help="Top-K candidate genomes per barcode."),
-    single_mass_min: Optional[float] = typer.Option(None, "--single-mass-min", help="Purity threshold for single calls."),
 
     # Empty / Ambient learning
-    eta_iters: Optional[int] = typer.Option(None, "--eta-iters", help="Ambient refinement iterations."),
-    eta_seed_quantile: Optional[float] = typer.Option(None, "--eta-seed-quantile", help="Quantile to seed eta from low-depth tail."),
     empty_bic_margin: Optional[float] = typer.Option(None, "--empty-bic-margin", help="Min ΔBIC (non-empty - empty) to call empty."),
     empty_top1_max: Optional[float] = typer.Option(None, "--empty-top1-max", help="Max top1 mass to allow empty."),
     empty_ratio12_max: Optional[float] = typer.Option(None, "--empty-ratio12-max", help="Max top1/top2 ratio to allow empty."),
-    empty_entropy_min: Optional[float] = typer.Option(None, "--empty-entropy-min", help="Min entropy to allow empty."),
+    empty_entropy_norm_min: float = typer.Option(0.8, help="Min entropy_norm to allow empty."),
     empty_reads_max: Optional[int] = typer.Option(None, "--empty-reads-max", help="Optional ceiling on reads for empty calls."),
+
+    # Doublet gates
+    bic_margin: Optional[float] = typer.Option(None, "--bic-margin", help="ΔBIC required to accept doublet over single."),
+    doublet_minor_min: Optional[float] = typer.Option(None, "--doublet-minor-min", help="Min minor fraction for doublet."),
+    
+    # Ambient iteration
+    eta_iters: Optional[int] = typer.Option(None, "--eta-iters", help="Ambient refinement iterations."),
+    eta_seed_quantile: Optional[float] = typer.Option(None, "--eta-seed-quantile", help="Quantile to seed eta from low-depth tail."),
+    topk_genomes: Optional[int] = typer.Option(None, "--topk-genomes", help="Top-K candidate genomes per barcode."),
+    
 ) -> None:
     """Posterior-aware genotyping (merge → per-cell genotype calls)."""
     from .genotyping import genotyping as _run_genotyping
@@ -580,8 +587,8 @@ def genotyping(
         kwargs["empty_top1_max"] = float(empty_top1_max)
     if empty_ratio12_max is not None:
         kwargs["empty_ratio12_max"] = float(empty_ratio12_max)
-    if empty_entropy_min is not None:
-        kwargs["empty_entropy_min"] = float(empty_entropy_min)
+    if empty_entropy_norm_min is not None:
+        kwargs["empty_entropy_norm_min"] = float(empty_entropy_norm_min)
     if empty_reads_max is not None:
         kwargs["empty_reads_max"] = int(empty_reads_max)
 
@@ -680,6 +687,7 @@ def run(
     genotyping_empty_top1_max: Optional[float] = typer.Option(None, "--genotyping-empty-top1-max"),
     genotyping_empty_ratio12_max: Optional[float] = typer.Option(None, "--genotyping-empty-ratio12-max"),
     genotyping_empty_entropy_min: Optional[float] = typer.Option(None, "--genotyping-empty-entropy-min"),
+    genotyping_empty_entropy_norm_min: Optional[float] = typer.Option(None, "--genotyping-empty-entropy-norm-min"),
     genotyping_empty_reads_max: Optional[int] = typer.Option(None, "--genotyping-empty-reads-max"),
 ) -> None:
     """Run the full pipeline."""
