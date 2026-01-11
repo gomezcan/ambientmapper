@@ -739,7 +739,6 @@ def run(
     if genotyping_ratio_top1_top2_min is not None:
         genotyping_conf["ratio_top1_top2_min"] = float(genotyping_ratio_top1_top2_min)
 
-
     if genotyping_eta_iters is not None:
         genotyping_conf["eta_iters"] = int(genotyping_eta_iters)
     if genotyping_eta_seed_quantile is not None:
@@ -751,7 +750,7 @@ def run(
     if genotyping_empty_ratio12_max is not None:
         genotyping_conf["empty_ratio12_max"] = float(genotyping_empty_ratio12_max)
     if genotyping_empty_entropy_min is not None:
-        genotyping_conf["empty_entropy_min"] = float(genotyping_empty_entropy_min)
+        genotyping_conf["empty_entropy_norm_min"] = float(genotyping_empty_entropy_norm_min)
     if genotyping_empty_reads_max is not None:
         genotyping_conf["empty_reads_max"] = int(genotyping_empty_reads_max)
 
