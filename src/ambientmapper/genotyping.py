@@ -4,9 +4,7 @@ src/ambientmapper/genotyping.py
 
 ambientmapper genotyping — posterior-aware merge → per-cell genotype calls (+ empty-aware)
 
-This module consumes per-read, multi-genome evidence exported by `assign` and
-emits per-cell genotype calls: {single, doublet, indistinguishable, ambiguous, empty}.
-All decisions are data-driven from `assign` outputs (no plate/design priors here).
+Consumes per-read, multi-genome evidence exported by `assign` and emits per-cell calls.
 
 Two-pass execution
   Pass 1: Stream input TSV(.gz) chunks → compute per-read posteriors L(r,g),
@@ -15,20 +13,21 @@ Two-pass execution
   Pass 2: Walk shard files → group rows per barcode → model selection (empty vs
           single vs doublet with ambient) → write calls.
 
-Key output contract (updated)
+Key output contract
   - ALWAYS write one row per barcode that reaches inference inclusion:
       <outdir>/<sample>_cells_calls.tsv.gz
     including call="empty" rows (empties are NOT dropped before writing).
 
-Empty gate update (entropy_norm)
-  - Add entropy_norm in [0,1] computed with K_eff = topk_genomes (Option 1).
-  - Empty gate uses entropy_norm >= empty_entropy_norm_min.
+Empty gate (updated)
+  - Empty gate uses JSD(p_b, eta) <= tau
+  - tau is learned from high-confidence empty seeds defined non-circularly by ΔBIC-only empties
+    (empty best by BIC AND (BIC_non_empty - BIC_empty) >= empty_seed_bic_min).
 
 Notes
   - Winner-only mode requires AS, MAPQ, NM.
   - Probabilistic mode fuses AS/MAPQ/NM + p-value penalty.
-  - Empty model compares against best non-empty BIC with conservative gates.
 """
+
 from __future__ import annotations
 
 import glob
@@ -43,9 +42,9 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import typer
-from typer.models import OptionInfo
 from pydantic import BaseModel
 from tqdm import tqdm
+from typer.models import OptionInfo
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
@@ -64,33 +63,40 @@ class MergeConfig(BaseModel):
     p_eps: float = 1e-3
 
     # Calling thresholds
-    min_reads: int = 100              # minimum reads to fit Single/Doublet (inference inclusion is separate if you add it later)
-    single_mass_min: float = 0.7      # purity threshold for Single
-    doublet_minor_min: float = 0.20   # minor fraction threshold for Doublet
-    bic_margin: float = 6.0           # ΔBIC required to accept Doublet over Single
-    near_tie_margin: float = 2.0      # tie band for Indistinguishable
-    ratio_top1_top2_min: float = 2.0  # top1/top2 dominance ratio for Single
+    min_reads: int = 100
+    single_mass_min: float = 0.7
+    doublet_minor_min: float = 0.20
+    bic_margin: float = 6.0
+    near_tie_margin: float = 2.0
+    ratio_top1_top2_min: float = 2.0
 
-    # Empty discovery / ambient learning
+    # Ambient learning
     eta_iters: int = 2
     eta_seed_quantile: float = 0.02
+
+    # Empty gate (structure + BIC)
     empty_bic_margin: float = 10.0
     empty_top1_max: float = 0.6
     empty_ratio12_max: float = 1.5
-    empty_entropy_norm_min: float = 0.8  # NEW: normalized entropy gate
     empty_reads_max: Optional[int] = None
+
+    # Empty discovery via JSD-to-ambient
+    empty_seed_bic_min: float = 20.0
+    empty_tau_quantile: float = 0.95
+    empty_jsd_max: Optional[float] = None  # learned tau; if set, used as gate
+    jsd_normalize: bool = True  # normalize by log(2) -> [0,1]
 
     # Search grid
     alpha_grid: float = 0.02
     rho_grid: float = 0.05
     max_alpha: float = 0.5
-    topk_genomes: int = 3  # also used as K_eff for entropy_norm
+    topk_genomes: int = 3
 
     # System
     sample: str = "sample"
     shards: int = 32
-    chunk_rows: int = 5_000_000         # pass1 chunk size
-    pass2_chunksize: int = 200_000      # pass2 shard read chunks
+    chunk_rows: int = 5_000_000
+    pass2_chunksize: int = 200_000
     winner_only: bool = True
     pass1_workers: int = 1
 
@@ -117,17 +123,14 @@ def _coerce_assign_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     out = df.rename(columns=rename)
 
-    # IDs to string
     for col in ("barcode", "read_id", "genome"):
         if col in out.columns:
             out[col] = out[col].astype(str)
 
-    # Numeric alignment metrics
     for col in ("AS", "MAPQ", "NM"):
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
 
-    # p-values (or deciles)
     for pcol in ("p_as", "p_mq"):
         if pcol in out.columns:
             out[pcol] = pd.to_numeric(out[pcol], errors="coerce")
@@ -167,16 +170,14 @@ def _write_gzip_df(df: pd.DataFrame, path: Path) -> None:
     df.to_csv(path, sep="\t", index=False, compression="gzip")
 
 
-def _pass1_job(i: int, fp: Path, cfg: MergeConfig, worker_root: Path) -> Tuple[int, pd.DataFrame, pd.DataFrame]:
-    wd = worker_root / f"w{i:03d}"
-    wd.mkdir(parents=True, exist_ok=True)
-    C_one, N_one = _pass1_process_one_file(fp, cfg, wd)
-    return i, C_one, N_one
+def _unwrap_optioninfo(x):
+    return x.default if isinstance(x, OptionInfo) else x
 
 
 # ------------------------------
 # Core math
 # ------------------------------
+
 
 def _zscore_series(x: np.ndarray) -> np.ndarray:
     x = x.astype(float, copy=False)
@@ -204,9 +205,7 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
     df = df.copy()
     df["_rid"] = df["barcode"].astype(str) + "::" + df["read_id"].astype(str)
 
-    # -------------------
-    # Winner-only (default)
-    # -------------------
+    # Winner-only
     if cfg.winner_only:
         for col in ("AS", "MAPQ", "NM"):
             if col not in df.columns:
@@ -216,10 +215,7 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
         df["_sort_mapq"] = -df["MAPQ"].fillna(-1)
         df["_sort_nm"] = df["NM"].fillna(9999)
 
-        df = df.sort_values(
-            by=["_rid", "_sort_as", "_sort_mapq", "_sort_nm"],
-            ascending=True,
-        )
+        df = df.sort_values(by=["_rid", "_sort_as", "_sort_mapq", "_sort_nm"], ascending=True)
         out = df.drop_duplicates(subset=["_rid"], keep="first").copy()
 
         denom = 1.0 + cfg.ambient_const
@@ -228,33 +224,24 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
 
         return out[["barcode", "read_id", "genome", "L", "L_amb"]].reset_index(drop=True)
 
-    # -------------------
-    # Probabilistic mode
-    # -------------------
+    # Probabilistic
     df["_rid_code"] = df["_rid"].astype("category").cat.codes
     S_parts: List[np.ndarray] = []
 
     if "AS" in df.columns:
-        S_as = df.groupby("_rid_code", observed=True)["AS"].transform(
-            lambda s: _zscore_series(s.to_numpy(float))
-        )
+        S_as = df.groupby("_rid_code", observed=True)["AS"].transform(lambda s: _zscore_series(s.to_numpy(float)))
         S_parts.append(cfg.w_as * S_as.to_numpy(float))
 
     if "MAPQ" in df.columns:
-        S_mq = df.groupby("_rid_code", observed=True)["MAPQ"].transform(
-            lambda s: _zscore_series(s.to_numpy(float))
-        )
+        S_mq = df.groupby("_rid_code", observed=True)["MAPQ"].transform(lambda s: _zscore_series(s.to_numpy(float)))
         S_parts.append(cfg.w_mapq * S_mq.to_numpy(float))
 
     if "NM" in df.columns:
-        S_nm = df.groupby("_rid_code", observed=True)["NM"].transform(
-            lambda s: _zscore_series(s.to_numpy(float))
-        )
+        S_nm = df.groupby("_rid_code", observed=True)["NM"].transform(lambda s: _zscore_series(s.to_numpy(float)))
         S_parts.append(-cfg.w_nm * S_nm.to_numpy(float))
 
     S = np.sum(S_parts, axis=0) if S_parts else np.zeros(len(df), dtype=float)
 
-    # p-value penalty (NaN-safe): missing p treated as 1.0
     gamma = np.ones(len(df), dtype=float)
     if ("p_as" in df.columns) or ("p_mq" in df.columns):
         pa = df["p_as"].to_numpy(float) if "p_as" in df.columns else np.ones(len(df), dtype=float)
@@ -277,18 +264,8 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
 
 
 def _aggregate_expected_counts_from_chunk(Ldf: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    C = (
-        Ldf.groupby(["barcode", "genome"], observed=True)["L"]
-        .sum()
-        .rename("C")
-        .reset_index()
-    )
-    N = (
-        Ldf.groupby("barcode", observed=True)["read_id"]
-        .nunique()
-        .rename("n_reads")
-        .reset_index()
-    )
+    C = Ldf.groupby(["barcode", "genome"], observed=True)["L"].sum().rename("C").reset_index()
+    N = Ldf.groupby("barcode", observed=True)["read_id"].nunique().rename("n_reads").reset_index()
     return C, N
 
 
@@ -344,9 +321,34 @@ def _bic(loglik: float, n_params: int, n_reads: int) -> float:
     return -2.0 * loglik + n_params * math.log(max(n_reads, 1))
 
 
+def _jsd(p: np.ndarray, q: np.ndarray, normalize: bool = True) -> float:
+    eps = 1e-12
+    p = np.clip(p.astype(float, copy=False), eps, None)
+    q = np.clip(q.astype(float, copy=False), eps, None)
+    p = p / p.sum()
+    q = q / q.sum()
+    m = 0.5 * (p + q)
+    kl_pm = float(np.sum(p * np.log(p / m)))
+    kl_qm = float(np.sum(q * np.log(q / m)))
+    jsd = 0.5 * (kl_pm + kl_qm)
+    if normalize:
+        jsd = jsd / math.log(2.0)
+    return jsd
+
+
+def _barcode_jsd_from_mass(mass: pd.Series, eta: pd.Series, normalize: bool) -> float:
+    genomes = sorted(set(map(str, mass.index)).union(set(map(str, eta.index))))
+    if not genomes:
+        return 0.0
+    p = mass.reindex(genomes).fillna(0.0).to_numpy(float)
+    q = eta.reindex(genomes).fillna(0.0).to_numpy(float)
+    return _jsd(p, q, normalize=normalize)
+
+
 # ------------------------------
 # Model selection / calling
 # ------------------------------
+
 
 def _select_model_for_barcode(
     L_block: pd.DataFrame,
@@ -356,37 +358,18 @@ def _select_model_for_barcode(
 ) -> Dict[str, Any]:
     read_count = int(L_block["read_id"].nunique())
 
-    # Composition stats from expected counts
-    mass = (
-        L_block.groupby("genome", observed=True)["L"]
-        .sum()
-        .sort_values(ascending=False)
-    )
+    mass = L_block.groupby("genome", observed=True)["L"].sum().sort_values(ascending=False)
     tot = float(mass.sum())
     props = (mass / max(tot, 1e-12)).to_numpy()
     genomes_sorted = mass.index.to_list()
+
+    jsd_to_eta = _barcode_jsd_from_mass(mass, eta, normalize=cfg.jsd_normalize)
 
     p1 = float(props[0]) if len(props) > 0 else 0.0
     p2 = float(props[1]) if len(props) > 1 else 0.0
     p3 = float(props[2]) if len(props) > 2 else 0.0
     top3_sum = p1 + p2 + p3
 
-    # entropy (natural log)
-    entropy = float(-np.sum(props * np.log(np.clip(props, 1e-12, 1.0)))) if tot > 0 else 0.0
-
-    # entropy_norm using Option 1: K_eff = cfg.topk_genomes
-    K_eff = int(cfg.topk_genomes) if int(cfg.topk_genomes) > 0 else 1
-    Hmax = math.log(K_eff) if K_eff > 1 else 0.0
-    if Hmax > 0:
-        entropy_norm = entropy / Hmax
-        if entropy_norm < 0.0:
-            entropy_norm = 0.0
-        elif entropy_norm > 1.0:
-            entropy_norm = 1.0
-    else:
-        entropy_norm = 0.0
-
-    # ratio: if p2==0 => Inf (and will fail empty gate)
     ratio12 = (p1 / p2) if p2 > 0 else float("inf")
     top_genome = genomes_sorted[0] if genomes_sorted else None
 
@@ -397,12 +380,11 @@ def _select_model_for_barcode(
         "p_top2": p2,
         "p_top3": p3,
         "top3_sum": top3_sum,
-        "entropy": entropy,
-        "entropy_norm": float(entropy_norm),
+        "jsd_to_eta": float(jsd_to_eta),
         "ratio_top1_top2": ratio12,
         "top_genome": top_genome,
-        "call": "ambiguous",
-        "status_flag": "ambiguous",
+        "call": "ambiguous_low_depth",
+        "status_flag": "init",
         "bic_empty": float("inf"),
         "bic_single": float("inf"),
         "bic_doublet": float("inf"),
@@ -423,7 +405,7 @@ def _select_model_for_barcode(
     # Empty model (always)
     ll_empty = _loglik_empty(L_block, eta)
     bic_empty = _bic(ll_empty, n_params=0, n_reads=read_count)
-    out["bic_empty"] = bic_empty
+    out["bic_empty"] = float(bic_empty)
 
     # Single/doublet only if enough reads
     evals: List[Dict[str, Any]] = []
@@ -441,7 +423,7 @@ def _select_model_for_barcode(
                 ll = _loglik_for_params(L_block, eta, "single", g1, None, a)
                 bic = _bic(ll, n_params=1, n_reads=read_count)
                 if bic < best_s["bic"]:
-                    best_s = {"model": "single", "g1": g1, "g2": None, "alpha": a, "rho": 1.0, "bic": bic}
+                    best_s = {"model": "single", "g1": g1, "g2": None, "alpha": float(a), "rho": 1.0, "bic": float(bic)}
             evals.append(best_s)
 
         # Doublet
@@ -452,10 +434,17 @@ def _select_model_for_barcode(
                     best_d = {"bic": float("inf")}
                     for a in alphas:
                         for r in rhos:
-                            ll = _loglik_for_params(L_block, eta, "doublet", g1, g2, a, r)
+                            ll = _loglik_for_params(L_block, eta, "doublet", g1, g2, float(a), float(r))
                             bic = _bic(ll, n_params=2, n_reads=read_count)
                             if bic < best_d["bic"]:
-                                best_d = {"model": "doublet", "g1": g1, "g2": g2, "alpha": a, "rho": r, "bic": bic}
+                                best_d = {
+                                    "model": "doublet",
+                                    "g1": g1,
+                                    "g2": g2,
+                                    "alpha": float(a),
+                                    "rho": float(r),
+                                    "bic": float(bic),
+                                }
                     evals.append(best_d)
 
         single_fits = [e for e in evals if e.get("model") == "single"]
@@ -464,36 +453,53 @@ def _select_model_for_barcode(
         best_single = min(single_fits, key=lambda x: x["bic"]) if single_fits else None
         best_doublet = min(doublet_fits, key=lambda x: x["bic"]) if doublet_fits else None
 
-    out["bic_single"] = best_single["bic"] if best_single else float("inf")
-    out["bic_doublet"] = best_doublet["bic"] if best_doublet else float("inf")
-    out["delta_math"] = float(out["bic_doublet"] - out["bic_single"])
+    out["bic_single"] = float(best_single["bic"]) if best_single else float("inf")
+    out["bic_doublet"] = float(best_doublet["bic"]) if best_doublet else float("inf")
 
     # Best non-empty model
-    best_non_empty: Optional[Dict[str, Any]]
     if best_single and best_doublet:
         best_non_empty = best_single if best_single["bic"] <= best_doublet["bic"] else best_doublet
     else:
         best_non_empty = best_single or best_doublet
 
-    bic_non_empty = best_non_empty["bic"] if best_non_empty else float("inf")
+    # Low-depth fallback (IMPORTANT: prevents crash)
+    if best_non_empty is None:
+        out.update(
+            {
+                "call": "ambiguous_low_depth",
+                "status_flag": "low_depth",
+                "bic_best": float(bic_empty),
+                "bic_best_non_empty": float("inf"),
+                "delta_empty": float("inf"),
+                "model": "empty" if math.isfinite(bic_empty) else None,
+                "alpha": float("nan"),
+                "rho": float("nan"),
+            }
+        )
+        return out
+
+    bic_non_empty = float(best_non_empty["bic"])
     out["bic_best_non_empty"] = float(bic_non_empty)
     out["delta_empty"] = float(bic_non_empty - bic_empty) if math.isfinite(bic_non_empty) else float("inf")
 
     # -------------------------
-    # Empty gate (conservative)
+    # Empty gate (conservative) — uses JSD(p_b, eta) <= tau (if tau is set)
     # -------------------------
     is_empty_best = (bic_empty < bic_non_empty)
     bic_margin_ok = (bic_non_empty - bic_empty) >= cfg.empty_bic_margin
     weak_dominance = (p1 <= cfg.empty_top1_max) and (ratio12 <= cfg.empty_ratio12_max)
-    diffuse = (entropy_norm >= cfg.empty_entropy_norm_min)
     ceiling_ok = (read_count <= cfg.empty_reads_max) if cfg.empty_reads_max is not None else True
 
-    if is_empty_best and bic_margin_ok and weak_dominance and diffuse and ceiling_ok:
+    jsd_ok = True
+    if cfg.empty_jsd_max is not None and math.isfinite(float(cfg.empty_jsd_max)):
+        jsd_ok = (jsd_to_eta <= float(cfg.empty_jsd_max))
+
+    if is_empty_best and bic_margin_ok and weak_dominance and ceiling_ok and jsd_ok:
         out.update(
             {
                 "call": "empty",
                 "status_flag": "empty",
-                "bic_best": bic_empty,
+                "bic_best": float(bic_empty),
                 "model": "empty",
                 "alpha": 1.0,
                 "rho": float("nan"),
@@ -501,15 +507,10 @@ def _select_model_for_barcode(
         )
         return out
 
-    # If no non-empty fit (e.g., low depth), fall back
-    if best_non_empty is None:
-        out.update({"call": "ambiguous", "status_flag": "low_depth", "bic_best": bic_empty})
-        return out
-
     # -------------------------
     # Non-empty: compute purity/minor
     # -------------------------
-    model = best_non_empty["model"]
+    model = str(best_non_empty["model"])
     alpha = float(best_non_empty["alpha"])
     rho = float(best_non_empty["rho"])
 
@@ -525,53 +526,70 @@ def _select_model_for_barcode(
             "model": model,
             "genome_1": best_non_empty.get("g1"),
             "genome_2": best_non_empty.get("g2"),
-            "alpha": alpha,
-            "rho": rho,
+            "alpha": float(alpha),
+            "rho": float(rho),
             "purity": float(purity),
             "minor": float(minor),
             "bic_best": float(best_non_empty["bic"]),
         }
     )
 
-    # Strong doublet gate
-    is_strong_doublet = (
-        model == "doublet"
-        and minor >= cfg.doublet_minor_min
-        and (out["bic_single"] - out["bic_doublet"]) >= cfg.bic_margin
-    )
-    if is_strong_doublet:
-        out.update({"call": "doublet", "status_flag": "doublet"})
+    # Convenience
+    bic_s = float(out["bic_single"])
+    bic_d = float(out["bic_doublet"])
+    delta_sd = bic_d - bic_s  # negative => doublet preferred
+    out["delta_math"] = float(delta_sd)
+
+    # ---- 1) confident doublet ----
+    is_doublet_pref = (model == "doublet") and math.isfinite(bic_d) and math.isfinite(bic_s) and (bic_d <= bic_s)
+    doublet_margin_ok = (bic_s - bic_d) >= cfg.bic_margin
+    doublet_minor_ok = (out["minor"] >= cfg.doublet_minor_min)
+
+    if is_doublet_pref and doublet_margin_ok and doublet_minor_ok:
+        out.update({"call": "doublet_confident", "status_flag": "doublet"})
         return out
 
-    # Indistinguishable vs single-by-default
-    delta = out["bic_doublet"] - out["bic_single"]
+    # ---- 2) indistinguishable (near tie) ----
     is_near_tie = (
-        len(genomes_sorted) >= 2
-        and abs(delta) < cfg.near_tie_margin
-        and ratio12 < cfg.ratio_top1_top2_min
-        and p1 < cfg.single_mass_min
+        math.isfinite(bic_s)
+        and math.isfinite(bic_d)
+        and abs(bic_d - bic_s) <= cfg.near_tie_margin
+        and (ratio12 < cfg.ratio_top1_top2_min)
+        and (p1 >= cfg.single_mass_min)
     )
     if is_near_tie:
         out.update(
             {
                 "call": "indistinguishable",
-                "status_flag": "low_confidence",
-                "indistinguishable_set": f"{genomes_sorted[0]},{genomes_sorted[1]}",
+                "status_flag": "near_tie",
+                "indistinguishable_set": f"{genomes_sorted[0]},{genomes_sorted[1]}" if len(genomes_sorted) >= 2 else "",
             }
         )
         return out
 
-    # Single by default
-    if (ratio12 >= cfg.ratio_top1_top2_min) and (purity >= cfg.single_mass_min):
-        out.update({"call": "single", "status_flag": "single"})
-    else:
-        out.update({"call": "ambiguous", "status_flag": "ambiguous"})
+    # ---- 3) clean singlet ----
+    if (ratio12 >= cfg.ratio_top1_top2_min) and (out["purity"] >= cfg.single_mass_min):
+        out.update({"call": "single_clean", "status_flag": "single"})
+        return out
+
+    # ---- 4) ambiguous subclasses ----
+    if is_doublet_pref and (not doublet_minor_ok or not doublet_margin_ok):
+        out.update({"call": "ambiguous_weak_doublet", "status_flag": "weak_doublet"})
+        return out
+
+    single_pref = (math.isfinite(bic_s) and (not math.isfinite(bic_d) or (bic_s <= bic_d)))
+    if single_pref:
+        out.update({"call": "ambiguous_dirty_singlet", "status_flag": "dirty_singlet"})
+        return out
+
+    out.update({"call": "ambiguous_low_depth", "status_flag": "other"})
     return out
 
 
 # ------------------------------
 # Pass drivers
 # ------------------------------
+
 
 def _barcode_to_shard_idx(barcode: str, shards: int) -> int:
     h = hashlib.sha1(barcode.encode("utf-8")).digest()
@@ -619,7 +637,9 @@ def _iter_shard_rows(shard_fp: Path, chunksize: int) -> Iterator[pd.DataFrame]:
         return
 
     for chunk in it:
-        chunk = chunk[chunk["barcode"] != "barcode"]
+        # defensive: in case of concatenated gzip members each with header
+        if "barcode" in chunk.columns:
+            chunk = chunk[chunk["barcode"] != "barcode"]
         chunk = chunk.dropna(subset=["barcode", "read_id", "genome"])
         if chunk.empty:
             continue
@@ -633,65 +653,6 @@ def _iter_shard_rows(shard_fp: Path, chunksize: int) -> Iterator[pd.DataFrame]:
         chunk["L"] = chunk["L"].astype("float32")
         chunk["L_amb"] = chunk["L_amb"].astype("float32")
         yield chunk
-
-
-def _pass1_stream_build(assign_glob: str, cfg: MergeConfig, tmp_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame, Path]:
-    files = [Path(p) for p in glob.glob(assign_glob, recursive=True)]
-    if not files:
-        raise FileNotFoundError(f"No files for {assign_glob}")
-
-    workers = max(1, int(getattr(cfg, "pass1_workers", 1) or 1))
-    workers = min(workers, len(files))
-
-    worker_root = tmp_dir / "L_shards_workers"
-    worker_root.mkdir(parents=True, exist_ok=True)
-
-    C_parts: List[pd.DataFrame] = []
-    N_parts: List[pd.DataFrame] = []
-
-    if workers == 1:
-        wd = worker_root / "w000"
-        wd.mkdir(parents=True, exist_ok=True)
-        for fp in tqdm(files, desc="[pass1] streaming"):
-            C_one, N_one = _pass1_process_one_file(fp, cfg, wd)
-            C_parts.append(C_one)
-            N_parts.append(N_one)
-    else:
-        with ProcessPoolExecutor(max_workers=workers) as ex:
-            futures = [
-                ex.submit(_pass1_job, i, fp, cfg, worker_root)
-                for i, fp in enumerate(files)
-            ]
-            for fut in tqdm(futures, desc=f"[pass1] files (workers={workers})"):
-                _, C_one, N_one = fut.result()
-                C_parts.append(C_one)
-                N_parts.append(N_one)
-
-    if C_parts:
-        C_all = (
-            pd.concat(C_parts, ignore_index=True)
-            .groupby(["barcode", "genome"], observed=True)["C"]
-            .sum()
-            .reset_index()
-        )
-    else:
-        C_all = pd.DataFrame(columns=["barcode", "genome", "C"])
-
-    if N_parts:
-        N_all = (
-            pd.concat(N_parts, ignore_index=True)
-            .groupby("barcode", observed=True)["n_reads"]
-            .sum()
-            .reset_index()
-        )
-    else:
-        N_all = pd.DataFrame(columns=["barcode", "n_reads"])
-
-    shard_dir = tmp_dir / "L_shards"
-    worker_dirs = sorted([p for p in worker_root.glob("w*") if p.is_dir()])
-    _merge_worker_shards(worker_dirs, shard_dir, cfg.shards)
-
-    return C_all, N_all, shard_dir
 
 
 def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -721,26 +682,23 @@ def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path) -> Tupl
                 pass
 
     if C_parts:
-        C_one = (
-            pd.concat(C_parts, ignore_index=True)
-            .groupby(["barcode", "genome"], observed=True)["C"]
-            .sum()
-            .reset_index()
-        )
+        C_one = pd.concat(C_parts, ignore_index=True).groupby(["barcode", "genome"], observed=True)["C"].sum().reset_index()
     else:
         C_one = pd.DataFrame(columns=["barcode", "genome", "C"])
 
     if N_parts:
-        N_one = (
-            pd.concat(N_parts, ignore_index=True)
-            .groupby("barcode", observed=True)["n_reads"]
-            .sum()
-            .reset_index()
-        )
+        N_one = pd.concat(N_parts, ignore_index=True).groupby("barcode", observed=True)["n_reads"].sum().reset_index()
     else:
         N_one = pd.DataFrame(columns=["barcode", "n_reads"])
 
     return C_one, N_one
+
+
+def _pass1_job(i: int, fp: Path, cfg: MergeConfig, worker_root: Path) -> Tuple[int, pd.DataFrame, pd.DataFrame]:
+    wd = worker_root / f"w{i:03d}"
+    wd.mkdir(parents=True, exist_ok=True)
+    C_one, N_one = _pass1_process_one_file(fp, cfg, wd)
+    return i, C_one, N_one
 
 
 def _merge_worker_shards(worker_dirs: List[Path], out_shard_dir: Path, shards: int) -> None:
@@ -750,12 +708,59 @@ def _merge_worker_shards(worker_dirs: List[Path], out_shard_dir: Path, shards: i
         if out_fp.exists():
             out_fp.unlink()
 
+        # Concatenating gzip members is valid; pandas can read it.
         with open(out_fp, "ab") as w:
             for wd in worker_dirs:
                 part = wd / f"shard_{si:02d}.tsv.gz"
                 if part.exists() and part.stat().st_size > 0:
                     with open(part, "rb") as r:
                         shutil.copyfileobj(r, w, length=1024 * 1024)
+
+
+def _pass1_stream_build(assign_glob: str, cfg: MergeConfig, tmp_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame, Path]:
+    files = [Path(p) for p in glob.glob(assign_glob, recursive=True)]
+    if not files:
+        raise FileNotFoundError(f"No files for {assign_glob}")
+
+    workers = max(1, int(getattr(cfg, "pass1_workers", 1) or 1))
+    workers = min(workers, len(files))
+
+    worker_root = tmp_dir / "L_shards_workers"
+    worker_root.mkdir(parents=True, exist_ok=True)
+
+    C_parts: List[pd.DataFrame] = []
+    N_parts: List[pd.DataFrame] = []
+
+    if workers == 1:
+        wd = worker_root / "w000"
+        wd.mkdir(parents=True, exist_ok=True)
+        for fp in tqdm(files, desc="[pass1] streaming"):
+            C_one, N_one = _pass1_process_one_file(fp, cfg, wd)
+            C_parts.append(C_one)
+            N_parts.append(N_one)
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_pass1_job, i, fp, cfg, worker_root) for i, fp in enumerate(files)]
+            for fut in tqdm(futures, desc=f"[pass1] files (workers={workers})"):
+                _, C_one, N_one = fut.result()
+                C_parts.append(C_one)
+                N_parts.append(N_one)
+
+    if C_parts:
+        C_all = pd.concat(C_parts, ignore_index=True).groupby(["barcode", "genome"], observed=True)["C"].sum().reset_index()
+    else:
+        C_all = pd.DataFrame(columns=["barcode", "genome", "C"])
+
+    if N_parts:
+        N_all = pd.concat(N_parts, ignore_index=True).groupby("barcode", observed=True)["n_reads"].sum().reset_index()
+    else:
+        N_all = pd.DataFrame(columns=["barcode", "n_reads"])
+
+    shard_dir = tmp_dir / "L_shards"
+    worker_dirs = sorted([p for p in worker_root.glob("w*") if p.is_dir()])
+    _merge_worker_shards(worker_dirs, shard_dir, cfg.shards)
+
+    return C_all, N_all, shard_dir
 
 
 def _pass2_worker(args) -> List[Dict[str, Any]]:
@@ -769,9 +774,9 @@ def _pass2_worker(args) -> List[Dict[str, Any]]:
 
     for bc, parts in blocks.items():
         L_block = pd.concat(parts, ignore_index=True)
-        cand = topk.get(bc, [])
         if L_block.empty:
             continue
+        cand = topk.get(bc, [])
         res = _select_model_for_barcode(L_block, eta, cfg, cand)
         res["barcode"] = bc
         rows.append(res)
@@ -779,20 +784,16 @@ def _pass2_worker(args) -> List[Dict[str, Any]]:
     return rows
 
 
-def _unwrap_optioninfo(x):
-    return x.default if isinstance(x, OptionInfo) else x
-
-
 # ------------------------------
 # Main
 # ------------------------------
+
 
 @app.command("genotyping")
 def genotyping(
     assign: str = typer.Option(..., help="Path/glob to assign outputs."),
     outdir: Path = typer.Option(Path("merge_out"), help="Output dir."),
     sample: str = typer.Option("sample", help="Sample name."),
-
     # Core
     min_reads: int = typer.Option(100, help="Min reads to fit Single/Doublet models."),
     single_mass_min: float = typer.Option(0.7, help="Purity threshold for single calls."),
@@ -803,29 +804,29 @@ def genotyping(
     pass1_workers: Optional[int] = typer.Option(None, help="Pass-1 workers."),
     pass2_chunksize: int = typer.Option(200_000, help="Pass-2 shard chunksize."),
     winner_only: bool = typer.Option(True, help="Winner-only mode (default)."),
-
     # Fusion
     beta: float = typer.Option(0.5, help="Softmax temperature (probabilistic mode)."),
     w_as: float = typer.Option(0.5, help="Weight for AS (probabilistic mode)."),
     w_mapq: float = typer.Option(1.0, help="Weight for MAPQ (probabilistic mode)."),
     w_nm: float = typer.Option(1.0, help="Weight for NM penalty (probabilistic mode)."),
     ambient_const: float = typer.Option(1e-3, help="Per-read ambient mass."),
-
-    # Empty gates
+    # Empty gates (BIC + structure)
     empty_bic_margin: float = typer.Option(10.0, help="Min ΔBIC (non-empty - empty) to call empty."),
     empty_top1_max: float = typer.Option(0.6, help="Max top1 mass to allow empty."),
     empty_ratio12_max: float = typer.Option(1.5, help="Max top1/top2 ratio to allow empty."),
-    empty_entropy_norm_min: float = typer.Option(0.8, help="Min entropy_norm to allow empty."),
     empty_reads_max: Optional[int] = typer.Option(None, help="Optional ceiling for empty calls."),
-
+    # Empty (JSD) gates
+    empty_seed_bic_min: float = typer.Option(20.0, help="ΔBIC-only empty seeds for learning tau (non-circular)."),
+    empty_tau_quantile: float = typer.Option(0.95, help="Quantile of seed JSD used as tau."),
+    empty_jsd_max: Optional[float] = typer.Option(None, help="Override tau; if set, do not learn."),
+    jsd_normalize: bool = typer.Option(True, help="Normalize JSD by log(2) to [0,1]."),
     # Doublet gates
     bic_margin: float = typer.Option(6.0, help="ΔBIC required to accept doublet over single."),
     doublet_minor_min: float = typer.Option(0.20, help="Min minor fraction for doublet."),
-
     # Ambient iteration
     eta_iters: int = typer.Option(2, help="Iterations for ambient refinement."),
     eta_seed_quantile: float = typer.Option(0.02, help="Seed eta from bottom quantile of n_reads."),
-    topk_genomes: int = typer.Option(3, help="Top-K candidate genomes per barcode (also K_eff for entropy_norm)."),
+    topk_genomes: int = typer.Option(3, help="Top-K candidate genomes per barcode."),
 ):
     """Run iterative empty-aware genotyping (writes empties into *_cells_calls.tsv.gz)."""
     cfg = MergeConfig(
@@ -846,8 +847,11 @@ def genotyping(
         empty_bic_margin=_unwrap_optioninfo(empty_bic_margin),
         empty_top1_max=_unwrap_optioninfo(empty_top1_max),
         empty_ratio12_max=_unwrap_optioninfo(empty_ratio12_max),
-        empty_entropy_norm_min=_unwrap_optioninfo(empty_entropy_norm_min),
         empty_reads_max=_unwrap_optioninfo(empty_reads_max),
+        empty_seed_bic_min=_unwrap_optioninfo(empty_seed_bic_min),
+        empty_tau_quantile=_unwrap_optioninfo(empty_tau_quantile),
+        empty_jsd_max=_unwrap_optioninfo(empty_jsd_max),
+        jsd_normalize=_unwrap_optioninfo(jsd_normalize),
         bic_margin=_unwrap_optioninfo(bic_margin),
         doublet_minor_min=_unwrap_optioninfo(doublet_minor_min),
         eta_iters=_unwrap_optioninfo(eta_iters),
@@ -879,7 +883,6 @@ def genotyping(
 
     all_genomes = sorted(C_all["genome"].unique()) if not C_all.empty else []
 
-    # eta estimation helper (smoothed + reindexed)
     def _compute_eta(target_bcs: Sequence[str]) -> pd.Series:
         mix: Dict[str, float] = {}
         target_set = set(map(str, target_bcs))
@@ -895,7 +898,6 @@ def genotyping(
 
         eps = 1e-12
         allg = all_genomes if all_genomes else sorted(mix.keys())
-
         if not allg:
             return pd.Series(dtype=float)
 
@@ -906,8 +908,7 @@ def genotyping(
 
         eta_s = pd.Series(mix, dtype=float).reindex(allg).fillna(0.0)
         eta_s = eta_s + eps
-        eta_s = eta_s / eta_s.sum()
-        return eta_s
+        return eta_s / eta_s.sum()
 
     # seed eta from low-depth tail
     typer.echo(f"[2/5] Ambient refinement (eta): seed from bottom quantile={cfg.eta_seed_quantile}")
@@ -920,11 +921,12 @@ def genotyping(
 
     shard_files = sorted(shard_dir.glob("*.tsv.gz"))
 
-    # iterative refinement
-    typer.echo(f"[3/5] Iterating eta using inferred empties (iters={cfg.eta_iters})")
+    # iterative refinement using ΔBIC-only empty seeds
+    typer.echo(f"[3/5] Iterating eta using ΔBIC-only empty seeds (iters={cfg.eta_iters})")
     for i in range(cfg.eta_iters):
         args = [(fp, cfg, topk, eta) for fp in shard_files]
         rows_iter: List[Dict[str, Any]] = []
+
         if threads <= 1:
             for a in tqdm(args, desc=f"[eta] iter {i+1}/{cfg.eta_iters}"):
                 rows_iter.extend(_pass2_worker(a))
@@ -934,10 +936,21 @@ def genotyping(
                     rows_iter.extend(rr)
 
         df_iter = pd.DataFrame(rows_iter)
-        empty_bcs = df_iter.loc[df_iter["call"] == "empty", "barcode"].astype(str).tolist()
+        if df_iter.empty:
+            typer.echo("  [warn] Empty results during eta refinement; stopping.")
+            break
+
+        df_iter["bic_non_empty"] = np.minimum(df_iter["bic_single"].to_numpy(float), df_iter["bic_doublet"].to_numpy(float))
+        df_iter["delta_empty"] = df_iter["bic_non_empty"] - df_iter["bic_empty"]
+
+        empty_bcs = df_iter.loc[
+            (df_iter["bic_empty"] < df_iter["bic_non_empty"]) &
+            (df_iter["delta_empty"] >= cfg.empty_seed_bic_min),
+            "barcode"
+        ].astype(str).tolist()
 
         if len(empty_bcs) < 10:
-            typer.echo("  [warn] Too few empty calls to refine eta; stopping refinement.")
+            typer.echo("  [warn] Too few empty SEEDS to refine eta; stopping refinement.")
             break
 
         eta = _compute_eta(empty_bcs)
@@ -945,10 +958,53 @@ def genotyping(
 
     eta.to_json(outdir / f"{sample}_eta_final.json")
 
-    # final pass2
+    # Learn tau if not overridden
+    if cfg.empty_jsd_max is None:
+        typer.echo("[3.5/5] Learning empty JSD threshold (tau) from ΔBIC-only empty seeds")
+        args = [(fp, cfg, topk, eta) for fp in shard_files]
+        rows_seed: List[Dict[str, Any]] = []
+
+        if threads <= 1:
+            for a in tqdm(args, desc="[tau] shards"):
+                rows_seed.extend(_pass2_worker(a))
+        else:
+            with ProcessPoolExecutor(max_workers=threads) as ex:
+                for rr in tqdm(ex.map(_pass2_worker, args), total=len(args), desc="[tau] shards"):
+                    rows_seed.extend(rr)
+
+        df_seed = pd.DataFrame(rows_seed)
+        if not df_seed.empty:
+            df_seed["bic_non_empty"] = np.minimum(df_seed["bic_single"].to_numpy(float), df_seed["bic_doublet"].to_numpy(float))
+            df_seed["delta_empty"] = df_seed["bic_non_empty"] - df_seed["bic_empty"]
+
+            seeds = df_seed[
+                (df_seed["bic_empty"] < df_seed["bic_non_empty"]) &
+                (df_seed["delta_empty"] >= cfg.empty_seed_bic_min) &
+                (df_seed["jsd_to_eta"].notna())
+            ].copy()
+
+            if cfg.empty_reads_max is not None:
+                seeds = seeds[seeds["n_reads"] <= cfg.empty_reads_max]
+
+            if len(seeds) >= 50:
+                tau = float(seeds["jsd_to_eta"].quantile(cfg.empty_tau_quantile))
+                cfg.empty_jsd_max = tau
+                (outdir / f"{sample}_empty_jsd_tau.json").write_text(
+                    pd.Series(
+                        {"tau": tau, "quantile": cfg.empty_tau_quantile, "seed_bic_min": cfg.empty_seed_bic_min}
+                    ).to_json()
+                )
+                typer.echo(f"  learned tau={tau:.4g} from n={len(seeds)} seed empties")
+            else:
+                typer.echo(f"  [warn] Too few seed empties to learn tau (n={len(seeds)}). Proceeding without JSD gate.")
+        else:
+            typer.echo("  [warn] Seed pass produced empty dataframe; proceeding without JSD gate.")
+
+    # Final pass2
     typer.echo("[4/5] Final calling (Pass 2)")
     args = [(fp, cfg, topk, eta) for fp in shard_files]
     rows: List[Dict[str, Any]] = []
+
     if threads <= 1:
         for a in tqdm(args, desc="[pass2] shards"):
             rows.extend(_pass2_worker(a))
@@ -965,13 +1021,16 @@ def genotyping(
     else:
         calls["best_genome"] = calls.get("genome_1", "")
 
-    # Output contract: DO NOT drop empties here
     _write_gzip_df(calls, outdir / f"{sample}_cells_calls.tsv.gz")
 
-    # legacy PASS: exclude empties
+    # legacy PASS: keep “real cells” + dirty singlets (for decontam)
     legacy = calls.copy()
     legacy["AssignedGenome"] = legacy["best_genome"].fillna("")
-    pass_mask = legacy["call"].isin(["single", "doublet", "indistinguishable"])
+
+    pass_mask = legacy["call"].isin(
+        ["single_clean", "doublet_confident", "indistinguishable", "ambiguous_dirty_singlet"]
+    )
+
     legacy.loc[pass_mask, ["barcode", "AssignedGenome", "call", "purity", "n_reads"]].to_csv(
         outdir / f"{sample}_BCs_PASS_by_mapping.csv",
         index=False,
