@@ -4,6 +4,13 @@ src/ambientmapper/decontam.py
 
 ambientmapper decontam v2 — model-informed purification (AllowedSet) + read drop list + pre/post barnyard summaries
 
+Goals
+  1) Read-level cleaning: emit a drop list for BAM filtering.
+  2) Conservative handling of ambiguous/indistinguishable, design-aware rescue when available.
+  3) Mode-independence: dropping driven by assignment evidence (winner / scores / p-values), not genotyping internals.
+  4) Genome-agnostic + scalable: supports 2..N genomes; outputs barnyard-like pre/post summaries without a combined genome.
+  5) Parallelized across assignment chunk files (per-file workers → merge parts).
+
 Key features
 - AllowedSet logic per barcode: policies for doublets/indistinguishable (top12 | top1 | expected)
 - Ambiguous handling modes: drop | design_rescue | top1_rescue | top12_rescue
@@ -14,6 +21,22 @@ Key features
 - Safe gzip-part merging: workers write per-file parts; master writes one header and concatenates member gz streams
 - Barnyard summaries pre/post based on "confident winner" evidence from assignment files
 
+Outputs
+  - {sample}_reads_to_drop.tsv.gz
+  - {sample}_barcode_policy.tsv.gz
+  - {sample}_cells_calls.decontam.tsv.gz   (cells_calls + policy + post-clean metrics + optional reclassify)
+  - Barnyard-like:
+      {sample}_pre_barcode_genome_counts.tsv.gz
+      {sample}_post_barcode_genome_counts.tsv.gz
+      {sample}_pre_barcode_composition.tsv.gz
+      {sample}_post_barcode_composition.tsv.gz
+      {sample}_pre_contamination_bins.tsv.gz (if design)
+      {sample}_post_contamination_bins.tsv.gz (if design)
+
+Assumptions about assignment inputs
+  - The assignment TSVs contain per-read, per-genome rows and typically an `assigned_class` column with "winner"
+  - rows. If no winner labels exist, decontam can compute winners using AS/MAPQ/NM ordering
+  
 Notes
 - This module is assignment-driven for read-level decisions (mode-independent w.r.t genotyping).
 - "winner evidence" here is `assigned_class == "winner"` plus optional `p_as <= decontam_alpha` override.
