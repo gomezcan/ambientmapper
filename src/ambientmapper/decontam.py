@@ -40,18 +40,17 @@ Notes
 - This module is assignment-driven for read-level decisions (mode-independent w.r.t genotyping).
 - "winner evidence" here is `assigned_class == "winner"` plus optional `p_as <= decontam_alpha` override.
 """
-
 from __future__ import annotations
 
 import gzip
-import json
 import glob
+import json
 import shutil
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, List, Tuple, Set, Iterable, Any
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -174,7 +173,6 @@ def _build_bckey_to_expected(
     design_path = Path(design_path)
     layout_path = Path(layout_path)
 
-    # Direct barcode mapping TSV
     df = None
     try:
         df = pd.read_csv(design_path, sep="\t", dtype=str)
@@ -214,9 +212,9 @@ class PolicyRow:
     expected_genome: str
     allowed_set: Set[str]
     allowed_set_str: str
-    action: str               # keep_cleaned | drop_barcode
+    action: str  # keep_cleaned | drop_barcode
     reason: str
-    flags: str                # semicolon-separated flags
+    flags: str
 
 
 def _is_doublet_like(call: str, model: str) -> bool:
@@ -267,96 +265,79 @@ def _compute_allowed_set(
     g2 = _norm_str(g2)
     flags: List[str] = []
 
-    # Empty barcodes are not cells; drop completely.
     if _is_empty(call, model):
         return set(), "drop_barcode", "call_empty", "empty"
 
-    # Indist set parsing if present
     indS = _parse_allowed_set_str(indist_set)
 
-    # DESIGN-AWARE
+    # DESIGN-AWARE, expected known
     if has_design and expected:
-        # default: expected wins
         if expected == g2 and expected != g1:
             flags.append("expected_is_top2")
         if expected not in {g1, g2} and (not indS or expected not in indS):
             flags.append("design_mismatch")
 
-        # If ambiguous and policy says drop unless rescued by design: keep only if expected exists (it does)
         if call.startswith("ambiguous") and ambiguous_policy == "drop":
             return set(), "drop_barcode", "ambiguous_policy_drop", ";".join(flags) or ""
 
         if _is_doublet_like(call, model):
             if doublet_policy == "top12":
-                S = {x for x in [g1, g2] if x}
-                # If model missing g2, fall back to expected only
-                if not S:
-                    S = {expected}
+                S = {x for x in [g1, g2] if x} or {expected}
                 return S, "keep_cleaned", "doublet_top12", ";".join(flags) or ""
-            # expected-only in-silico sort
             return {expected}, "keep_cleaned", "doublet_expected_only", ";".join(flags) or ""
 
         if _is_indist(call):
             if indist_policy == "top12":
-                S = indS if indS else {x for x in [g1, g2] if x}
-                if not S:
-                    S = {expected}
+                S = indS or {x for x in [g1, g2] if x} or {expected}
                 return S, "keep_cleaned", "indist_top12", ";".join(flags) or ""
             return {expected}, "keep_cleaned", "indist_expected_only", ";".join(flags) or ""
 
-        # single-like or any other: expected-only
         return {expected}, "keep_cleaned", "design_expected_only", ";".join(flags) or ""
 
-    # DESIGN PRESENT BUT UNKNOWN EXPECTED
+    # DESIGN PRESENT BUT expected unknown
     if has_design and not expected:
-        # By default, do not hallucinate.
         if ambiguous_policy in {"drop", "design_rescue"}:
             return set(), "drop_barcode", "unknown_expected_drop", "unknown_in_design"
-        # Rescue policies
         if ambiguous_policy == "top12_rescue":
-            S = {x for x in [g1, g2] if x}
-            if not S and g1:
-                S = {g1}
-            return S, "keep_cleaned", "unknown_expected_top12_rescue", "unknown_in_design"
+            S = {x for x in [g1, g2] if x} or ({g1} if g1 else set())
+            return S, ("keep_cleaned" if S else "drop_barcode"), "unknown_expected_top12_rescue", "unknown_in_design"
         if ambiguous_policy == "top1_rescue":
-            return ({g1} if g1 else set()), ("keep_cleaned" if g1 else "drop_barcode"), "unknown_expected_top1_rescue", "unknown_in_design"
+            S = {g1} if g1 else set()
+            return S, ("keep_cleaned" if S else "drop_barcode"), "unknown_expected_top1_rescue", "unknown_in_design"
         return set(), "drop_barcode", "unknown_expected_drop", "unknown_in_design"
 
     # NO DESIGN
-    # Ambiguous policy is the main guardrail.
     if call.startswith("ambiguous"):
         if ambiguous_policy == "drop":
             return set(), "drop_barcode", "ambiguous_policy_drop", ""
         if ambiguous_policy == "design_rescue":
-            # no design => drop
             return set(), "drop_barcode", "ambiguous_no_design_drop", ""
         if ambiguous_policy == "top12_rescue":
-            S = {x for x in [g1, g2] if x}
-            if not S and g1:
-                S = {g1}
+            S = {x for x in [g1, g2] if x} or ({g1} if g1 else set())
             return S, ("keep_cleaned" if S else "drop_barcode"), "ambiguous_top12_rescue", ""
         if ambiguous_policy == "top1_rescue":
-            return ({g1} if g1 else set()), ("keep_cleaned" if g1 else "drop_barcode"), "ambiguous_top1_rescue", ""
+            S = {g1} if g1 else set()
+            return S, ("keep_cleaned" if S else "drop_barcode"), "ambiguous_top1_rescue", ""
         return set(), "drop_barcode", "ambiguous_policy_drop", ""
 
-    # non-ambiguous, no design
     if _is_doublet_like(call, model):
         if doublet_policy == "top12":
             S = {x for x in [g1, g2] if x}
             return S, ("keep_cleaned" if S else "drop_barcode"), "doublet_top12", ""
-        # expected-only makes no sense without design; fall back to top1
-        return ({g1} if g1 else set()), ("keep_cleaned" if g1 else "drop_barcode"), "doublet_fallback_top1", ""
+        S = {g1} if g1 else set()
+        return S, ("keep_cleaned" if S else "drop_barcode"), "doublet_fallback_top1", ""
 
     if _is_indist(call):
         if indist_policy == "top12":
-            S = indS if indS else {x for x in [g1, g2] if x}
+            S = indS or {x for x in [g1, g2] if x}
             return S, ("keep_cleaned" if S else "drop_barcode"), "indist_top12", ""
-        return ({g1} if g1 else set()), ("keep_cleaned" if g1 else "drop_barcode"), "indist_fallback_top1", ""
+        S = {g1} if g1 else set()
+        return S, ("keep_cleaned" if S else "drop_barcode"), "indist_fallback_top1", ""
 
     if _is_single_like(call, model):
-        return ({g1} if g1 else set()), ("keep_cleaned" if g1 else "drop_barcode"), "single_top1", ""
+        S = {g1} if g1 else set()
+        return S, ("keep_cleaned" if S else "drop_barcode"), "single_top1", ""
 
-    # fallback: conservative drop
     return set(), "drop_barcode", "unknown_call_drop", ""
 
 
@@ -369,13 +350,7 @@ def _write_barnyard_summaries(
     prefix: str,
     counts_map: Dict[Tuple[str, str], int],
     expected_map: Dict[str, str],
-):
-    """
-    Generates:
-      1) *_barcode_genome_counts.tsv.gz  (long)
-      2) *_barcode_composition.tsv.gz
-      3) *_contamination_bins.tsv.gz   (only if expected_map is non-empty)
-    """
+) -> None:
     if not counts_map:
         return
 
@@ -385,7 +360,6 @@ def _write_barnyard_summaries(
     out_counts = out_dir / f"{sample_name}_{prefix}_barcode_genome_counts.tsv.gz"
     df_counts.to_csv(out_counts, sep="\t", index=False, compression="gzip")
 
-    # Composition
     totals = (
         df_counts.groupby("barcode", as_index=False)["n_winner_reads"]
         .sum()
@@ -401,14 +375,12 @@ def _write_barnyard_summaries(
     comp = totals.merge(top_df, on="barcode", how="left")
     comp["top_frac"] = comp["top_reads"] / comp["total_reads"]
 
-    # expected genome
     if expected_map:
         comp["expected_genome"] = comp["barcode"].map(expected_map).map(_norm_str)
         comp.loc[comp["expected_genome"] == "", "expected_genome"] = np.nan
     else:
         comp["expected_genome"] = np.nan
 
-    # expected_reads
     exp_counts = (
         df_counts.rename(columns={"n_winner_reads": "expected_reads"})
         .merge(comp[["barcode", "expected_genome"]], on="barcode", how="left")
@@ -426,7 +398,6 @@ def _write_barnyard_summaries(
     out_comp = out_dir / f"{sample_name}_{prefix}_barcode_composition.tsv.gz"
     comp.to_csv(out_comp, sep="\t", index=False, compression="gzip")
 
-    # Bins (design-known only)
     if expected_map:
         valid_comp = comp[(comp["expected_genome"].notna()) & (comp["expected_genome"].astype(str) != "")].copy()
         if valid_comp.empty:
@@ -461,14 +432,13 @@ def _coerce_numeric(series: pd.Series) -> pd.Series:
 
 def _pick_winner_per_read(df: pd.DataFrame, rid_col: str) -> pd.DataFrame:
     """
-    Winner per read_id within (barcode, read_id) group using:
+    Winner per read (rid_col) using:
       AS desc, MAPQ desc, NM asc.
-    Falls back gracefully if some columns missing.
-    Returns a dataframe with 1 row per rid.
+    If a column is missing, that key is neutral.
+    Returns one row per rid_col.
     """
     tmp = df.copy()
 
-    # Sorting keys (handle missing)
     if "AS" in tmp.columns:
         tmp["_sort_as"] = -_coerce_numeric(tmp["AS"]).fillna(-999999)
     else:
@@ -496,7 +466,8 @@ def _process_one_assign_file(
     valid_barcodes: Set[str],
     bc_key_mode: str,
     bc_key_n: int,
-    allowed_pairs_df: pd.DataFrame,   # columns: bc_key, genome, is_allowed=1
+    allowed_pairs_df: pd.DataFrame,  # columns: bc_key, genome, is_allowed=1
+    allowed_set_cache: Dict[str, str],  # bc_key -> "g1,g2,..."
     bc_key_to_drop: Set[str],
     chunksize: int,
     # schema cols
@@ -527,42 +498,37 @@ def _process_one_assign_file(
             if missing:
                 raise ValueError(f"File {fp.name} missing columns: {sorted(missing)}")
 
-            # core cols
             bc_full = chunk[barcode_col].astype(str)
-            rid = chunk[read_id_col].astype(str)
-            genome = chunk[genome_col].astype(str)
 
-            # Filter to called barcodes only (keeps memory bounded)
             mask_valid_bc = bc_full.isin(valid_barcodes)
             if not mask_valid_bc.any():
                 continue
+
             chunk = chunk.loc[mask_valid_bc].copy()
             bc_full = chunk[barcode_col].astype(str)
             rid = chunk[read_id_col].astype(str)
-            genome = chunk[genome_col].astype(str)
 
-            # bc_key + rid key
             chunk["bc_key"] = bc_full.map(lambda x: _design_key(x, bc_key_mode, bc_key_n))
             chunk["_rid"] = bc_full + "::" + rid
 
-            # Merge allowed indicator by (bc_key, genome)
-            # This avoids per-row Python set membership.
-            chunk = chunk.merge(
-                allowed_pairs_df,
-                how="left",
-                left_on=["bc_key", genome_col],
-                right_on=["bc_key", "genome"],
-                suffixes=("", "_y"),
-            )
-            chunk["is_allowed"] = chunk["is_allowed"].fillna(0).astype(int)
-            # allowed_set string for the read is derived from bc_key only; fill later using winner rows
+            # Allowed membership by (bc_key, genome)
+            if not allowed_pairs_df.empty:
+                chunk = chunk.merge(
+                    allowed_pairs_df,
+                    how="left",
+                    left_on=["bc_key", genome_col],
+                    right_on=["bc_key", "genome"],
+                    suffixes=("", "_y"),
+                )
+                chunk["is_allowed"] = chunk["is_allowed"].fillna(0).astype(int)
+            else:
+                chunk["is_allowed"] = 0
 
-            # Confidence logic (uses assigned_class + p_as threshold if available)
+            # Confidence logic: winner label + optional p_as override
             if class_col in chunk.columns:
                 cls = chunk[class_col].astype(str)
                 is_winner_default = cls.eq("winner")
             else:
-                # if no class column, treat winner-by-score as "confident"
                 is_winner_default = pd.Series(False, index=chunk.index)
 
             has_p = (p_as_col in chunk.columns)
@@ -577,58 +543,66 @@ def _process_one_assign_file(
                 else:
                     is_confident_row = is_winner_override | ((~haspv) & is_winner_default)
             else:
-                # fallback: if no p_as logic, use winner label if present; else later we will treat score-winner as confident
                 is_confident_row = is_winner_default
 
             chunk["is_confident_row"] = is_confident_row.astype(int)
 
-            # Determine winner row per read by scores (genome, AS/MAPQ/NM). This is the read we may drop.
+            # Winner by score (always)
             win = _pick_winner_per_read(chunk.rename(columns={genome_col: "genome"}), "_rid")
             win = win[["_rid", barcode_col, read_id_col, "bc_key", "genome"]].copy()
+            win = win.rename(columns={"genome": "winner_genome"})
 
-            # Attach p_as (from winner row if exists)
+            # p_as (best effort; if multiple, keep first)
             if has_p:
-                win = win.merge(chunk[["_rid", p_as_col]].drop_duplicates("_rid"), on="_rid", how="left")
+                pa = chunk[["_rid", p_as_col]].drop_duplicates("_rid")
+                win = win.merge(pa, on="_rid", how="left")
                 win = win.rename(columns={p_as_col: "p_as"})
             else:
                 win["p_as"] = ""
 
-            # Attach confidence for the read:
-            # If assigned_class present, mark confident if ANY row in group flagged confident_row.
+            # Read confidence: any row in group is confident
             conf_by_rid = chunk.groupby("_rid", observed=True)["is_confident_row"].max().rename("is_confident")
             win = win.merge(conf_by_rid.reset_index(), on="_rid", how="left")
             win["is_confident"] = win["is_confident"].fillna(0).astype(int)
-
-            # If class_col missing entirely, treat score-winner as confident
             if class_col not in chunk.columns:
-                win["is_confident"] = 1
+                win["is_confident"] = 1  # score-winner is confident if no labels exist
 
-            # Drop entire barcode if bc_key in drop set (e.g., empty/ambiguous drop)
+            # Drop barcode
             win["drop_barcode"] = win["bc_key"].isin(bc_key_to_drop)
 
-            # Winner genome
-            win = win.rename(columns={"genome": "winner_genome"})
+            # Allowed set string (from precomputed cache)
+            win["allowed_set"] = win["bc_key"].map(lambda k: allowed_set_cache.get(str(k), ""))
 
-            # Safe keep stats require AS/MAPQ/NM; otherwise disable.
+            # Winner allowed membership
+            if not allowed_pairs_df.empty:
+                win = win.merge(
+                    allowed_pairs_df.rename(columns={"genome": "winner_genome"})[["bc_key", "winner_genome", "is_allowed"]],
+                    on=["bc_key", "winner_genome"],
+                    how="left",
+                )
+                win["winner_is_allowed"] = win["is_allowed"].fillna(0).astype(int)
+                win.drop(columns=["is_allowed"], inplace=True)
+            else:
+                win["winner_is_allowed"] = 0
+
+            # Safe keep
             have_scores = ("AS" in chunk.columns) and ("MAPQ" in chunk.columns) and ("NM" in chunk.columns)
             safe_keep_enabled = have_scores and (safe_keep_delta_as is not None) and (int(safe_keep_delta_as) > 0)
 
             if safe_keep_enabled:
-                # Compute best allowed/disallowed AS per read
-                tmp_scores = chunk[["_rid", "is_allowed", "AS", "MAPQ", "NM"]].copy()
-                tmp_scores["AS"] = _coerce_numeric(tmp_scores["AS"])
-                tmp_scores["MAPQ"] = _coerce_numeric(tmp_scores["MAPQ"])
-                tmp_scores["NM"] = _coerce_numeric(tmp_scores["NM"])
+                tmp = chunk[["_rid", "is_allowed", "AS", "MAPQ", "NM"]].copy()
+                tmp["AS"] = _coerce_numeric(tmp["AS"])
+                tmp["MAPQ"] = _coerce_numeric(tmp["MAPQ"])
+                tmp["NM"] = _coerce_numeric(tmp["NM"])
 
-                # best allowed AS
                 allowed_as = (
-                    tmp_scores[tmp_scores["is_allowed"] == 1]
+                    tmp[tmp["is_allowed"] == 1]
                     .groupby("_rid", observed=True)["AS"]
                     .max()
                     .rename("best_allowed_as")
                 )
                 disallowed_as = (
-                    tmp_scores[tmp_scores["is_allowed"] == 0]
+                    tmp[tmp["is_allowed"] == 0]
                     .groupby("_rid", observed=True)["AS"]
                     .max()
                     .rename("best_disallowed_as")
@@ -636,10 +610,9 @@ def _process_one_assign_file(
                 win = win.merge(allowed_as.reset_index(), on="_rid", how="left")
                 win = win.merge(disallowed_as.reset_index(), on="_rid", how="left")
 
-                # optional constraints: allowed MAPQ min / allowed NM max (based on best allowed hit)
                 if safe_keep_mapq_min is not None:
                     allowed_mapq = (
-                        tmp_scores[tmp_scores["is_allowed"] == 1]
+                        tmp[tmp["is_allowed"] == 1]
                         .groupby("_rid", observed=True)["MAPQ"]
                         .max()
                         .rename("best_allowed_mapq")
@@ -650,7 +623,7 @@ def _process_one_assign_file(
 
                 if safe_keep_nm_max is not None:
                     allowed_nm = (
-                        tmp_scores[tmp_scores["is_allowed"] == 1]
+                        tmp[tmp["is_allowed"] == 1]
                         .groupby("_rid", observed=True)["NM"]
                         .min()
                         .rename("best_allowed_nm")
@@ -659,11 +632,9 @@ def _process_one_assign_file(
                 else:
                     win["best_allowed_nm"] = np.nan
 
-                # safe keep rule: keep if allowed AS is within delta of disallowed AS
                 delta = float(safe_keep_delta_as)
                 ba = win["best_allowed_as"].to_numpy(dtype=float)
                 bd = win["best_disallowed_as"].to_numpy(dtype=float)
-                # If no allowed hit, cannot safe-keep
                 ok = np.isfinite(ba) & np.isfinite(bd) & (ba >= (bd - delta))
 
                 if safe_keep_mapq_min is not None:
@@ -678,54 +649,26 @@ def _process_one_assign_file(
             else:
                 win["safe_keep"] = False
 
-            # Determine allowed_set for this bc_key as a string (by joining allowed_pairs_df)
-            # Precompute a bc_key -> allowed_set_str map for speed outside of worker would be better,
-            # but this is fine because win size is per-read not per-alignment.
-            # We will instead attach allowed_set_str by building a dict once per worker call:
-            # (Done outside loop would require passing dict; simplest: compute once here lazily.)
-            # For speed: create bc_key->allowed_set_str per chunk from allowed_pairs_df.
-            # allowed_pairs_df is small; convert to dict once:
-            # NOTE: This is per worker but outside loop would be better; keep local static via attribute.
-          
-            allowed_set_cache = (allowed_pairs_df.groupby("bc_key")["genome"]
-                                 .apply(lambda s: ",".join(sorted(set(map(str, s)))))
-                                 .to_dict()
-                                )
-            allowed_set_cache: Dict[str, str] = getattr(_process_one_assign_file, "_allowed_set_cache")
-            win["allowed_set"] = win["bc_key"].map(lambda k: allowed_set_cache.get(str(k), ""))
-
-            # Determine mismatch: winner genome not in allowed set.
-            # Use merge membership instead of parsing strings: build bc_key+winner_genome lookup by merging with allowed_pairs_df.
-            win = win.merge(
-                allowed_pairs_df.rename(columns={"genome": "winner_genome"})[["bc_key", "winner_genome", "is_allowed"]],
-                on=["bc_key", "winner_genome"],
-                how="left",
-            )
-            win["winner_is_allowed"] = win["is_allowed"].fillna(0).astype(int)
-            win.drop(columns=["is_allowed"], inplace=True)
-
-            # Read drop decision:
-            # - drop if barcode dropped
-            # - else drop if confident AND winner not allowed AND not safe_keep AND there exists an allowed set
+            # Drop rule
             has_allowed_set = win["allowed_set"].astype(str).ne("")
             mismatch_conf = (win["is_confident"] == 1) & (win["winner_is_allowed"] == 0) & has_allowed_set
             drop_read = win["drop_barcode"] | (mismatch_conf & (~win["safe_keep"]))
 
-            # PRE counts: confident winner reads per barcode x winner_genome
+            # PRE counts
             pre_mask = (win["is_confident"] == 1)
             if pre_mask.any():
                 vc = win.loc[pre_mask, [barcode_col, "winner_genome"]].value_counts()
                 for (b, g), n in vc.items():
                     pre_counts[(str(b), str(g))] += int(n)
 
-            # POST counts: confident winners that survive drop_read
+            # POST counts
             post_mask = (win["is_confident"] == 1) & (~drop_read)
             if post_mask.any():
                 vc2 = win.loc[post_mask, [barcode_col, "winner_genome"]].value_counts()
                 for (b, g), n in vc2.items():
                     post_counts[(str(b), str(g))] += int(n)
 
-            # Write dropped reads (one row per read)
+            # Write dropped reads
             if drop_read.any():
                 reason = np.where(
                     win["drop_barcode"].to_numpy(bool),
@@ -751,18 +694,15 @@ def _process_one_assign_file(
 
 
 # -------------------------
-# Post-clean gating + outputs
+# Post-clean gating
 # -------------------------
 def _compute_post_metrics(
-    calls: pd.DataFrame,
+    calls_barcodes: pd.DataFrame,  # columns: barcode
     post_counts: Dict[Tuple[str, str], int],
     barcode_to_allowedset: Dict[str, Set[str]],
     min_reads_post_clean: int,
     min_allowed_frac_post_clean: float,
 ) -> pd.DataFrame:
-    """
-    Build per-barcode post metrics and keep/drop decisions.
-    """
     total_post: Dict[str, int] = defaultdict(int)
     allowed_post: Dict[str, int] = defaultdict(int)
 
@@ -773,17 +713,18 @@ def _compute_post_metrics(
             allowed_post[bc] += n
 
     rows = []
-    for bc in calls["barcode"].astype(str).tolist():
+    for bc in calls_barcodes["barcode"].astype(str).tolist():
         S = barcode_to_allowedset.get(bc, set())
         tr = int(total_post.get(bc, 0))
         ar = int(allowed_post.get(bc, 0))
         frac = (ar / tr) if tr > 0 else 0.0
 
         keep = (ar >= int(min_reads_post_clean)) and (frac >= float(min_allowed_frac_post_clean))
-        reason = "keep" if keep else "postclean_failed"
-        if ar < int(min_reads_post_clean):
+        if keep:
+            reason = "keep"
+        elif ar < int(min_reads_post_clean):
             reason = f"allowed_reads_post<{min_reads_post_clean}"
-        elif frac < float(min_allowed_frac_post_clean):
+        else:
             reason = f"allowed_frac_post<{min_allowed_frac_post_clean}"
 
         rows.append(
@@ -793,8 +734,7 @@ def _compute_post_metrics(
                 "post_allowed_reads": ar,
                 "post_allowed_frac": float(frac),
                 "keep_postclean": bool(keep),
-                "drop_reason": reason if not keep else "keep",
-                "allowed_set": _allowed_set_to_str(S),
+                "drop_reason": reason,
             }
         )
 
@@ -802,9 +742,9 @@ def _compute_post_metrics(
 
 
 # -------------------------
-# Main command
+# Main (runs as ambientmapper decontam ...)
 # -------------------------
-@app.callback(invoke_without_command=True)
+@app.callback()
 def decontam(
     cells_calls: Path = typer.Option(..., exists=True, readable=True, help="*_cells_calls.tsv(.gz) from genotyping."),
     out_dir: Path = typer.Option(..., help="Output directory for decontam artifacts."),
@@ -831,7 +771,7 @@ def decontam(
     doublet_policy: str = typer.Option(
         "top12",
         "--doublet-policy",
-        help="Doublet policy: top12 (rescue) | expected (in-silico sorting; design only)",
+        help="Doublet policy: top12 (rescue) | expected (design only; in-silico sorting)",
     ),
     indist_policy: str = typer.Option(
         "top12",
@@ -876,15 +816,7 @@ def decontam(
     chunksize: int = typer.Option(1_000_000, "--chunksize"),
     design_bc_mode: str = typer.Option("before-dash", "--design-bc-mode"),
     design_bc_n: int = typer.Option(10, "--design-bc-n"),
-):
-    """
-    decontam v2:
-      - uses genotyping calls to define AllowedSet(barcode)
-      - drops reads whose confident winner is disallowed, with optional SafeKeep to avoid over-stripping homology
-      - post-clean barcode gating (min reads + min allowed frac)
-      - parallel across assignment chunk files
-      - writes barnyard-like pre/post summaries (genome-agnostic)
-    """
+) -> None:
     cells_calls = cells_calls.expanduser().resolve()
     out_dir = out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -898,7 +830,7 @@ def decontam(
         sample_name = _infer_sample_name_from_cells_calls(cells_calls)
     sample_root = _infer_sample_root_from_cells_calls(cells_calls)
 
-    # resolve design file
+    # Design
     has_design = False
     bckey_to_expected: Dict[str, str] = {}
     if design_file is not None:
@@ -926,7 +858,7 @@ def decontam(
             assign_glob = _default_assign_glob(sample_root, sample_name)
             typer.echo(f"[decontam] auto --assign-glob: {assign_glob}")
 
-    # 1) Load per-cell calls
+    # Load calls
     typer.echo(f"[decontam] Loading cell calls: {cells_calls}")
     calls = pd.read_csv(cells_calls, sep="\t", dtype=str)
     if "barcode" not in calls.columns:
@@ -935,42 +867,28 @@ def decontam(
     calls["barcode"] = calls["barcode"].astype(str)
     calls["bc_key"] = calls["barcode"].map(lambda x: _design_key(x, design_bc_mode, design_bc_n))
 
-    # standardize needed columns
-    call_col = _col_first(calls, ["call"])
-    model_col = _col_first(calls, ["model"])
-    g1_col = _col_first(calls, ["genome_1", "genome1", "top_genome", "best_genome"])
-    g2_col = _col_first(calls, ["genome_2", "genome2"])
-    indist_col = _col_first(calls, ["indistinguishable_set"])
+    call_col = _col_first(calls, ["call"]) or "call"
+    model_col = _col_first(calls, ["model"]) or "model"
+    g1_col = _col_first(calls, ["genome_1", "genome1", "top_genome", "best_genome"]) or "genome_1"
+    g2_col = _col_first(calls, ["genome_2", "genome2"]) or "genome_2"
+    indist_col = _col_first(calls, ["indistinguishable_set"]) or "indistinguishable_set"
 
-    if call_col is None:
-        calls["call"] = ""
-        call_col = "call"
-    if model_col is None:
-        calls["model"] = ""
-        model_col = "model"
-    if g1_col is None:
-        calls["genome_1"] = ""
-        g1_col = "genome_1"
-    if g2_col is None:
-        calls["genome_2"] = ""
-        g2_col = "genome_2"
-    if indist_col is None:
-        calls["indistinguishable_set"] = ""
-        indist_col = "indistinguishable_set"
+    for c in [call_col, model_col, g1_col, g2_col, indist_col]:
+        if c not in calls.columns:
+            calls[c] = ""
 
-    # Valid barcodes set
     valid_barcodes: Set[str] = set(calls["barcode"].unique())
 
-    # 2) Build per-barcode policy rows, plus bc_key->allowed genomes pairs
+    # Build policy + allowed pairs
     policy_rows: List[Dict[str, Any]] = []
     barcode_to_allowedset: Dict[str, Set[str]] = {}
     barcode_to_expected: Dict[str, str] = {}
     bc_key_to_drop: Set[str] = set()
 
-    # Build bc_key->expected map for each barcode (per-bc_full)
     for row in calls.itertuples(index=False):
         bc_full = _norm_str(getattr(row, "barcode", ""))
         bc_key = _norm_str(getattr(row, "bc_key", ""))
+
         callv = _norm_str(getattr(row, call_col, ""))
         modelv = _norm_str(getattr(row, model_col, ""))
         g1v = _norm_str(getattr(row, g1_col, ""))
@@ -982,7 +900,6 @@ def decontam(
             expected = _norm_str(bckey_to_expected.get(bc_key, ""))
         barcode_to_expected[bc_full] = expected
 
-        # design mismatch handling: if strict and expected is unknown => drop barcode entirely
         if has_design and strict_design_drop_mismatch and (not expected):
             allowed, action, reason, flags = set(), "drop_barcode", "unknown_in_design_strict", "unknown_in_design"
         else:
@@ -1022,7 +939,6 @@ def decontam(
     df_policy = pd.DataFrame.from_records(policy_rows)
     df_policy.to_csv(out_dir / f"{sample_name}_barcode_policy.tsv.gz", sep="\t", index=False, compression="gzip")
 
-    # Build allowed pairs (bc_key, genome) for fast membership
     allowed_pairs: List[Tuple[str, str]] = []
     for bc, bc_key, allowed_str, action in df_policy[["barcode", "bc_key", "allowed_set", "action"]].itertuples(index=False):
         if action != "keep_cleaned":
@@ -1038,7 +954,15 @@ def decontam(
         allowed_pairs_df = pd.DataFrame(columns=["bc_key", "genome"])
     allowed_pairs_df["is_allowed"] = 1
 
-    # 3) Identify assignment files
+    allowed_set_cache = (
+        allowed_pairs_df.groupby("bc_key")["genome"]
+        .apply(lambda s: ",".join(sorted(set(map(str, s)))))
+        .to_dict()
+        if not allowed_pairs_df.empty
+        else {}
+    )
+
+    # Assignment inputs
     input_files: List[Path] = []
     if assignments is not None:
         input_files.append(Path(assignments).expanduser().resolve())
@@ -1055,7 +979,7 @@ def decontam(
     if not input_files:
         raise FileNotFoundError("[decontam] No assignment inputs found. Provide --assignments or --assign-glob.")
 
-    # 4) Parallel read-level processing (per-file parts)
+    # Parallel per-file
     threads = max(1, int(threads))
     drops_dir = tmp_dir / "drop_parts"
     drops_dir.mkdir(parents=True, exist_ok=True)
@@ -1081,6 +1005,7 @@ def decontam(
                 bc_key_mode=design_bc_mode,
                 bc_key_n=design_bc_n,
                 allowed_pairs_df=allowed_pairs_df,
+                allowed_set_cache=allowed_set_cache,
                 bc_key_to_drop=bc_key_to_drop,
                 chunksize=chunksize,
                 read_id_col=read_id_col,
@@ -1112,6 +1037,7 @@ def decontam(
                     bc_key_mode=design_bc_mode,
                     bc_key_n=design_bc_n,
                     allowed_pairs_df=allowed_pairs_df,
+                    allowed_set_cache=allowed_set_cache,
                     bc_key_to_drop=bc_key_to_drop,
                     chunksize=chunksize,
                     read_id_col=read_id_col,
@@ -1139,7 +1065,7 @@ def decontam(
     reads_to_drop_path = out_dir / f"{sample_name}_reads_to_drop.tsv.gz"
     with gzip.open(reads_to_drop_path, "wt") as out_fh:
         out_fh.write("read_id\tbarcode\tbc_key\tallowed_set\twinner_genome\tp_as\treason\n")
-    # append members without headers: we wrote headers in parts, so skip them on merge
+
     with gzip.open(reads_to_drop_path, "at") as out_fh:
         for part in sorted(part_paths):
             if not part.exists() or part.stat().st_size == 0:
@@ -1149,20 +1075,19 @@ def decontam(
                 for line in in_fh:
                     if first:
                         first = False
-                        # skip part header
-                        continue
+                        continue  # skip part header
                     out_fh.write(line)
 
     typer.echo(f"[decontam] Wrote {reads_to_drop_path} (drop_rows_total={drop_total})")
 
-    # 5) Barnyard summaries pre/post
+    # Barnyard summaries
     typer.echo("[decontam] Writing barnyard-like summary tables...")
     _write_barnyard_summaries(out_dir, sample_name, "pre", pre_counts, barcode_to_expected)
     _write_barnyard_summaries(out_dir, sample_name, "post", post_counts, barcode_to_expected)
 
-    # 6) Post-clean metrics + keep/drop
+    # Post-clean metrics
     df_post = _compute_post_metrics(
-        calls=calls[["barcode"]].copy(),
+        calls_barcodes=calls[["barcode"]].copy(),
         post_counts=post_counts,
         barcode_to_allowedset=barcode_to_allowedset,
         min_reads_post_clean=min_reads_post_clean,
@@ -1170,14 +1095,19 @@ def decontam(
     )
     df_post.to_csv(out_dir / f"{sample_name}_barcode_postclean.tsv.gz", sep="\t", index=False, compression="gzip")
 
-    # 7) Append post columns into calls (1:1 join) and write combined file
-    calls_out = calls.merge(df_policy[["barcode", "allowed_set", "expected_genome", "action", "reason", "flags"]], on="barcode", how="left")
-    calls_out = calls_out.merge(df_post.drop(columns=["allowed_set"]), on="barcode", how="left")
+    # Append into calls and write combined file
+    calls_out = calls.merge(
+        df_policy[["barcode", "allowed_set", "expected_genome", "action", "reason", "flags"]],
+        on="barcode",
+        how="left",
+    )
+    calls_out = calls_out.merge(df_post, on="barcode", how="left")
+
     out_calls = out_dir / f"{sample_name}_cells_calls.decontam.tsv.gz"
     calls_out.to_csv(out_calls, sep="\t", index=False, compression="gzip")
     typer.echo(f"[decontam] Wrote {out_calls}")
 
-    # 8) Params JSON
+    # Params JSON
     params = {
         "cells_calls": str(cells_calls),
         "out_dir": str(out_dir),
@@ -1211,7 +1141,7 @@ def decontam(
     params_path.write_text(json.dumps(params, indent=2))
     typer.echo(f"[decontam] Wrote {params_path}")
 
-    # cleanup
+    # Cleanup tmp
     try:
         shutil.rmtree(tmp_dir)
     except Exception:
