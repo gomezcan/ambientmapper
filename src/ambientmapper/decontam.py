@@ -68,6 +68,7 @@ from .utils import (
 app = typer.Typer(
     help="ambientmapper decontam v2 — model-informed purification: AllowedSet + read drops + post-clean gating",
     add_completion=False,
+    invoke_without_command=True,
     no_args_is_help=True,
 )
 
@@ -685,11 +686,10 @@ def _process_one_assign_file(
             # For speed: create bc_key->allowed_set_str per chunk from allowed_pairs_df.
             # allowed_pairs_df is small; convert to dict once:
             # NOTE: This is per worker but outside loop would be better; keep local static via attribute.
-            if not hasattr(_process_one_assign_file, "_allowed_set_cache"):
-                cache = defaultdict(list)
-                for r in allowed_pairs_df.itertuples(index=False):
-                    cache[str(r.bc_key)].append(str(r.genome))
-                _process_one_assign_file._allowed_set_cache = {k: ",".join(sorted(set(v))) for k, v in cache.items()}
+            allowed_set_cache = (allowed_pairs_df.groupby("bc_key")["genome"]
+                                 .apply(lambda s: ",".join(sorted(set(map(str, s)))))
+                                 .to_dict()
+                                )
             allowed_set_cache: Dict[str, str] = getattr(_process_one_assign_file, "_allowed_set_cache")
             win["allowed_set"] = win["bc_key"].map(lambda k: allowed_set_cache.get(str(k), ""))
 
@@ -803,7 +803,7 @@ def _compute_post_metrics(
 # -------------------------
 # Main command
 # -------------------------
-@app.command("decontam")
+@app.callback(invoke_without_command=True)
 def decontam(
     cells_calls: Path = typer.Option(..., exists=True, readable=True, help="*_cells_calls.tsv(.gz) from genotyping."),
     out_dir: Path = typer.Option(..., help="Output directory for decontam artifacts."),
