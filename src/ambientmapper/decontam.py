@@ -686,6 +686,7 @@ def _process_one_assign_file(
             # For speed: create bc_key->allowed_set_str per chunk from allowed_pairs_df.
             # allowed_pairs_df is small; convert to dict once:
             # NOTE: This is per worker but outside loop would be better; keep local static via attribute.
+          
             allowed_set_cache = (allowed_pairs_df.groupby("bc_key")["genome"]
                                  .apply(lambda s: ",".join(sorted(set(map(str, s)))))
                                  .to_dict()
