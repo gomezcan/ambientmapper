@@ -458,6 +458,27 @@ def _pick_winner_per_read(df: pd.DataFrame, rid_col: str) -> pd.DataFrame:
     win = tmp.drop_duplicates(subset=[rid_col], keep="first").copy()
     return win
 
+def _pick_winner_using_assigned_class_or_scores(
+    chunk: pd.DataFrame,
+    *,
+    rid_col: str,
+    genome_col: str,
+    class_col: str,
+) -> pd.DataFrame:
+    # If assigned_class present: use it
+    if class_col in chunk.columns:
+        w = chunk[chunk[class_col].astype(str) == "winner"].copy()
+        if not w.empty:
+            # if multiple winners per read, tie-break by scores
+            w = w.rename(columns={genome_col: "genome"})
+            return _pick_winner_per_read(w, rid_col).rename(columns={"genome": "winner_genome"})
+        # fall back to score-based if no winner rows found
+
+    # fallback: score-based across all rows
+    tmp = chunk.rename(columns={genome_col: "genome"}).copy()
+    return _pick_winner_per_read(tmp, rid_col).rename(columns={"genome": "winner_genome"})
+
+
 def _process_one_assign_file(
     fp: Path,
     *,
@@ -484,10 +505,10 @@ def _process_one_assign_file(
     safe_keep_nm_max: Optional[int],
     # optional: policy table (preferred). If None, allowed_set comes from allowed_set_cache.
     policy_df: Optional[pd.DataFrame] = None,
-    **_ignored: Any,  # tolerate older callers that pass extra kwargs
+    **_ignored: Any,
 ) -> Tuple[Counter, Counter, int]:
     """
-    Backward-compatible worker.
+    Worker over one assignment chunk file.
 
     Returns:
       pre_counts  : Counter[(barcode, genome)] = #confident winner reads (pre-clean)
@@ -498,7 +519,9 @@ def _process_one_assign_file(
     post_counts: Counter = Counter()
     n_drop_rows = 0
 
-    # --- policy lookup (barcode -> allowed_set/action/expected/reason/flags) ---
+    # -------------------------
+    # Policy lookup table (per-barcode)
+    # -------------------------
     rhs = None
     if policy_df is not None:
         need = {"barcode", "bc_key", "allowed_set", "action", "expected_genome", "reason", "flags"}
@@ -511,18 +534,18 @@ def _process_one_assign_file(
             .copy()
         )
 
-    # --- normalize allowed_pairs_df to avoid column collisions ---
+    # -------------------------
+    # Allowed-pairs table (bc_key, genome) -> is_allowed
+    # -------------------------
     if allowed_pairs_df is not None and not allowed_pairs_df.empty:
         ap = allowed_pairs_df.copy()
         if "is_allowed" not in ap.columns:
             ap["is_allowed"] = 1
-        # rename genome -> allowed_genome for safe merges
         ap = ap.rename(columns={"genome": "allowed_genome"})
-        ap = ap[["bc_key", "allowed_genome", "is_allowed"]].copy()
+        ap = ap[["bc_key", "allowed_genome", "is_allowed"]].drop_duplicates().copy()
     else:
         ap = pd.DataFrame(columns=["bc_key", "allowed_genome", "is_allowed"])
 
-    # ensure cache is a dict
     if allowed_set_cache is None:
         allowed_set_cache = {}
 
@@ -536,7 +559,8 @@ def _process_one_assign_file(
             if missing:
                 raise ValueError(f"File {fp.name} missing columns: {sorted(missing)}")
 
-            # canonical columns
+            # canonical identifiers
+            chunk = chunk.copy()
             chunk["barcode"] = chunk[barcode_col].astype(str)
             chunk["read_id"] = chunk[read_id_col].astype(str)
 
@@ -549,7 +573,7 @@ def _process_one_assign_file(
             chunk["bc_key"] = chunk["barcode"].map(lambda x: _design_key(x, bc_key_mode, bc_key_n))
             chunk["_rid"] = chunk["barcode"] + "::" + chunk["read_id"]
 
-            # allowed membership per row
+            # per-row allowed membership
             if not ap.empty:
                 chunk = chunk.merge(
                     ap,
@@ -562,14 +586,15 @@ def _process_one_assign_file(
             else:
                 chunk["is_allowed"] = 0
 
-            # winner labels
-            if class_col in chunk.columns:
-                cls = chunk[class_col].astype(str)
-                is_winner_default = cls.eq("winner")
+            # -------------------------
+            # Per-row confidence (for "counting winners" + for mismatch_conf)
+            # -------------------------
+            has_class = (class_col in chunk.columns)
+            if has_class:
+                is_winner_default = (chunk[class_col].astype(str) == "winner")
             else:
                 is_winner_default = pd.Series(False, index=chunk.index)
 
-            # p_as override logic
             has_p = (p_as_col in chunk.columns)
             if decontam_alpha is not None and has_p:
                 p_vals = pd.to_numeric(chunk[p_as_col], errors="coerce")
@@ -578,58 +603,74 @@ def _process_one_assign_file(
                 if require_p_as:
                     is_confident_row = is_winner_override
                 else:
+                    # use p_as when present; otherwise fall back to assigned_class winner
                     is_confident_row = is_winner_override | ((~haspv) & is_winner_default)
             else:
                 is_confident_row = is_winner_default
 
             chunk["is_confident_row"] = is_confident_row.astype(int)
 
-            # pick score-winner per read
-            tmp_for_win = chunk.rename(columns={genome_col: "genome"}).copy()
-            win = _pick_winner_per_read(tmp_for_win, "_rid").copy()
-            win = win.rename(columns={"genome": "winner_genome"})
+            # -------------------------
+            # Pick winner per read
+            #   - if assigned_class exists and has winner rows: pick among those (tie-break by scores)
+            #   - else: pick by scores among all rows
+            # Returns one row per _rid with columns including barcode/read_id/bc_key and winner_genome
+            # -------------------------
+            win = _pick_winner_using_assigned_class_or_scores(
+                chunk,
+                rid_col="_rid",
+                genome_col=genome_col,
+                class_col=class_col,
+            ).copy()
 
-            # ensure canonical columns on win
+            # Ensure required identity columns exist on win
+            # (pick_winner returns a subset of original columns; make sure these are present)
             if "barcode" not in win.columns:
                 win["barcode"] = win[barcode_col].astype(str)
             if "read_id" not in win.columns:
                 win["read_id"] = win[read_id_col].astype(str)
             if "bc_key" not in win.columns:
                 win["bc_key"] = win["barcode"].map(lambda x: _design_key(x, bc_key_mode, bc_key_n))
+            if "_rid" not in win.columns:
+                win["_rid"] = win["barcode"] + "::" + win["read_id"]
 
-            # merge policy if provided
+            # -------------------------
+            # Attach p_as ONCE (always create column)
+            # -------------------------
+            if has_p:
+                pa = (
+                    chunk[["_rid", p_as_col]]
+                    .drop_duplicates(subset=["_rid"], keep="first")
+                    .rename(columns={p_as_col: "p_as"})
+                )
+                win = win.merge(pa, on="_rid", how="left")
+            else:
+                win["p_as"] = np.nan
+            win["p_as"] = win["p_as"].fillna("").astype(str)
+
+            # -------------------------
+            # Attach policy (allowed_set/action) ONCE
+            # -------------------------
             if rhs is not None:
                 win = win.merge(rhs, on=["barcode"], how="left", validate="m:1")
             else:
-                # minimal columns if no policy_df
                 win["allowed_set"] = ""
                 win["action"] = "keep_cleaned"
-                win["expected_genome"] = ""
-                win["reason"] = ""
-                win["flags"] = ""
 
-            # fill defaults
             win["allowed_set"] = win["allowed_set"].fillna("")
             win["action"] = win["action"].fillna("keep_cleaned")
 
-            # if allowed_set missing but we have allowed_set_cache (bc_key -> string), fill it
-            if "allowed_set" in win.columns:
-                miss_allowed = win["allowed_set"].astype(str).eq("")
-                if miss_allowed.any():
-                    win.loc[miss_allowed, "allowed_set"] = win.loc[miss_allowed, "bc_key"].map(
-                        lambda k: allowed_set_cache.get(str(k), "")
-                    )
+            # Fill allowed_set from cache if missing
+            miss_allowed = win["allowed_set"].astype(str).eq("")
+            if miss_allowed.any():
+                win.loc[miss_allowed, "allowed_set"] = win.loc[miss_allowed, "bc_key"].map(
+                    lambda k: allowed_set_cache.get(str(k), "")
+                )
 
-            # p_as attach
-            if has_p:
-                pa = chunk[["_rid", p_as_col]].drop_duplicates(subset=["_rid"], keep="first").copy()
-                pa = pa.rename(columns={p_as_col: "p_as"})
-                win = win.merge(pa, on="_rid", how="left")
-                win["p_as"] = win["p_as"].fillna("").astype(str)
-            else:
-                win["p_as"] = ""
-
-            # per-read confidence: any row confident
+            # -------------------------
+            # is_confident per read: any row in that read had confident evidence
+            # (if no assigned_class, treat score-winner reads as confident)
+            # -------------------------
             conf_by_rid = (
                 chunk.groupby("_rid", observed=True)["is_confident_row"]
                 .max()
@@ -638,24 +679,28 @@ def _process_one_assign_file(
             )
             win = win.merge(conf_by_rid, on="_rid", how="left")
             win["is_confident"] = win["is_confident"].fillna(0).astype(int)
-
-            # if there is no assigned_class, treat score-winner as confident
-            if class_col not in chunk.columns:
+            if not has_class:
                 win["is_confident"] = 1
 
-            # drop barcode: either explicit set OR policy action != keep_cleaned
+            # Drop barcode if policy says so or in bc_key_to_drop
             win["drop_barcode"] = win["bc_key"].isin(bc_key_to_drop) | (win["action"].astype(str) != "keep_cleaned")
 
-            # winner allowed membership (bc_key, winner_genome)
+            # -------------------------
+            # winner_is_allowed (per read)
+            # -------------------------
             if not ap.empty:
-                ap_win = ap.rename(columns={"allowed_genome": "winner_genome"})[["bc_key", "winner_genome", "is_allowed"]].copy()
+                ap_win = ap.rename(columns={"allowed_genome": "winner_genome"})[
+                    ["bc_key", "winner_genome", "is_allowed"]
+                ].drop_duplicates().copy()
                 win = win.merge(ap_win, on=["bc_key", "winner_genome"], how="left")
                 win["winner_is_allowed"] = pd.to_numeric(win["is_allowed"], errors="coerce").fillna(0).astype(int)
                 win.drop(columns=["is_allowed"], inplace=True, errors="ignore")
             else:
                 win["winner_is_allowed"] = 0
 
-            # safe-keep
+            # -------------------------
+            # safe-keep (homology guard)
+            # -------------------------
             have_scores = ("AS" in chunk.columns) and ("MAPQ" in chunk.columns) and ("NM" in chunk.columns)
             safe_keep_enabled = have_scores and (safe_keep_delta_as is not None) and (int(safe_keep_delta_as) > 0)
 
@@ -719,26 +764,28 @@ def _process_one_assign_file(
             else:
                 win["safe_keep"] = False
 
-            # drop rule
+            # -------------------------
+            # Drop rule
+            # -------------------------
             has_allowed_set = win["allowed_set"].astype(str).ne("")
             mismatch_conf = (win["is_confident"] == 1) & (win["winner_is_allowed"] == 0) & has_allowed_set
             drop_read = win["drop_barcode"] | (mismatch_conf & (~win["safe_keep"]))
 
-            # PRE counts
+            # PRE counts (confident winners)
             pre_mask = (win["is_confident"] == 1)
             if bool(pre_mask.any()):
                 vc = win.loc[pre_mask, ["barcode", "winner_genome"]].value_counts()
                 for (b, g), n in vc.items():
                     pre_counts[(str(b), str(g))] += int(n)
 
-            # POST counts
+            # POST counts (confident winners that survive)
             post_mask = (win["is_confident"] == 1) & (~drop_read)
             if bool(post_mask.any()):
                 vc2 = win.loc[post_mask, ["barcode", "winner_genome"]].value_counts()
                 for (b, g), n in vc2.items():
                     post_counts[(str(b), str(g))] += int(n)
 
-            # write drops
+            # Write drops
             if bool(drop_read.any()):
                 reason_arr = np.where(
                     win["drop_barcode"].to_numpy(bool),
@@ -753,7 +800,7 @@ def _process_one_assign_file(
                         "bc_key": win["bc_key"].astype(str),
                         "allowed_set": win["allowed_set"].astype(str),
                         "winner_genome": win["winner_genome"].astype(str),
-                        "p_as": win["p_as"].fillna("").astype(str),
+                        "p_as": win["p_as"].astype(str),
                         "reason": reason_arr,
                     }
                 )
