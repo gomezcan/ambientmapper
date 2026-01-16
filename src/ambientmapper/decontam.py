@@ -652,10 +652,29 @@ def _process_one_assign_file(
 
             # -------------------------
             # Attach policy (allowed_set/action)
+            #   IMPORTANT: avoid bc_key collisions (bc_key -> bc_key_x/bc_key_y)
             # -------------------------
-            win = win.merge(pol, on="barcode", how="left", validate="m:1")
+            # Ensure we have bc_key before policy merge
+            if "bc_key" not in win.columns:
+                win["bc_key"] = win["barcode"].map(lambda x: _design_key(x, bc_key_mode, bc_key_n))
+
+            # Make a merge-safe policy table: DO NOT carry bc_key into the merge
+            pol2 = pol.copy()
+            pol2 = pol2.drop(columns=[c for c in ["bc_key", "read_id", "_rid"] if c in pol2.columns], errors="ignore")
+
+            # Also remove any prior collision columns just in case
+            win.drop(columns=[c for c in ["bc_key_x", "bc_key_y"] if c in win.columns], inplace=True, errors="ignore")
+
+            # Merge policy
+            win = win.merge(pol2, on="barcode", how="left", validate="m:1")
+
+            # Guarantee bc_key still exists after merge
+            if "bc_key" not in win.columns:
+                win["bc_key"] = win["barcode"].map(lambda x: _design_key(x, bc_key_mode, bc_key_n))
+
             win["allowed_set"] = win["allowed_set"].fillna("").astype(str)
             win["action"] = win["action"].fillna("keep_cleaned").astype(str)
+
 
             # confident per read = any row had confident evidence
             conf_by_rid = (
