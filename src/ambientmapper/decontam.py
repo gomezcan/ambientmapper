@@ -694,53 +694,28 @@ def _process_one_assign_file(
             win["drop_barcode"] = win["bc_key"].isin(bc_key_to_drop) | (win["action"] != "keep_cleaned")
 
             # -------------------------
-            # winner allowed? (use allowed_pairs_df)
+            # winner allowed?
+            #   - design-aware: check bc_key × winner_genome against allowed_pairs_df
+            #   - no-design: treat winner as allowed (allowed_set is defined by policy)
             # -------------------------
-            if not ap.empty:
-                ap_win = ap.rename(columns={"genome": "winner_genome"}).copy()
+            if has_design and (not ap.empty):
+                ap_win = ap.rename(columns={"genome": "winner_genome"})[
+                    ["bc_key", "winner_genome", "is_allowed"]
+                ].drop_duplicates()
 
-                # Ensure is_allowed exists and is named exactly 'is_allowed'
-                if "is_allowed" not in ap_win.columns:
-                    # try common alternatives
-                    for alt in ("allowed", "isAllowed", "allowed_flag"):
-                        if alt in ap_win.columns:
-                            ap_win = ap_win.rename(columns={alt: "is_allowed"})
-                            break
-                if "is_allowed" not in ap_win.columns:
-                    # if ap is missing it entirely, treat all as NOT allowed
-                    ap_win["is_allowed"] = 0
-
-                ap_win = ap_win[["bc_key", "winner_genome", "is_allowed"]].drop_duplicates()
-
-                # Prevent suffix collisions just in case
-                win.drop(
-                    columns=[c for c in ("is_allowed", "is_allowed_x", "is_allowed_y") if c in win.columns],
-                    inplace=True,
-                    errors="ignore",
-                )
+                # ensure no stale column
+                win.drop(columns=["is_allowed"], inplace=True, errors="ignore")
 
                 win = win.merge(ap_win, on=["bc_key", "winner_genome"], how="left")
+                win["winner_is_allowed"] = (
+                    pd.to_numeric(win.get("is_allowed"), errors="coerce").fillna(0).astype(int)
+                )
+                win.drop(columns=["is_allowed"], inplace=True, errors="ignore")
 
-                # Normalize to winner_is_allowed, even if merge produced nothing
-                src = None
-                if "is_allowed" in win.columns:
-                    src = "is_allowed"
-                elif "is_allowed_x" in win.columns:
-                    src = "is_allowed_x"
-                elif "is_allowed_y" in win.columns:
-                    src = "is_allowed_y"
-
-                if src is None:
-                    win["winner_is_allowed"] = 0
-                else:
-                    win["winner_is_allowed"] = (
-                        pd.to_numeric(win[src], errors="coerce").fillna(0).astype(int)
-                    )
-
-                win.drop(columns=[c for c in ("is_allowed", "is_allowed_x", "is_allowed_y") if c in win.columns],
-                         inplace=True, errors="ignore")
             else:
-                win["winner_is_allowed"] = 0
+                # no design (or no allowed table): don't gate on bc_key
+                win["winner_is_allowed"] = 1
+
 
 
             # -------------------------
