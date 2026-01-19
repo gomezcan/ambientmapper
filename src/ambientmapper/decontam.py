@@ -34,8 +34,8 @@ Outputs
 
 Assumptions about assignment inputs
   - The assignment TSVs contain per-read, per-genome rows and typically an `assigned_class` column with "winner"
-  - rows. If no winner labels exist, decontam can compute winners using AS/MAPQ/NM ordering
-  
+    rows. If no winner labels exist, decontam can compute winners using AS/MAPQ/NM ordering.
+
 Notes
 - This module is assignment-driven for read-level decisions (mode-independent w.r.t genotyping).
 - "winner evidence" here is `assigned_class == "winner"` plus optional `p_as <= decontam_alpha` override.
@@ -47,7 +47,6 @@ import glob
 import json
 import shutil
 from collections import Counter, defaultdict
-
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -105,7 +104,7 @@ def _norm_str(x) -> str:
     return s
 
 
-def _col_first(df: pd.DataFrame, cols: list[str]) -> Optional[str]:
+def _col_first(df: pd.DataFrame, cols: List[str]) -> Optional[str]:
     for c in cols:
         if c in df.columns:
             return c
@@ -373,7 +372,7 @@ def _write_barnyard_summaries(
         .rename(columns={"genome": "top_genome", "n_winner_reads": "top_reads"})
     )
 
-    comp = totals.merge(top_df, on="barcode", how="left")    
+    comp = totals.merge(top_df, on="barcode", how="left")
     comp["top_frac"] = comp["top_reads"] / comp["total_reads"].replace(0, np.nan)
 
     if expected_map:
@@ -459,6 +458,7 @@ def _pick_winner_per_read(df: pd.DataFrame, rid_col: str) -> pd.DataFrame:
     win = tmp.drop_duplicates(subset=[rid_col], keep="first").copy()
     return win
 
+
 def _pick_winner_using_assigned_class_or_scores(
     chunk: pd.DataFrame,
     *,
@@ -487,8 +487,8 @@ def _process_one_assign_file(
     valid_barcodes: Set[str],
     bc_key_mode: str,
     bc_key_n: int,
-    allowed_pairs_df: pd.DataFrame,          # optional debug only
-    policy_df: pd.DataFrame,                # must include: barcode, allowed_set, action
+    allowed_pairs_df: Optional[pd.DataFrame],  # optional debug only
+    policy_df: pd.DataFrame,                  # must include: barcode, allowed_set, action
     barcodes_to_drop: Set[str],
     has_design: bool,
     chunksize: int,
@@ -559,7 +559,6 @@ def _process_one_assign_file(
     def _token_in_allowed_set(genome: str, aset: str) -> bool:
         if not aset:
             return False
-        # exact tokens; no substring matches
         toks = [t for t in aset.split(",") if t]
         return genome in toks
 
@@ -632,14 +631,12 @@ def _process_one_assign_file(
 
             # ---- PATCH: p_as comes from the WINNER row (never arbitrary first row per _rid) ----
             if "p_as" in win.columns:
-                # already normalized somewhere upstream
                 pass
             elif p_as_col in win.columns:
                 win = win.rename(columns={p_as_col: "p_as"})
             else:
                 win["p_as"] = ""
 
-            # numeric for confidence; string for output
             win["_p_as_val"] = pd.to_numeric(win["p_as"], errors="coerce")
             win["p_as"] = win["p_as"].fillna("").astype(str)
 
@@ -650,9 +647,8 @@ def _process_one_assign_file(
             # -------------------------
             # Confidence ON WINNER
             # -------------------------
-            has_class = class_col in chunk.columns
             if decontam_alpha is None:
-                # if no alpha provided, treat winners as confident (your original behavior)
+                # if no alpha provided, treat winners as confident
                 win["is_confident"] = 1
             else:
                 alpha = float(decontam_alpha)
@@ -662,9 +658,6 @@ def _process_one_assign_file(
                     # if p missing, still accept winner as confident
                     is_conf = is_conf | (~has_p)
                 win["is_confident"] = is_conf.astype(int)
-
-                # If you want to force “must be assign-winner” when assigned_class exists,
-                # you can add an additional gate here; leaving off for robustness.
 
             # Drop whole barcode?
             win["drop_barcode"] = (win["barcode"].isin(barcodes_to_drop)) | (win["action"] != "keep_cleaned")
@@ -773,15 +766,10 @@ def _process_one_assign_file(
             drop_bc_arr = win["drop_barcode"].fillna(False).to_numpy().astype(bool)
             safe_keep_arr = win["safe_keep"].fillna(False).to_numpy().astype(bool)
 
-            keep_mask = (
-                (~drop_bc_arr)
-                & is_conf_arr
-                & (winner_allowed_arr | safe_keep_arr)
-            )
+            keep_mask = (~drop_bc_arr) & is_conf_arr & (winner_allowed_arr | safe_keep_arr)
             drop_mask = is_conf_arr & (~keep_mask)
 
             # PRE counts: confident winners (not filtered by allowedness)
-            # (this is for diagnostics / before-vs-after)
             if is_conf_arr.any():
                 vc = win.loc[is_conf_arr, ["barcode", "winner_genome"]].value_counts()
                 for (b, g), n in vc.items():
@@ -816,7 +804,6 @@ def _process_one_assign_file(
                 out.to_csv(fh, sep="\t", header=False, index=False)
 
     return pre_counts, post_counts, n_drop_rows
-
 
 
 # -------------------------
@@ -1009,7 +996,7 @@ def decontam(
     policy_rows: List[Dict[str, Any]] = []
     barcode_to_allowedset: Dict[str, Set[str]] = {}
     barcode_to_expected: Dict[str, str] = {}
-    bc_key_to_drop: Set[str] = set()
+    barcodes_to_drop: Set[str] = set()  # PATCH: defined + used consistently
 
     for row in calls.itertuples(index=False):
         bc_full = _norm_str(getattr(row, "barcode", ""))
@@ -1043,7 +1030,7 @@ def decontam(
             )
 
         barcode_to_allowedset[bc_full] = allowed
-        if action == "drop_barcode" and bc_key:
+        if action == "drop_barcode":
             barcodes_to_drop.add(bc_full)
 
         policy_rows.append(
@@ -1065,6 +1052,7 @@ def decontam(
     df_policy = pd.DataFrame.from_records(policy_rows)
     df_policy.to_csv(out_dir / f"{sample_name}_barcode_policy.tsv.gz", sep="\t", index=False, compression="gzip")
 
+    # Optional debug table (bc_key x allowed genome)
     allowed_pairs: List[Tuple[str, str]] = []
     for bc, bc_key, allowed_str, action in df_policy[["barcode", "bc_key", "allowed_set", "action"]].itertuples(index=False):
         if action != "keep_cleaned":
@@ -1075,20 +1063,10 @@ def decontam(
         for g in _parse_allowed_set_str(allowed_str):
             allowed_pairs.append((bc_key, g))
 
-    allowed_pairs_df = pd.DataFrame.from_records(allowed_pairs, columns=["bc_key", "genome"])
-    allowed_pairs_df = allowed_pairs_df.drop_duplicates(["bc_key","genome"]).copy()
-
+    allowed_pairs_df = pd.DataFrame.from_records(allowed_pairs, columns=["bc_key", "genome"]).drop_duplicates(["bc_key", "genome"])
     if allowed_pairs_df.empty:
         allowed_pairs_df = pd.DataFrame(columns=["bc_key", "genome"])
     allowed_pairs_df["is_allowed"] = 1
-
-    allowed_set_cache = (
-        allowed_pairs_df.groupby("bc_key")["genome"]
-        .apply(lambda s: ",".join(sorted(set(map(str, s)))))
-        .to_dict()
-        if not allowed_pairs_df.empty
-        else {}
-    )
 
     # Assignment inputs
     input_files: List[Path] = []
@@ -1133,8 +1111,9 @@ def decontam(
                 bc_key_mode=design_bc_mode,
                 bc_key_n=design_bc_n,
                 allowed_pairs_df=allowed_pairs_df,
-                allowed_set_cache=allowed_set_cache,
-                bc_key_to_drop=bc_key_to_drop,
+                policy_df=df_policy,
+                barcodes_to_drop=barcodes_to_drop,  # PATCH: pass required arg
+                has_design=has_design,              # PATCH: pass required arg
                 chunksize=chunksize,
                 read_id_col=read_id_col,
                 barcode_col=barcode_col,
@@ -1146,7 +1125,6 @@ def decontam(
                 safe_keep_delta_as=safe_keep_delta_as,
                 safe_keep_mapq_min=safe_keep_mapq_min,
                 safe_keep_nm_max=safe_keep_nm_max,
-                policy_df=df_policy,
             )
             pre_counts.update(pc)
             post_counts.update(qc)
@@ -1166,8 +1144,9 @@ def decontam(
                     bc_key_mode=design_bc_mode,
                     bc_key_n=design_bc_n,
                     allowed_pairs_df=allowed_pairs_df,
-                    allowed_set_cache=allowed_set_cache,
-                    bc_key_to_drop=bc_key_to_drop,
+                    policy_df=df_policy,
+                    barcodes_to_drop=barcodes_to_drop,  # PATCH
+                    has_design=has_design,              # PATCH
                     chunksize=chunksize,
                     read_id_col=read_id_col,
                     barcode_col=barcode_col,
@@ -1179,7 +1158,6 @@ def decontam(
                     safe_keep_delta_as=safe_keep_delta_as,
                     safe_keep_mapq_min=safe_keep_mapq_min,
                     safe_keep_nm_max=safe_keep_nm_max,
-                    policy_df=df_policy,
                 )
                 futs[fut] = fp
 
