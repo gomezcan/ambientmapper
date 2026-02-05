@@ -276,7 +276,7 @@ def filter(
     normalize_bc: bool = typer.Option( False, "--normalize-bc/--no-normalize-bc", 
                                       help="Apply canonicalize_bc_seq_sample_force to BC column (default: off)"),
 ) -> None:
-     """Filter QCMapping files by barcode frequency."""
+    """Filter QCMapping files by barcode frequency."""
     from .filtering import filter_qc_file
 
     cfgs = _load_one_or_many_configs(
