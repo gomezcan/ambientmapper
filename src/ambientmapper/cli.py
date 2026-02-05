@@ -253,6 +253,14 @@ def extract(
 def filter(
     config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
     threads: int = typer.Option(4, "--threads", "-t", min=1),
+    min_barcode_freq: Optional[int] = typer.Option(
+        None, "--min-barcode-freq", help="Override config min_barcode_freq"
+    ),
+    normalize_bc: bool = typer.Option(
+        False,
+        "--normalize-bc/--no-normalize-bc",
+        help="Apply canonicalize_bc_seq_sample_force to BC column (default: off)",
+    ),
 ) -> None:
     """Filter QCMapping files by barcode frequency."""
     from .filtering import filter_qc_file
@@ -262,18 +270,22 @@ def filter(
     _ensure_dirs(d)
 
     genomes = sorted(dict(cfg["genomes"]).keys())
-    minf = int(cfg["min_barcode_freq"])
+    minf = int(min_barcode_freq if min_barcode_freq is not None else cfg.get("min_barcode_freq", 10))
+
+    # IMPORTANT: if extract already wrote BC like '<seq>-<sample>', skip normalization to save CPU/memory.
+    sample_for_norm = str(cfg["sample"]) if normalize_bc else None
 
     with ProcessPoolExecutor(max_workers=_clamp(int(threads), 1, len(genomes))) as ex:
         futs = []
         for g in genomes:
             ip = d["qc"] / f"{g}_QCMapping.txt"
             op = d["filtered"] / f"filtered_{g}_QCMapping.txt"
-            futs.append(ex.submit(filter_qc_file, ip, op, minf, str(cfg["sample"])))
+            futs.append(ex.submit(filter_qc_file, ip, op, minf, sample_for_norm))
         for f in as_completed(futs):
             f.result()
 
     typer.echo("[filter] done")
+
 
 
 @app.command()
