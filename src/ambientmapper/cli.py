@@ -102,6 +102,24 @@ def _load_config(config: Path) -> Dict[str, object]:
         raise typer.BadParameter("Config field 'genomes' must be a non-empty mapping.")
     return cfg
 
+def _load_one_or_many_configs(
+    *,
+    config: Optional[Path],
+    configs: Optional[Path],
+    min_barcode_freq: Optional[int] = None,
+    chunk_size_cells: Optional[int] = None,
+) -> List[Dict[str, object]]:
+    if (config is None) == (configs is None):
+        raise typer.BadParameter("Provide exactly one of: --config (JSON) OR --configs (TSV).")
+
+    if config is not None:
+        cfg = _load_config(config)
+        return [cfg]
+
+    # TSV -> build cfgs with defaults supplied by CLI or fall back to safe defaults
+    mbf = int(min_barcode_freq) if min_barcode_freq is not None else 10
+    csc = int(chunk_size_cells) if chunk_size_cells is not None else 5000
+    return _cfgs_from_tsv(configs, mbf, csc)
 
 def _cfgs_from_tsv(
     tsv: Path, min_barcode_freq: int, chunk_size_cells: int
@@ -251,197 +269,206 @@ def extract(
 
 @app.command()
 def filter(
-    config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
+    config: Optional[Path] = typer.Option(None, "--config", "-c", exists=True, readable=True),
+    configs: Optional[Path] = typer.Option(None, "--configs", exists=True, readable=True),
     threads: int = typer.Option(4, "--threads", "-t", min=1),
-    min_barcode_freq: Optional[int] = typer.Option(
-        None, "--min-barcode-freq", help="Override config min_barcode_freq"
-    ),
-    normalize_bc: bool = typer.Option(
-        False,
-        "--normalize-bc/--no-normalize-bc",
-        help="Apply canonicalize_bc_seq_sample_force to BC column (default: off)",
-    ),
+    min_barcode_freq: Optional[int] = typer.Option(None, "--min-barcode-freq", min=1),
+    normalize_bc: bool = typer.Option( False, "--normalize-bc/--no-normalize-bc", 
+                                      help="Apply canonicalize_bc_seq_sample_force to BC column (default: off)"),
 ) -> None:
-    """Filter QCMapping files by barcode frequency."""
+     """Filter QCMapping files by barcode frequency."""
     from .filtering import filter_qc_file
 
-    cfg = _load_config(config)
-    d = _cfg_dirs(cfg)
-    _ensure_dirs(d)
+    cfgs = _load_one_or_many_configs(
+        config=config,
+        configs=configs,
+        min_barcode_freq=min_barcode_freq,
+    )
+    for cfg in cfgs:
+        d = _cfg_dirs(cfg)
+        _ensure_dirs(d)
 
-    genomes = sorted(dict(cfg["genomes"]).keys())
-    minf = int(min_barcode_freq if min_barcode_freq is not None else cfg.get("min_barcode_freq", 10))
+        genomes = sorted(dict(cfg["genomes"]).keys())
+        
+        # priority: CLI override > cfg value > default
+        minf = int(min_barcode_freq if min_barcode_freq is not None else cfg.get("min_barcode_freq", 10))
+        
+        # IMPORTANT: if extract already wrote BC like '<seq>-<sample>', skip normalization to save CPU/memory.
+        futs.append(ex.submit(filter_qc_file, ip, op, minf, sample_for_norm))
 
-    # IMPORTANT: if extract already wrote BC like '<seq>-<sample>', skip normalization to save CPU/memory.
-    sample_for_norm = str(cfg["sample"]) if normalize_bc else None
+        with ProcessPoolExecutor(max_workers=_clamp(int(threads), 1, len(genomes))) as ex:
+            futs = []
+            for g in genomes:
+                ip = d["qc"] / f"{g}_QCMapping.txt"
+                op = d["filtered"] / f"filtered_{g}_QCMapping.txt"
+                futs.append(ex.submit(filter_qc_file, ip, op, minf, str(cfg["sample"])))
+            for f in as_completed(futs):
+                f.result()
 
-    with ProcessPoolExecutor(max_workers=_clamp(int(threads), 1, len(genomes))) as ex:
-        futs = []
-        for g in genomes:
-            ip = d["qc"] / f"{g}_QCMapping.txt"
-            op = d["filtered"] / f"filtered_{g}_QCMapping.txt"
-            futs.append(ex.submit(filter_qc_file, ip, op, minf, sample_for_norm))
-        for f in as_completed(futs):
-            f.result()
-
-    typer.echo("[filter] done")
-
+        typer.echo(f"[filter] done: {cfg['sample']}")    
 
 
 @app.command()
 def chunks(
-    config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
+    config: Optional[Path] = typer.Option(None, "--config", "-c", exists=True, readable=True),
+    configs: Optional[Path] = typer.Option(None, "--configs", exists=True, readable=True),
+    chunk_size_cells: Optional[int] = typer.Option(None, "--chunk-size-cells", min=1),
 ) -> None:
     """Create barcode chunk files."""
     from .chunks import make_barcode_chunks
 
-    cfg = _load_config(config)
-    d = _cfg_dirs(cfg)
-    _ensure_dirs(d)
+    cfgs = _load_one_or_many_configs(
+        config=config,
+        configs=configs,
+        chunk_size_cells=chunk_size_cells,
+    )
 
-    n = make_barcode_chunks(d["filtered"], d["chunks"], str(cfg["sample"]), int(cfg["chunk_size_cells"]))
-    typer.echo(f"[chunks] wrote {n} chunk files")
+    for cfg in cfgs:
+        d = _cfg_dirs(cfg)
+        _ensure_dirs(d)
 
+        n_cells = int(chunk_size_cells if chunk_size_cells is not None else cfg.get("chunk_size_cells", 5000))
+        n = make_barcode_chunks(d["filtered"], d["chunks"], str(cfg["sample"]), n_cells)
+        typer.echo(f"[chunks] {cfg['sample']}: wrote {n} chunk files")
 
 @app.command()
 def assign(
-    config: Path = typer.Option(..., "-c", "--config", exists=True, readable=True),
+    config: Optional[Path] = typer.Option(None, "-c", "--config", exists=True, readable=True),
+    configs: Optional[Path] = typer.Option(None, "--configs", exists=True, readable=True),
     threads: int = typer.Option(16, "-t", "--threads", min=1),
-    edges_workers: Optional[int] = typer.Option(
-        None, "--edges-workers", help="Max workers for learn_edges_parallel (default: = --threads)"
-    ),
-    edges_max_reads: Optional[int] = typer.Option(
-        None, "--edges-max-reads", help="Optional cap of reads per genome when learning edges"
-    ),
-    ecdf_workers: Optional[int] = typer.Option(
-        None, "--ecdf-workers", help="Max workers for learn_ecdfs (default: = --threads)"
-    ),
-    chunksize: Optional[int] = typer.Option(
-        None,
-        "--chunksize",
-        help="Override pandas read_csv chunk size (rows per chunk).",
-    ),
-    batch_size: Optional[int] = typer.Option(
-        None,
-        "--batch-size",
-        help="Override batch size for batched winner-edge learning.",
-    ),
-    verbose: bool = typer.Option(True, "--verbose/--quiet", help="Print per-chunk progress"),
+
+    alpha: Optional[float] = typer.Option(None, "--alpha"),
+    k: Optional[int] = typer.Option(None, "--k"),
+    mapq_min: Optional[int] = typer.Option(None, "--mapq-min"),
+    xa_max: Optional[int] = typer.Option(None, "--xa-max"),
+
+    edges_workers: Optional[int] = typer.Option(None, "--edges-workers"),
+    edges_max_reads: Optional[int] = typer.Option(None, "--edges-max-reads"),
+    ecdf_workers: Optional[int] = typer.Option(None, "--ecdf-workers"),
+    chunksize: Optional[int] = typer.Option(None, "--chunksize"),
+    batch_size: Optional[int] = typer.Option(None, "--batch-size"),
+    verbose: bool = typer.Option(True, "--verbose/--quiet"),
 ) -> None:
     """Learn edges/ECDFs and score each chunk (parallel)."""
     from .assign_streaming import learn_edges_parallel, learn_ecdfs_parallel, score_chunk
 
-    cfg = _load_config(config)
-    d = _cfg_dirs(cfg)
-    _ensure_dirs(d)
+    cfgs = _load_one_or_many_configs(config=config, configs=configs)
 
-    workdir = Path(str(cfg["workdir"]))
-    sample = str(cfg["sample"])
-    _ensure_minimal_chunk(workdir, sample)
+    for cfg in cfgs:
+        d = _cfg_dirs(cfg)
+        _ensure_dirs(d)
 
-    chunks_dir = d["chunks"]
-
-    aconf = cfg.get("assign", {}) if isinstance(cfg.get("assign"), dict) else {}
-    alpha = float(aconf.get("alpha", 0.05))
-    k = int(aconf.get("k", 10))
-    mapq_min = int(aconf.get("mapq_min", 20))
-    xa_max = int(aconf.get("xa_max", 2))
-
-    chunksize_val = int(chunksize if chunksize is not None else aconf.get("chunksize", cfg.get("chunksize", 1_000_000)))
-    batch_size_val = int(batch_size if batch_size is not None else aconf.get("batch_size", cfg.get("batch_size", 32)))
-
-    chunk_files = sorted(chunks_dir.glob("*_cell_map_ref_chunk_*.txt"))
-    if not chunk_files:
-        _ensure_minimal_chunk(workdir, sample)
-        chunk_files = sorted(chunks_dir.glob("*_cell_map_ref_chunk_*.txt"))
-
-    threads_eff = max(1, int(threads))
-    if edges_workers is not None:
-        edges_workers = max(1, min(int(edges_workers), threads_eff))
-    if edges_max_reads is not None and int(edges_max_reads) <= 0:
-        edges_max_reads = None
-    if ecdf_workers is not None:
-        ecdf_workers = max(1, min(int(ecdf_workers), threads_eff))
-
-    if k <= 0:
-        k = 10
-    if chunksize_val <= 0:
-        chunksize_val = 1_000_000
-    if batch_size_val <= 0:
-        batch_size_val = 32
-
-    exp_dir = workdir / sample / "ExplorationReadLevel"
-    exp_dir.mkdir(parents=True, exist_ok=True)
-    edges_npz = exp_dir / "global_edges.npz"
-    ecdf_npz = exp_dir / "global_ecdf.npz"
-
-    if verbose:
-        typer.echo(
-            f"[assign] chunksize={chunksize_val:,} batch_size={batch_size_val} threads={threads_eff}"
-            + (f" edges_workers={edges_workers}" if edges_workers is not None else "")
-            + (f" edges_max_reads={int(edges_max_reads):,}" if edges_max_reads is not None else "")
-            + (f" ecdf_workers={ecdf_workers}" if ecdf_workers is not None else "")
+        _apply_assign_overrides(
+            cfg,
+            alpha=alpha,
+            k=k,
+            mapq_min=mapq_min,
+            xa_max=xa_max,
+            chunksize=chunksize,
+            batch_size=batch_size,
+            edges_workers=edges_workers,
+            edges_max_reads=edges_max_reads,
+            ecdf_workers=ecdf_workers,
         )
 
-    learn_edges_parallel(
-        workdir=workdir,
-        sample=sample,
-        chunks_dir=chunks_dir,
-        out_model=edges_npz,
-        mapq_min=mapq_min,
-        xa_max=xa_max,
-        chunksize=chunksize_val,
-        k=k,
-        batch_size=batch_size_val,
-        threads=threads_eff,
-        verbose=verbose,
-        edges_workers=edges_workers,
-        edges_max_reads=edges_max_reads,
-    )
+        workdir = Path(str(cfg["workdir"]))
+        sample = str(cfg["sample"])
+        _ensure_minimal_chunk(workdir, sample)
 
-    ecdf_workers_eff = int(ecdf_workers) if ecdf_workers is not None else threads_eff
-    learn_ecdfs_parallel(
-        workdir=workdir,
-        sample=sample,
-        chunks_dir=chunks_dir,
-        edges_model=edges_npz,
-        out_model=ecdf_npz,
-        mapq_min=mapq_min,
-        xa_max=xa_max,
-        chunksize=chunksize_val,
-        verbose=verbose,
-        workers=ecdf_workers_eff,
-    )
+        chunks_dir = d["chunks"]
+        aconf = cfg.get("assign", {}) if isinstance(cfg.get("assign"), dict) else {}
 
-    pool_n = min(threads_eff, len(chunk_files))
-    typer.echo(f"[assign/score] start: {len(chunk_files)} chunks, procs={pool_n}")
+        alpha_eff = float(aconf.get("alpha", 0.05))
+        k_eff = int(aconf.get("k", 10))
+        mapq_min_eff = int(aconf.get("mapq_min", 20))
+        xa_max_eff = int(aconf.get("xa_max", 2))
 
-    with ProcessPoolExecutor(max_workers=pool_n) as ex:
-        fut = {
-            ex.submit(
-                score_chunk,
-                workdir=workdir,
-                sample=sample,
-                chunk_file=chf,
-                ecdf_model=ecdf_npz,
-                out_raw_dir=None,
-                out_filtered_dir=None,
-                mapq_min=mapq_min,
-                xa_max=xa_max,
-                chunksize=chunksize_val,
-                alpha=alpha,
-            ): chf
-            for chf in chunk_files
-        }
-        done = 0
-        total = len(fut)
-        for f in as_completed(fut):
-            f.result()
-            done += 1
-            if done % 5 == 0 or done == total:
-                typer.echo(f"[assign/score] {done}/{total} chunks")
+        chunksize_val = int(aconf.get("chunksize", 1_000_000))
+        batch_size_val = int(aconf.get("batch_size", 32))
 
-    typer.echo("[assign/score] done")
+        chunk_files = sorted(chunks_dir.glob("*_cell_map_ref_chunk_*.txt"))
+        if not chunk_files:
+            _ensure_minimal_chunk(workdir, sample)
+            chunk_files = sorted(chunks_dir.glob("*_cell_map_ref_chunk_*.txt"))
+
+        threads_eff = max(1, int(threads))
+        edges_workers_eff = max(1, min(int(aconf.get("edges_workers", threads_eff)), threads_eff))
+        ecdf_workers_eff = max(1, min(int(aconf.get("ecdf_workers", threads_eff)), threads_eff))
+        edges_max_reads_eff = aconf.get("edges_max_reads", None)
+        if edges_max_reads_eff is not None and int(edges_max_reads_eff) <= 0:
+            edges_max_reads_eff = None
+
+        exp_dir = workdir / sample / "ExplorationReadLevel"
+        exp_dir.mkdir(parents=True, exist_ok=True)
+        edges_npz = exp_dir / "global_edges.npz"
+        ecdf_npz = exp_dir / "global_ecdf.npz"
+
+        if verbose:
+            typer.echo(
+                f"[assign] {sample} chunksize={chunksize_val:,} batch_size={batch_size_val} threads={threads_eff} "
+                f"edges_workers={edges_workers_eff} ecdf_workers={ecdf_workers_eff}"
+                + (f" edges_max_reads={int(edges_max_reads_eff):,}" if edges_max_reads_eff is not None else "")
+            )
+
+        learn_edges_parallel(
+            workdir=workdir,
+            sample=sample,
+            chunks_dir=chunks_dir,
+            out_model=edges_npz,
+            mapq_min=mapq_min_eff,
+            xa_max=xa_max_eff,
+            chunksize=chunksize_val,
+            k=k_eff,
+            batch_size=batch_size_val,
+            threads=threads_eff,
+            verbose=verbose,
+            edges_workers=edges_workers_eff,
+            edges_max_reads=edges_max_reads_eff,
+        )
+
+        learn_ecdfs_parallel(
+            workdir=workdir,
+            sample=sample,
+            chunks_dir=chunks_dir,
+            edges_model=edges_npz,
+            out_model=ecdf_npz,
+            mapq_min=mapq_min_eff,
+            xa_max=xa_max_eff,
+            chunksize=chunksize_val,
+            verbose=verbose,
+            workers=ecdf_workers_eff,
+        )
+
+        pool_n = min(threads_eff, len(chunk_files))
+        typer.echo(f"[assign/score] {sample}: start {len(chunk_files)} chunks, procs={pool_n}")
+
+        with ProcessPoolExecutor(max_workers=pool_n) as ex:
+            fut = {
+                ex.submit(
+                    score_chunk,
+                    workdir=workdir,
+                    sample=sample,
+                    chunk_file=chf,
+                    ecdf_model=ecdf_npz,
+                    out_raw_dir=None,
+                    out_filtered_dir=None,
+                    mapq_min=mapq_min_eff,
+                    xa_max=xa_max_eff,
+                    chunksize=chunksize_val,
+                    alpha=alpha_eff,
+                ): chf
+                for chf in chunk_files
+            }
+            done = 0
+            total = len(fut)
+            for f in as_completed(fut):
+                f.result()
+                done += 1
+                if done % 5 == 0 or done == total:
+                    typer.echo(f"[assign/score] {sample}: {done}/{total}")
+
+        typer.echo(f"[assign] done: {sample}")
+
 
 
 @app.command()
