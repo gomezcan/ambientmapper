@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import csv
 import glob
+import hashlib
 import json
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
-import hashlib
-import time
-from datetime import datetime, timezone
+
 import typer
 
 from .pipeline import run_pipeline
@@ -26,12 +26,10 @@ app = typer.Typer(
 # -----------------------------------------------------------------------------
 # Wire sub-apps / commands
 # -----------------------------------------------------------------------------
-# decontam is its own Typer app that runs as: `ambientmapper decontam ...`
 from .decontam import app as decontam_app  # noqa: E402
 
 app.add_typer(decontam_app, name="decontam")
 
-# clean-bams is a single command
 from .clean_bams import clean_bams_cmd  # noqa: E402
 
 app.command("clean-bams")(clean_bams_cmd)
@@ -104,28 +102,8 @@ def _load_config(config: Path) -> Dict[str, object]:
         raise typer.BadParameter("Config field 'genomes' must be a non-empty mapping.")
     return cfg
 
-def _load_one_or_many_configs(
-    *,
-    config: Optional[Path],
-    configs: Optional[Path],
-    min_barcode_freq: Optional[int] = None,
-    chunk_size_cells: Optional[int] = None,
-) -> List[Dict[str, object]]:
-    if (config is None) == (configs is None):
-        raise typer.BadParameter("Provide exactly one of: --config (JSON) OR --configs (TSV).")
 
-    if config is not None:
-        cfg = _load_config(config)
-        return [cfg]
-
-    # TSV -> build cfgs with defaults supplied by CLI or fall back to safe defaults
-    mbf = int(min_barcode_freq) if min_barcode_freq is not None else 10
-    csc = int(chunk_size_cells) if chunk_size_cells is not None else 5000
-    return _cfgs_from_tsv(configs, mbf, csc)
-
-def _cfgs_from_tsv(
-    tsv: Path, min_barcode_freq: int, chunk_size_cells: int
-) -> List[Dict[str, object]]:
+def _cfgs_from_tsv(tsv: Path, min_barcode_freq: int, chunk_size_cells: int) -> List[Dict[str, object]]:
     groups: Dict[str, Dict[str, str]] = {}
     workdirs: Dict[str, str] = {}
 
@@ -176,6 +154,26 @@ def _cfgs_from_tsv(
             }
         )
     return cfgs
+
+
+def _load_one_or_many_configs(
+    *,
+    config: Optional[Path],
+    configs: Optional[Path],
+    min_barcode_freq: Optional[int] = None,
+    chunk_size_cells: Optional[int] = None,
+) -> List[Dict[str, object]]:
+    if (config is None) == (configs is None):
+        raise typer.BadParameter("Provide exactly one of: --config (JSON) OR --configs (TSV).")
+
+    if config is not None:
+        return [_load_config(config)]
+
+    # TSV -> build cfgs with defaults supplied by CLI or fall back to safe defaults
+    mbf = int(min_barcode_freq) if min_barcode_freq is not None else 10
+    csc = int(chunk_size_cells) if chunk_size_cells is not None else 5000
+    assert configs is not None
+    return _cfgs_from_tsv(configs, mbf, csc)
 
 
 def _apply_assign_overrides(
@@ -241,20 +239,27 @@ def _ensure_minimal_chunk(workdir: Path, sample: str) -> None:
     }
     (chunks / "manifest.json").write_text(json.dumps(man, indent=2))
 
+
+# -----------------------------------------------------------------------------
+# Sentinels (for stepwise commands)
+# -----------------------------------------------------------------------------
 def _sentinel_dir(d: Dict[str, Path]) -> Path:
     p = d["root"] / "_sentinels"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
+
 def _stable_json(obj: object) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+
 
 def _hash_str(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
+
 def _sentinel_path(d: Dict[str, Path], step: str, signature: str) -> Path:
-    # signature allows different parameterizations to coexist
     return _sentinel_dir(d) / f"{step}.{signature}.done.json"
+
 
 def _write_sentinel(
     d: Dict[str, Path],
@@ -277,9 +282,11 @@ def _write_sentinel(
     sp.write_text(json.dumps(payload, indent=2))
     return sp
 
+
 def _has_sentinel(d: Dict[str, Path], step: str, cfg: Dict[str, object], params: Dict[str, object]) -> bool:
     sig = _hash_str(_stable_json({"step": step, "sample": cfg.get("sample"), "params": params}))
     return _sentinel_path(d, step, sig).exists()
+
 
 # -----------------------------------------------------------------------------
 # Stepwise commands
@@ -319,29 +326,26 @@ def extract(
     sp = _write_sentinel(d, step="extract", cfg=cfg, params=params, outputs=outputs)
     typer.echo(f"[extract] done ({cfg['sample']}) sentinel={sp.name}")
 
+
 @app.command()
 def filter(
     config: Optional[Path] = typer.Option(None, "--config", "-c", exists=True, readable=True),
     configs: Optional[Path] = typer.Option(None, "--configs", exists=True, readable=True),
     threads: int = typer.Option(4, "--threads", "-t", min=1),
     min_barcode_freq: Optional[int] = typer.Option(None, "--min-barcode-freq", min=1),
-    normalize_bc: bool = typer.Option(
-        False,
-        "--normalize-bc/--no-normalize-bc",
-        help="Apply canonicalize_bc_seq_sample_force to BC column (default: off)",
-    ),
+    normalize_bc: bool = typer.Option(False, "--normalize-bc/--no-normalize-bc"),
+    resume: bool = typer.Option(True, "--resume/--no-resume"),
 ) -> None:
     """Filter QCMapping files by barcode frequency."""
     from .filtering import filter_qc_file
-
 
     cfgs = _load_one_or_many_configs(config=config, configs=configs, min_barcode_freq=min_barcode_freq)
 
     for cfg in cfgs:
         d = _cfg_dirs(cfg)
         _ensure_dirs(d)
-        genomes = sorted(dict(cfg["genomes"]).keys())
 
+        genomes = sorted(dict(cfg["genomes"]).keys())
         minf = int(min_barcode_freq if min_barcode_freq is not None else cfg.get("min_barcode_freq", 10))
         sample_for_norm = str(cfg["sample"]) if normalize_bc else None
         pool_n = _clamp(int(threads), 1, len(genomes))
@@ -363,7 +367,6 @@ def filter(
                 ip = d["qc"] / f"{g}_QCMapping.txt"
                 op = d["filtered"] / f"filtered_{g}_QCMapping.txt"
                 futs.append(ex.submit(filter_qc_file, ip, op, minf, sample_for_norm))
-            # ensure all finish
             rows = [int(f.result()) for f in as_completed(futs)]
 
         outputs = {
@@ -373,6 +376,7 @@ def filter(
         }
         sp = _write_sentinel(d, step="filter", cfg=cfg, params=params, outputs=outputs)
         typer.echo(f"[filter] done ({cfg['sample']}) sentinel={sp.name}")
+
 
 @app.command()
 def chunks(
@@ -403,6 +407,7 @@ def chunks(
         sp = _write_sentinel(d, step="chunks", cfg=cfg, params=params, outputs=outputs)
         typer.echo(f"[chunks] {cfg['sample']}: wrote {n} chunk files sentinel={sp.name}")
 
+
 @app.command()
 def assign(
     config: Optional[Path] = typer.Option(None, "-c", "--config", exists=True, readable=True),
@@ -431,9 +436,14 @@ def assign(
 
         _apply_assign_overrides(
             cfg,
-            alpha=alpha, k=k, mapq_min=mapq_min, xa_max=xa_max,
-            chunksize=chunksize, batch_size=batch_size,
-            edges_workers=edges_workers, edges_max_reads=edges_max_reads,
+            alpha=alpha,
+            k=k,
+            mapq_min=mapq_min,
+            xa_max=xa_max,
+            chunksize=chunksize,
+            batch_size=batch_size,
+            edges_workers=edges_workers,
+            edges_max_reads=edges_max_reads,
             ecdf_workers=ecdf_workers,
         )
 
@@ -444,7 +454,6 @@ def assign(
         chunks_dir = d["chunks"]
         aconf = cfg.get("assign", {}) if isinstance(cfg.get("assign"), dict) else {}
 
-        # resolved values actually used
         alpha_eff = float(aconf.get("alpha", 0.05))
         k_eff = int(aconf.get("k", 10))
         mapq_min_eff = int(aconf.get("mapq_min", 20))
@@ -494,16 +503,32 @@ def assign(
             )
 
         learn_edges_parallel(
-            workdir=workdir, sample=sample, chunks_dir=chunks_dir, out_model=edges_npz,
-            mapq_min=mapq_min_eff, xa_max=xa_max_eff, chunksize=chunksize_val,
-            k=k_eff, batch_size=batch_size_val, threads=threads_eff, verbose=verbose,
-            edges_workers=edges_workers_eff, edges_max_reads=edges_max_reads_eff,
+            workdir=workdir,
+            sample=sample,
+            chunks_dir=chunks_dir,
+            out_model=edges_npz,
+            mapq_min=mapq_min_eff,
+            xa_max=xa_max_eff,
+            chunksize=chunksize_val,
+            k=k_eff,
+            batch_size=batch_size_val,
+            threads=threads_eff,
+            verbose=verbose,
+            edges_workers=edges_workers_eff,
+            edges_max_reads=edges_max_reads_eff,
         )
 
         learn_ecdfs_parallel(
-            workdir=workdir, sample=sample, chunks_dir=chunks_dir, edges_model=edges_npz,
-            out_model=ecdf_npz, mapq_min=mapq_min_eff, xa_max=xa_max_eff,
-            chunksize=chunksize_val, verbose=verbose, workers=ecdf_workers_eff,
+            workdir=workdir,
+            sample=sample,
+            chunks_dir=chunks_dir,
+            edges_model=edges_npz,
+            out_model=ecdf_npz,
+            mapq_min=mapq_min_eff,
+            xa_max=xa_max_eff,
+            chunksize=chunksize_val,
+            verbose=verbose,
+            workers=ecdf_workers_eff,
         )
 
         pool_n = min(threads_eff, len(chunk_files))
@@ -513,11 +538,16 @@ def assign(
             fut = {
                 ex.submit(
                     score_chunk,
-                    workdir=workdir, sample=sample, chunk_file=chf,
+                    workdir=workdir,
+                    sample=sample,
+                    chunk_file=chf,
                     ecdf_model=ecdf_npz,
-                    out_raw_dir=None, out_filtered_dir=None,
-                    mapq_min=mapq_min_eff, xa_max=xa_max_eff,
-                    chunksize=chunksize_val, alpha=alpha_eff,
+                    out_raw_dir=None,
+                    out_filtered_dir=None,
+                    mapq_min=mapq_min_eff,
+                    xa_max=xa_max_eff,
+                    chunksize=chunksize_val,
+                    alpha=alpha_eff,
                 ): chf
                 for chf in chunk_files
             }
@@ -534,15 +564,12 @@ def assign(
         typer.echo(f"[assign] done: {sample} sentinel={sp.name}")
 
 
-
-
 @app.command()
 def genotyping(
     config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
     assign_glob: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs. If omitted, inferred."),
     outdir: Optional[Path] = typer.Option(None, "--outdir", help="Override output dir (default: <workdir>/<sample>/final)."),
     sample: Optional[str] = typer.Option(None, "--sample", help="Override sample name from config."),
-    # pass-through knobs (kept as-is from your draft)
     min_reads: Optional[int] = typer.Option(None, "--min-reads"),
     single_mass_min: Optional[float] = typer.Option(None, "--single-mass-min"),
     ratio_top1_top2_min: Optional[float] = typer.Option(None, "--ratio-top1-top2-min"),
@@ -570,6 +597,7 @@ def genotyping(
     eta_iters: Optional[int] = typer.Option(None, "--eta-iters"),
     eta_seed_quantile: Optional[float] = typer.Option(None, "--eta-seed-quantile"),
     topk_genomes: Optional[int] = typer.Option(None, "--topk-genomes"),
+    resume: bool = typer.Option(True, "--resume/--no-resume"),
 ) -> None:
     """Posterior-aware genotyping (merge → per-cell genotype calls)."""
     from .genotyping import genotyping as _run_genotyping
@@ -671,14 +699,21 @@ def genotyping(
     if topk_genomes is not None:
         kwargs["topk_genomes"] = max(1, int(topk_genomes))
 
+    # Sentinel for genotyping keyed by the actual kwargs (except outdir path is included as string)
+    params = {k: (str(v) if isinstance(v, Path) else v) for k, v in kwargs.items()}
+    if resume and _has_sentinel(d, "genotyping", cfg, params):
+        typer.echo(f"[genotyping] skip (sentinel): {sample_eff}")
+        return
+
     _run_genotyping(**kwargs)
 
+    outputs = {"outdir": str(outdir_eff), "assign": str(assign_glob)}
+    sp = _write_sentinel(d, step="genotyping", cfg=cfg, params=params, outputs=outputs)
+    typer.echo(f"[genotyping] done ({sample_eff}) sentinel={sp.name}")
 
-# NOTE: decontam command is provided by add_typer(decontam_app, name="decontam")
-# Do NOT re-declare a second decontam() command in this file, or Typer will conflict.
 
 # -----------------------------------------------------------------------------
-# Optional extra commands (keep if you have these modules)
+# Optional extra commands
 # -----------------------------------------------------------------------------
 @app.command()
 def interpool(
@@ -738,7 +773,7 @@ def run(
     assign_edges_workers: Optional[int] = typer.Option(None, "--assign-edges-workers"),
     assign_edges_max_reads: Optional[int] = typer.Option(None, "--assign-edges-max-reads"),
     ecdf_workers: Optional[int] = typer.Option(None, "--ecdf-workers"),
-    # genotyping overrides (pass through into pipeline params)
+    # genotyping overrides
     genotyping_min_reads: Optional[int] = typer.Option(None, "--genotyping-min-reads"),
     genotyping_beta: Optional[float] = typer.Option(None, "--genotyping-beta"),
     genotyping_w_as: Optional[float] = typer.Option(None, "--genotyping-w-as"),
@@ -781,7 +816,7 @@ def run(
     only = [s.strip() for s in only_steps.split(",") if s.strip()]
 
     genotyping_conf: Dict[str, object] = {}
-    for k, v in [
+    for k2, v2 in [
         ("min_reads", genotyping_min_reads),
         ("beta", genotyping_beta),
         ("w_as", genotyping_w_as),
@@ -810,8 +845,8 @@ def run(
         ("empty_jsd_max", genotyping_empty_jsd_max),
         ("jsd_normalize", genotyping_jsd_normalize),
     ]:
-        if v is not None:
-            genotyping_conf[k] = v
+        if v2 is not None:
+            genotyping_conf[k2] = v2
 
     if "eta_seed_quantile" in genotyping_conf:
         q = float(genotyping_conf["eta_seed_quantile"])
