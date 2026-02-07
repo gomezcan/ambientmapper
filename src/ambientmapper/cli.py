@@ -325,11 +325,15 @@ def filter(
     configs: Optional[Path] = typer.Option(None, "--configs", exists=True, readable=True),
     threads: int = typer.Option(4, "--threads", "-t", min=1),
     min_barcode_freq: Optional[int] = typer.Option(None, "--min-barcode-freq", min=1),
-    normalize_bc: bool = typer.Option(False, "--normalize-bc/--no-normalize-bc"),
-    resume: bool = typer.Option(True, "--resume/--no-resume"),
+    normalize_bc: bool = typer.Option(
+        False,
+        "--normalize-bc/--no-normalize-bc",
+        help="Apply canonicalize_bc_seq_sample_force to BC column (default: off)",
+    ),
 ) -> None:
     """Filter QCMapping files by barcode frequency."""
     from .filtering import filter_qc_file
+
 
     cfgs = _load_one_or_many_configs(config=config, configs=configs, min_barcode_freq=min_barcode_freq)
 
