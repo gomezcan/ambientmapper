@@ -99,6 +99,11 @@ class MergeConfig(BaseModel):
     pass2_chunksize: int = 200_000
     winner_only: bool = True
     pass1_workers: int = 1
+  
+    # Optional: drop promiscuous ambiguous reads (disabled unless max_hits is set)
+    max_hits: Optional[int] = None        # if None, do not filter
+    hits_delta_as: Optional[int] = None   # near-top window for counting hits
+
 
 
 # ------------------------------
@@ -122,23 +127,25 @@ def _coerce_assign_schema(df: pd.DataFrame) -> pd.DataFrame:
         rename["p_mq_decile"] = "p_mq"
 
     out = df.rename(columns=rename)
+  
+    if "assigned_class" in out.columns:
+      out["assigned_class"] = out["assigned_class"].astype(str)
 
     for col in ("barcode", "read_id", "genome"):
-        if col in out.columns:
+      if col in out.columns:
             out[col] = out[col].astype(str)
-
+          
     for col in ("AS", "MAPQ", "NM"):
-        if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce")
+      if col in out.columns:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
 
     for pcol in ("p_as", "p_mq"):
-        if pcol in out.columns:
-            out[pcol] = pd.to_numeric(out[pcol], errors="coerce")
-            max_val = out[pcol].max(skipna=True)
-            if max_val and max_val > 1.0:
-                out[pcol] = out[pcol] / 10.0
-
-    return out
+      if pcol in out.columns:
+        out[pcol] = pd.to_numeric(out[pcol], errors="coerce")
+        max_val = out[pcol].max(skipna=True)
+        if max_val and max_val > 1.0:
+          out[pcol] = out[pcol] / 10.0
+  return out
 
 
 def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
@@ -158,6 +165,8 @@ def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
         agg["p_as"] = "min"
     if "p_mq" in have:
         agg["p_mq"] = "min"
+    if "assigned_class" in have:
+        agg["assigned_class"] = "first"
 
     if not agg:
         return df.drop_duplicates(keys)[keys]
@@ -177,7 +186,6 @@ def _unwrap_optioninfo(x):
 # ------------------------------
 # Core math
 # ------------------------------
-
 
 def _zscore_series(x: np.ndarray) -> np.ndarray:
     x = x.astype(float, copy=False)
@@ -343,6 +351,93 @@ def _barcode_jsd_from_mass(mass: pd.Series, eta: pd.Series, normalize: bool) -> 
     p = mass.reindex(genomes).fillna(0.0).to_numpy(float)
     q = eta.reindex(genomes).fillna(0.0).to_numpy(float)
     return _jsd(p, q, normalize=normalize)
+
+
+def _filter_promiscuous_ambiguous_reads(
+    df: pd.DataFrame, cfg: MergeConfig
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Drop entire (barcode, read_id) groups *only for ambiguous rows* if they have
+    > cfg.max_hits genomes within cfg.hits_delta_as of best AS.
+
+    Disabled unless BOTH cfg.max_hits and cfg.hits_delta_as are set.
+    Returns: (filtered_df, stats_dict)
+    """
+    stats: Dict[str, Any] = {
+        "enabled": False,
+        "reason": "",
+        "rows_in": int(len(df)),
+        "rows_out": int(len(df)),
+        "amb_rows_in": 0,
+        "amb_rows_out": 0,
+        "amb_read_groups_in": 0,
+        "amb_read_groups_dropped": 0,
+    }
+
+    # opt-in only
+    if cfg.max_hits is None or cfg.hits_delta_as is None:
+        stats["reason"] = "disabled (max_hits or hits_delta_as not set)"
+        return df, stats
+    if cfg.max_hits <= 0 or cfg.hits_delta_as < 0:
+        stats["reason"] = "disabled (invalid thresholds)"
+        return df, stats
+    if "assigned_class" not in df.columns:
+        stats["reason"] = "disabled (missing assigned_class)"
+        return df, stats
+    if "AS" not in df.columns:
+        stats["reason"] = "disabled (missing AS)"
+        return df, stats
+
+    stats["enabled"] = True
+
+    cls = df["assigned_class"].astype(str).str.lower()
+    amb_mask = (cls == "ambiguous")
+
+    stats["amb_rows_in"] = int(amb_mask.sum())
+    if stats["amb_rows_in"] == 0:
+        stats["reason"] = "enabled but no ambiguous rows"
+        return df, stats
+
+    amb = df.loc[amb_mask, ["barcode", "read_id", "AS"]].copy()
+  
+    # per ambiguous read group
+    grp = amb.groupby(["barcode", "read_id"], observed=True)
+
+    # number of ambiguous read-groups present
+    stats["amb_read_groups_in"] = int(grp.ngroups)
+
+    # compute best AS per group
+    #best_as = grp["AS"].transform("max")  # remove
+
+    # count near-top hits per group (within delta of best)
+    delta = int(cfg.hits_delta_as)
+    n_near = grp["AS"].transform(lambda s: int((s >= (s.max() - delta)).sum()))
+
+    # mark groups to drop
+    to_drop = (n_near > int(cfg.max_hits))
+    if not bool(to_drop.any()):
+        stats["reason"] = "enabled but no groups exceeded threshold"
+        stats["amb_rows_out"] = stats["amb_rows_in"]
+        return df, stats
+
+    drop_keys = amb.loc[to_drop, ["barcode", "read_id"]].drop_duplicates()
+    stats["amb_read_groups_dropped"] = int(len(drop_keys))
+
+    # drop only ambiguous rows for those keys
+    tmp = df.merge(drop_keys.assign(_drop=True), on=["barcode", "read_id"], how="left")
+    drop_row = tmp["_drop"].fillna(False).to_numpy(bool) & amb_mask.to_numpy(bool)
+
+    out = df.loc[~drop_row].reset_index(drop=True)
+
+    # stats out
+    cls_out = out["assigned_class"].astype(str).str.lower()
+    amb_out = (cls_out == "ambiguous")
+    stats["rows_out"] = int(len(out))
+    stats["amb_rows_out"] = int(amb_out.sum())
+    stats["reason"] = "enabled and applied"
+
+    return out, stats
+
 
 
 # ------------------------------
@@ -661,6 +756,17 @@ def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path) -> Tupl
     C_parts: List[pd.DataFrame] = []
     N_parts: List[pd.DataFrame] = []
 
+    filt_tot = {
+        "enabled": False,
+        "chunks": 0,
+        "rows_in": 0,
+        "rows_out": 0,
+        "amb_rows_in": 0,
+        "amb_rows_out": 0,
+        "amb_read_groups_in": 0,
+        "amb_read_groups_dropped": 0,
+    }
+
     try:
         it = pd.read_csv(fp, sep="\t", chunksize=cfg.chunk_rows, low_memory=False)
         for raw in it:
@@ -669,11 +775,26 @@ def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path) -> Tupl
             if df.empty:
                 continue
 
+            df, st = _filter_promiscuous_ambiguous_reads(df, cfg)
+
+            filt_tot["chunks"] += 1
+            filt_tot["enabled"] = filt_tot["enabled"] or bool(st.get("enabled", False))
+            filt_tot["rows_in"] += int(st.get("rows_in", 0))
+            filt_tot["rows_out"] += int(st.get("rows_out", 0))
+            filt_tot["amb_rows_in"] += int(st.get("amb_rows_in", 0))
+            filt_tot["amb_rows_out"] += int(st.get("amb_rows_out", 0))
+            filt_tot["amb_read_groups_in"] += int(st.get("amb_read_groups_in", 0))
+            filt_tot["amb_read_groups_dropped"] += int(st.get("amb_read_groups_dropped", 0))
+
+            if df.empty:
+                continue
+
             Ldf = _compute_read_posteriors(df, cfg)
             C, N = _aggregate_expected_counts_from_chunk(Ldf)
             C_parts.append(C)
             N_parts.append(N)
             _write_L_chunk_to_shards(Ldf, handles, cfg.shards, headers)
+
     finally:
         for h in handles:
             try:
@@ -681,11 +802,26 @@ def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path) -> Tupl
             except Exception:
                 pass
 
+    if filt_tot["enabled"]:
+      amb_in = filt_tot["amb_rows_in"]
+      amb_out = filt_tot["amb_rows_out"]
+      drop_groups = filt_tot["amb_read_groups_dropped"]
+      grp_in = max(filt_tot["amb_read_groups_in"], 1)
+
+      frac_amb_dropped = (amb_in - amb_out) / amb_in if amb_in > 0 else 0.0
+      frac_groups_dropped = drop_groups / grp_in if grp_in > 0 else 0.0
+
+    if drop_groups > 0:
+        typer.echo(
+            f"[max-hits] file={fp.name} ΔAS={cfg.hits_delta_as} max_hits={cfg.max_hits} "
+            f"amb_rows {amb_in:,}->{amb_out:,} (drop {frac_amb_dropped:.1%}) "
+            f"amb_read_groups dropped {drop_groups:,}/{grp_in:,} ({frac_groups_dropped:.1%})"
+        )
+
     if C_parts:
         C_one = pd.concat(C_parts, ignore_index=True).groupby(["barcode", "genome"], observed=True)["C"].sum().reset_index()
     else:
         C_one = pd.DataFrame(columns=["barcode", "genome", "C"])
-
     if N_parts:
         N_one = pd.concat(N_parts, ignore_index=True).groupby("barcode", observed=True)["n_reads"].sum().reset_index()
     else:
@@ -693,13 +829,11 @@ def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path) -> Tupl
 
     return C_one, N_one
 
-
 def _pass1_job(i: int, fp: Path, cfg: MergeConfig, worker_root: Path) -> Tuple[int, pd.DataFrame, pd.DataFrame]:
-    wd = worker_root / f"w{i:03d}"
-    wd.mkdir(parents=True, exist_ok=True)
-    C_one, N_one = _pass1_process_one_file(fp, cfg, wd)
-    return i, C_one, N_one
-
+  wd = worker_root / f"w{i:03d}"
+  wd.mkdir(parents=True, exist_ok=True)
+  C_one, N_one = _pass1_process_one_file(fp, cfg, wd)
+  return i, C_one, N_one
 
 def _merge_worker_shards(worker_dirs: List[Path], out_shard_dir: Path, shards: int) -> None:
     out_shard_dir.mkdir(parents=True, exist_ok=True)
@@ -804,6 +938,14 @@ def genotyping(
     pass1_workers: Optional[int] = typer.Option(None, help="Pass-1 workers."),
     pass2_chunksize: int = typer.Option(200_000, help="Pass-2 shard chunksize."),
     winner_only: bool = typer.Option(True, help="Winner-only mode (default)."),
+    # filter non-informative reads
+    max_hits: Optional[int] = typer.Option(None,
+        help="(Optional) Drop promiscuous reads among assigned_class=ambiguous only. "
+             "Enabled only if BOTH --max-hits and --hits-delta-as are provided. "
+             "A read is dropped if >max-hits genomes fall within (best_AS - hits-delta-as)."),
+    hits_delta_as: Optional[int] = typer.Option(None,
+        help="(Optional) AS window for counting near-top hits for --max-hits filtering. "
+             "Enabled only if BOTH --max-hits and --hits-delta-as are provided."),
     # Fusion
     beta: float = typer.Option(0.5, help="Softmax temperature (probabilistic mode)."),
     w_as: float = typer.Option(0.5, help="Weight for AS (probabilistic mode)."),
@@ -857,6 +999,8 @@ def genotyping(
         eta_iters=_unwrap_optioninfo(eta_iters),
         eta_seed_quantile=_unwrap_optioninfo(eta_seed_quantile),
         topk_genomes=topk_genomes,
+        max_hits=max_hits,
+        hits_delta_as=hits_delta_as,
     )
 
     outdir = outdir.expanduser().resolve()
@@ -1043,7 +1187,6 @@ def genotyping(
         pass
 
     typer.echo("[5/5] Done.")
-
 
 if __name__ == "__main__":
     app()
