@@ -73,7 +73,6 @@ def _cfg_from_inline(
 ) -> Dict[str, object]:
     genomes = _parse_csv_list(genomes_csv)
     bam_paths = [Path(p).expanduser().resolve() for p in _parse_csv_list(bams_csv)]
-
     if len(genomes) != len(bam_paths):
         raise typer.BadParameter(
             f"#genome names ({len(genomes)}) must equal #bams ({len(bam_paths)})."
@@ -83,7 +82,6 @@ def _cfg_from_inline(
     for p in bam_paths:
         if not p.exists():
             raise typer.BadParameter(f"BAM not found: {p}")
-
     return {
         "sample": sample,
         "genomes": {g: str(p) for g, p in zip(genomes, bam_paths)},
@@ -169,7 +167,6 @@ def _load_one_or_many_configs(
     if config is not None:
         return [_load_config(config)]
 
-    # TSV -> build cfgs with defaults supplied by CLI or fall back to safe defaults
     mbf = int(min_barcode_freq) if min_barcode_freq is not None else 10
     csc = int(chunk_size_cells) if chunk_size_cells is not None else 5000
     assert configs is not None
@@ -340,7 +337,6 @@ def filter(
     from .filtering import filter_qc_file
 
     cfgs = _load_one_or_many_configs(config=config, configs=configs, min_barcode_freq=min_barcode_freq)
-
     for cfg in cfgs:
         d = _cfg_dirs(cfg)
         _ensure_dirs(d)
@@ -369,11 +365,7 @@ def filter(
                 futs.append(ex.submit(filter_qc_file, ip, op, minf, sample_for_norm))
             rows = [int(f.result()) for f in as_completed(futs)]
 
-        outputs = {
-            "filtered_dir": str(d["filtered"]),
-            "n_genomes": len(genomes),
-            "rows_per_genome": rows,
-        }
+        outputs = {"filtered_dir": str(d["filtered"]), "n_genomes": len(genomes), "rows_per_genome": rows}
         sp = _write_sentinel(d, step="filter", cfg=cfg, params=params, outputs=outputs)
         typer.echo(f"[filter] done ({cfg['sample']}) sentinel={sp.name}")
 
@@ -389,7 +381,6 @@ def chunks(
     from .chunks import make_barcode_chunks
 
     cfgs = _load_one_or_many_configs(config=config, configs=configs, chunk_size_cells=chunk_size_cells)
-
     for cfg in cfgs:
         d = _cfg_dirs(cfg)
         _ensure_dirs(d)
@@ -402,7 +393,6 @@ def chunks(
             continue
 
         n = make_barcode_chunks(d["filtered"], d["chunks"], str(cfg["sample"]), n_cells)
-
         outputs = {"chunks_dir": str(d["chunks"]), "n_chunks": int(n)}
         sp = _write_sentinel(d, step="chunks", cfg=cfg, params=params, outputs=outputs)
         typer.echo(f"[chunks] {cfg['sample']}: wrote {n} chunk files sentinel={sp.name}")
@@ -429,7 +419,6 @@ def assign(
     from .assign_streaming import learn_edges_parallel, learn_ecdfs_parallel, score_chunk
 
     cfgs = _load_one_or_many_configs(config=config, configs=configs)
-
     for cfg in cfgs:
         d = _cfg_dirs(cfg)
         _ensure_dirs(d)
@@ -464,6 +453,7 @@ def assign(
         threads_eff = max(1, int(threads))
         edges_workers_eff = max(1, min(int(aconf.get("edges_workers", threads_eff)), threads_eff))
         ecdf_workers_eff = max(1, min(int(aconf.get("ecdf_workers", threads_eff)), threads_eff))
+
         edges_max_reads_eff = aconf.get("edges_max_reads", None)
         if edges_max_reads_eff is not None and int(edges_max_reads_eff) <= 0:
             edges_max_reads_eff = None
@@ -492,6 +482,7 @@ def assign(
 
         exp_dir = workdir / sample / "ExplorationReadLevel"
         exp_dir.mkdir(parents=True, exist_ok=True)
+
         edges_npz = exp_dir / "global_edges.npz"
         ecdf_npz = exp_dir / "global_ecdf.npz"
 
@@ -570,6 +561,7 @@ def genotyping(
     assign_glob: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs. If omitted, inferred."),
     outdir: Optional[Path] = typer.Option(None, "--outdir", help="Override output dir (default: <workdir>/<sample>/final)."),
     sample: Optional[str] = typer.Option(None, "--sample", help="Override sample name from config."),
+    # core
     min_reads: Optional[int] = typer.Option(None, "--min-reads"),
     single_mass_min: Optional[float] = typer.Option(None, "--single-mass-min"),
     ratio_top1_top2_min: Optional[float] = typer.Option(None, "--ratio-top1-top2-min"),
@@ -579,11 +571,27 @@ def genotyping(
     chunk_rows: Optional[int] = typer.Option(None, "--chunk-rows"),
     pass2_chunksize: Optional[int] = typer.Option(None, "--pass2-chunksize"),
     winner_only: Optional[bool] = typer.Option(None, "--winner-only/--no-winner-only"),
+    # optional read-filter (NEW)
+    max_hits: Optional[int] = typer.Option(
+        None,
+        "--max-hits",
+        help="(Optional) Drop promiscuous reads among assigned_class=ambiguous only. "
+        "Enabled only if BOTH --max-hits and --hits-delta-as are provided. "
+        "A read is dropped if >max-hits genomes fall within (best_AS - hits-delta-as).",
+    ),
+    hits_delta_as: Optional[int] = typer.Option(
+        None,
+        "--hits-delta-as",
+        help="(Optional) AS window for counting near-top hits for --max-hits filtering. "
+        "Enabled only if BOTH --max-hits and --hits-delta-as are provided.",
+    ),
+    # fusion
     beta: Optional[float] = typer.Option(None, "--beta"),
     w_as: Optional[float] = typer.Option(None, "--w-as"),
     w_mapq: Optional[float] = typer.Option(None, "--w-mapq"),
     w_nm: Optional[float] = typer.Option(None, "--w-nm"),
     ambient_const: Optional[float] = typer.Option(None, "--ambient-const"),
+    # empty gates
     empty_bic_margin: Optional[float] = typer.Option(None, "--empty-bic-margin"),
     empty_top1_max: Optional[float] = typer.Option(None, "--empty-top1-max"),
     empty_ratio12_max: Optional[float] = typer.Option(None, "--empty-ratio12-max"),
@@ -591,9 +599,11 @@ def genotyping(
     empty_seed_bic_min: Optional[float] = typer.Option(None, "--empty-seed-bic-min"),
     empty_tau_quantile: Optional[float] = typer.Option(None, "--empty-tau-quantile"),
     empty_jsd_max: Optional[float] = typer.Option(None, "--empty-jsd-max"),
-    jsd_normalize: Optional[bool] = typer.Option(None, "--jsd-normalize"),
+    jsd_normalize: Optional[bool] = typer.Option(None, "--jsd-normalize/--no-jsd-normalize"),
+    # doublet gates
     bic_margin: Optional[float] = typer.Option(None, "--bic-margin"),
     doublet_minor_min: Optional[float] = typer.Option(None, "--doublet-minor-min"),
+    # ambient iteration
     eta_iters: Optional[int] = typer.Option(None, "--eta-iters"),
     eta_seed_quantile: Optional[float] = typer.Option(None, "--eta-seed-quantile"),
     topk_genomes: Optional[int] = typer.Option(None, "--topk-genomes"),
@@ -637,6 +647,7 @@ def genotyping(
 
     kwargs: Dict[str, object] = {"assign": assign_glob, "outdir": outdir_eff, "sample": sample_eff}
 
+    # core
     if threads is not None:
         kwargs["threads"] = max(1, int(threads))
     if shards is not None:
@@ -647,17 +658,22 @@ def genotyping(
         kwargs["pass2_chunksize"] = max(1, int(pass2_chunksize))
     if winner_only is not None:
         kwargs["winner_only"] = bool(winner_only)
-
     if min_reads is not None:
         kwargs["min_reads"] = max(1, int(min_reads))
     if single_mass_min is not None:
         kwargs["single_mass_min"] = float(single_mass_min)
     if ratio_top1_top2_min is not None:
         kwargs["ratio_top1_top2_min"] = float(ratio_top1_top2_min)
-
     if pass1_workers is not None:
         kwargs["pass1_workers"] = max(1, int(pass1_workers))
 
+    # NEW: optional read-filter passthrough
+    if max_hits is not None:
+        kwargs["max_hits"] = int(max_hits)
+    if hits_delta_as is not None:
+        kwargs["hits_delta_as"] = int(hits_delta_as)
+
+    # fusion / gates
     if beta is not None:
         kwargs["beta"] = float(beta)
     if w_as is not None:
@@ -677,7 +693,6 @@ def genotyping(
         kwargs["empty_ratio12_max"] = float(empty_ratio12_max)
     if empty_reads_max is not None:
         kwargs["empty_reads_max"] = int(empty_reads_max)
-
     if empty_seed_bic_min is not None:
         kwargs["empty_seed_bic_min"] = float(empty_seed_bic_min)
     if empty_tau_quantile is not None:
@@ -699,7 +714,7 @@ def genotyping(
     if topk_genomes is not None:
         kwargs["topk_genomes"] = max(1, int(topk_genomes))
 
-    # Sentinel for genotyping keyed by the actual kwargs (except outdir path is included as string)
+    # Sentinel for genotyping keyed by actual kwargs (Paths stringified)
     params = {k: (str(v) if isinstance(v, Path) else v) for k, v in kwargs.items()}
     if resume and _has_sentinel(d, "genotyping", cfg, params):
         typer.echo(f"[genotyping] skip (sentinel): {sample_eff}")
@@ -800,7 +815,10 @@ def run(
     genotyping_empty_seed_bic_min: Optional[float] = typer.Option(None, "--genotyping-empty-seed-bic-min"),
     genotyping_empty_tau_quantile: Optional[float] = typer.Option(None, "--genotyping-empty-tau-quantile"),
     genotyping_empty_jsd_max: Optional[float] = typer.Option(None, "--genotyping-empty-jsd-max"),
-    genotyping_jsd_normalize: Optional[bool] = typer.Option(None, "--genotyping-jsd-normalize"),
+    genotyping_jsd_normalize: Optional[bool] = typer.Option(None, "--genotyping-jsd-normalize/--no-genotyping-jsd-normalize"),
+    # NEW: pass through max-hits filter to genotyping.py
+    genotyping_max_hits: Optional[int] = typer.Option(None, "--genotyping-max-hits"),
+    genotyping_hits_delta_as: Optional[int] = typer.Option(None, "--genotyping-hits-delta-as"),
 ) -> None:
     """Run the full pipeline."""
     inline_ready = all([sample, genome, bam, workdir])
@@ -844,6 +862,9 @@ def run(
         ("empty_tau_quantile", genotyping_empty_tau_quantile),
         ("empty_jsd_max", genotyping_empty_jsd_max),
         ("jsd_normalize", genotyping_jsd_normalize),
+        # NEW
+        ("max_hits", genotyping_max_hits),
+        ("hits_delta_as", genotyping_hits_delta_as),
     ]:
         if v2 is not None:
             genotyping_conf[k2] = v2
@@ -905,7 +926,6 @@ def run(
     if not batch:
         typer.echo("[run] no configs found in TSV")
         return
-
     for cfg in batch:
         typer.echo(f"[run] starting {cfg['sample']}")
         _ensure_minimal_chunk(Path(str(cfg["workdir"])), str(cfg["sample"]))
@@ -914,3 +934,4 @@ def run(
 
 if __name__ == "__main__":
     app()
+
