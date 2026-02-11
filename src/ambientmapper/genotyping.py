@@ -145,7 +145,7 @@ def _coerce_assign_schema(df: pd.DataFrame) -> pd.DataFrame:
         max_val = out[pcol].max(skipna=True)
         if max_val and max_val > 1.0:
           out[pcol] = out[pcol] / 10.0
-  return out
+    return out
 
 
 def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
