@@ -1564,12 +1564,20 @@ def assign_streaming_pipeline(
 ):
     edges_path = Path(workdir) / sample / "ExplorationReadLevel" / "global_edges.npz"
     ecdf_path = Path(workdir) / sample / "ExplorationReadLevel" / "global_ecdf.npz"
-    learn_edges(
+    if not edges_npz.exists():
+        learn_edges(
         workdir, sample, chunks_dir, edges_path, mapq_min, xa_max, chunksize, k
-    )  # type: ignore
-    learn_ecdfs(
-        workdir, sample, chunks_dir, edges_path, ecdf_path, mapq_min, xa_max, chunksize
-    )  # type: ignore
+        )  # type: ignore
+    else:
+        typer.echo(f"[assign] reuse existing edges model: {edges_npz}")
+
+    if not ecdf_npz.exists():
+        learn_ecdfs(
+            workdir, sample, chunks_dir, edges_path, ecdf_path, mapq_min, xa_max, chunksize
+        )  # type: ignore
+    else:
+        typer.echo(f"[assign] reuse existing ECDF model: {ecdf_npz}")
+        
     for chunk_file in sorted(Path(chunks_dir).glob("*_cell_map_ref_chunk_*.txt")):
         score_chunk(
             workdir,
