@@ -522,7 +522,9 @@ def assign(
             workers=ecdf_workers_eff,
         )
 
-        pool_n = min(threads_eff, len(chunk_files))
+        threads_eff = int(threads) if threads is not None else 2
+        pool_n = max(1, min(score_workers_eff, 2))  # for local-friendly default cap
+        
         typer.echo(f"[assign/score] {sample}: start {len(chunk_files)} chunks, procs={pool_n}")
 
         with ProcessPoolExecutor(max_workers=pool_n) as ex:
