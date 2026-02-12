@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-assign_streaming_v2.py
+assign_streaming.py
 
 A memory- and IO-aware "assign" implementation for AmbientMapper-like workflows.
 
@@ -534,7 +534,7 @@ def _ecdf_chunk_worker(
 # Pass A: learn edges (batched parallel)
 # -----------------------------
 @app.command()
-def learn_edges_v2(
+def learn_edges(
     workdir: Path = typer.Option(..., "--workdir"),
     sample: str = typer.Option(..., "--sample"),
     chunks_dir: Path = typer.Option(..., "--chunks-dir"),
@@ -624,7 +624,7 @@ def learn_edges_v2(
 # Pass B: learn ECDFs (per-chunk parallel map-reduce)
 # -----------------------------
 @app.command()
-def learn_ecdfs_v2(
+def learn_ecdfs(
     workdir: Path = typer.Option(..., "--workdir"),
     sample: str = typer.Option(..., "--sample"),
     chunks_dir: Path = typer.Option(..., "--chunks-dir"),
@@ -752,7 +752,7 @@ def _load_ecdf_model(path: Path):
 # Pass C: score one chunk (single-pass + streaming output)
 # -----------------------------
 @app.command()
-def score_chunk_v2(
+def score_chunk(
     workdir: Path = typer.Option(..., "--workdir"),
     sample: str = typer.Option(..., "--sample"),
     chunk_file: Path = typer.Option(..., "--chunk-file"),
@@ -968,7 +968,7 @@ def score_chunk_v2(
 # Convenience pipeline: edges -> ecdfs -> score all chunks
 # -----------------------------
 @app.command()
-def assign_streaming_pipeline_v2(
+def assign_streaming_pipeline(
     workdir: Path = typer.Option(..., "--workdir"),
     sample: str = typer.Option(..., "--sample"),
     chunks_dir: Path = typer.Option(..., "--chunks-dir"),
@@ -995,7 +995,7 @@ def assign_streaming_pipeline_v2(
 
     if not edges_path.exists():
         _log(f"[assign] learn edges → {edges_path}", verbose)
-        learn_edges_v2(  # type: ignore
+        learn_edges(  # type: ignore
             workdir=workdir,
             sample=sample,
             chunks_dir=chunks_dir,
@@ -1014,7 +1014,7 @@ def assign_streaming_pipeline_v2(
 
     if not ecdf_path.exists():
         _log(f"[assign] learn ECDFs → {ecdf_path}", verbose)
-        learn_ecdfs_v2(  # type: ignore
+        learn_ecdfs(  # type: ignore
             workdir=workdir,
             sample=sample,
             chunks_dir=chunks_dir,
@@ -1036,7 +1036,7 @@ def assign_streaming_pipeline_v2(
     _log(f"[assign/score] scoring {len(chunk_files)} chunks (serial). For parallel, run score-chunk-v2 in SLURM array.", verbose)
 
     for ch in chunk_files:
-        score_chunk_v2(  # type: ignore
+        score_chunk(  # type: ignore
             workdir=workdir,
             sample=sample,
             chunk_file=ch,
