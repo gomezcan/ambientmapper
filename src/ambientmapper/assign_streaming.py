@@ -1,55 +1,104 @@
-# src/ambientmapper/assign_streaming.py
+#!/usr/bin/env python3
+"""
+assign_streaming_v2.py
+
+A memory- and IO-aware "assign" implementation for AmbientMapper-like workflows.
+
+Design goals
+------------
+- Keep per-(Read,BC) accumulator lightweight (dataclass with slots)
+- Avoid nested dict-of-dict-of-sets patterns
+- Use stable dtypes (string/float32) and avoid repeated astype(str)
+- Parallelize at a safe granularity (batch of chunk files per worker)
+- Avoid nested parallelism (common source of BrokenProcessPool/OOM)
+- Provide:
+    Pass A: learn global AS/MAPQ decile edges from winner distributions
+    Pass B: learn per-decile ΔAS / ΔMAPQ tail ECDFs (stored as hist counts)
+    Pass C: score chunks, producing:
+        - raw per-read summary table (winner, runner-up, deltas, p-values)
+        - filtered per-read/per-genome table (keeps winner rows + ambiguous rows)
+
+Notes / assumptions
+-------------------
+- Input genome-mapping files live under: {workdir}/{sample}/filtered_QCFiles/
+  matching: filtered_*_QCMapping.txt
+- Chunk files are barcode lists (one barcode per line), matching:
+  *_cell_map_ref_chunk_*.txt
+
+- We assume the filtered mapping files are TAB-separated with header and columns:
+  Read, BC, MAPQ, AS, NM, XAcount
+
+- "Winner" ranking is: NM asc, then AS desc, then MAPQ desc.
+- "Ambiguity" is assessed using empirical tail probabilities of ΔAS and ΔMAPQ
+  within deciles of winner AS/MAPQ:
+    p_as = P(ΔAS >= observed | winner-AS decile)
+    p_mq = P(ΔMQ >= observed | winner-MAPQ decile)
+  Then a read is called:
+    winner if (p_as <= alpha) OR (p_mq <= alpha) OR (runner-up absent) OR (ΔNM > 0)
+    ambiguous otherwise
+
+Performance knobs
+-----------------
+- --chunksize: pandas read_csv chunk size for genome files (rows per chunk)
+- --batch-size: number of chunk files handled per worker in batched passes
+- --workers: number of worker processes for batched passes
+- --max-reads-per-genome: optional cap during model learning for speed
+
+Outputs
+-------
+Models saved to:
+  {workdir}/{sample}/ExplorationReadLevel/global_edges.npz
+  {workdir}/{sample}/ExplorationReadLevel/global_ecdf.npz
+
+Scored chunk outputs to:
+  {workdir}/{sample}/raw_cell_map_ref_chunks/{sample}_chunk{N}_raw.tsv.gz
+  {workdir}/{sample}/cell_map_ref_chunks/{sample}_chunk{N}_filtered.tsv.gz
+"""
+
 from __future__ import annotations
 
+import math
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple, Optional
-import typing as T
 from threading import Lock
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Optional, Iterable, Tuple
 
 import numpy as np
 import pandas as pd
 import typer
-import math
 
 app = typer.Typer(add_completion=False)
 
-__all__ = [
-    "learn_edges",
-    "learn_ecdfs",
-    "score_chunk",
-    "assign_streaming_pipeline",
-    "learn_edges_parallel",
-    "learn_ecdfs_parallel",
-    "learn_ecdf_from_scores_parallel",
-    "learn_ecdfs_batched",
-]
-
-# ---------- logging helpers ----------
+# -----------------------------
+# Logging helpers
+# -----------------------------
 _LOG_LOCK = Lock()
 
 
-def _log(msg: str, verbose: bool):
+def _log(msg: str, verbose: bool) -> None:
     if not verbose:
         return
     with _LOG_LOCK:
         typer.echo(msg)
 
 
-def _log_ok(msg: str, verbose: bool):
+def _log_ok(msg: str, verbose: bool) -> None:
     if not verbose:
         return
     with _LOG_LOCK:
         typer.secho(msg, fg="green")
 
 
-def _log_err(msg: str, verbose: bool):
+def _log_err(msg: str, verbose: bool) -> None:
     with _LOG_LOCK:
         typer.secho(msg, fg="red")
 
 
-# ---------- small utils ----------
+# -----------------------------
+# Small utils
+# -----------------------------
 def _chunk_bcs(chunk_file: Path) -> set[str]:
     with open(chunk_file, "r") as f:
         return {ln.strip() for ln in f if ln.strip()}
@@ -62,61 +111,36 @@ def _genome_from_filename(p: Path) -> str:
     return n
 
 
-def _key_tuple(genome: str, AS: float, MAPQ: float, NM: float) -> tuple:
-    # comparator key: lower is better
-    # Prefer lower NM, then higher AS, then higher MAPQ
-    return (NM, -AS, -MAPQ, genome)
+def _filtered_files(workdir: Path, sample: str) -> list[Path]:
+    d = Path(workdir) / sample / "filtered_QCFiles"
+    if not d.exists():
+        raise FileNotFoundError(f"Not found: {d}")
+    files = sorted(d.glob("filtered_*_QCMapping.txt"))
+    if not files:
+        raise FileNotFoundError(f"No filtered_* files under {d}")
+    return files
 
 
-def _pick_best_two_and_worst(
-    acc: dict, genome: str, AS: float, MAPQ: float, NM: float, XA: float
-):
-    # track per-genome collapsed scores: AS=max, MAPQ=max, NM=min
-    per_g = acc.setdefault("per_g", {})
-    gentry = per_g.get(genome)
-    if gentry is None:
-        per_g[genome] = {"AS": AS, "MAPQ": MAPQ, "NM": NM}
-    else:
-        if AS > gentry["AS"]:
-            gentry["AS"] = AS
-        if MAPQ > gentry["MAPQ"]:
-            gentry["MAPQ"] = MAPQ
-        if NM < gentry["NM"]:
-            gentry["NM"] = NM
-
-    # alignment-level best1 / best2 / worst (uses NM-first key)
-    cand = {"g": genome, "AS": AS, "MAPQ": MAPQ, "NM": NM, "XA": XA}
-    cand["key"] = _key_tuple(genome, AS, MAPQ, NM)
-    if acc.get("best1") is None:
-        acc["best1"] = cand
-        acc["worst"] = cand
-        acc.setdefault("seen_g", set()).add(genome)
-        return
-    acc.setdefault("seen_g", set()).add(genome)
-    if cand["key"] > acc["worst"]["key"]:
-        acc["worst"] = cand
-    if cand["key"] < acc["best1"]["key"]:
-        acc["best2"] = acc["best1"]
-        acc["best1"] = cand
-    else:
-        b2 = acc.get("best2")
-        if b2 is None or cand["key"] < b2["key"]:
-            acc["best2"] = cand
-
-
-# ---------- fixed histogram specs (shared across workers) ----------
-_AS_RANGE = (0.0, 200.0, 2000)  # lo, hi, nbins
-_MQ_RANGE = (0.0, 60.0, 120)
-
-
+# -----------------------------
+# Histogram + tail-prob model
+# -----------------------------
 class DeltaHist:
-    def __init__(self, lo=0.0, hi=100.0, nbins=200):
-        self.lo, self.hi, self.nbins = float(lo), float(hi), int(nbins)
-        self.edges = np.linspace(self.lo, self.hi, self.nbins + 1)
+    """
+    Fixed-bin histogram with overflow bucket and tail-prob query.
+    tail_p(x) = P(X >= x) under the empirical distribution.
+    """
+
+    __slots__ = ("lo", "hi", "nbins", "edges", "counts", "overflow")
+
+    def __init__(self, lo: float, hi: float, nbins: int):
+        self.lo = float(lo)
+        self.hi = float(hi)
+        self.nbins = int(nbins)
+        self.edges = np.linspace(self.lo, self.hi, self.nbins + 1, dtype=np.float64)
         self.counts = np.zeros(self.nbins, dtype=np.int64)
         self.overflow = 0
 
-    def add(self, x: float):
+    def add(self, x: float) -> None:
         if not np.isfinite(x):
             return
         if x >= self.hi:
@@ -126,7 +150,10 @@ class DeltaHist:
             idx = 0
         else:
             idx = int((x - self.lo) / (self.hi - self.lo) * self.nbins)
-            idx = min(max(idx, 0), self.nbins - 1)
+            if idx < 0:
+                idx = 0
+            elif idx >= self.nbins:
+                idx = self.nbins - 1
         self.counts[idx] += 1
 
     def tail_p(self, x: float) -> float:
@@ -140,878 +167,542 @@ class DeltaHist:
         if x <= self.lo:
             return 1.0
         idx = int((x - self.lo) / (self.hi - self.lo) * self.nbins)
-        idx = min(max(idx, 0), self.nbins - 1)
+        if idx < 0:
+            idx = 0
+        elif idx >= self.nbins:
+            idx = self.nbins - 1
         tail = int(self.counts[idx:].sum() + self.overflow)
         return tail / total
 
 
-def _new_hist_from_spec(spec: tuple[float, float, int]) -> DeltaHist:
+# winner hist specs
+_AS_RANGE = (0.0, 200.0, 2000)  # lo, hi, nbins
+_MQ_RANGE = (0.0, 60.0, 120)
+
+# delta hist specs
+_DAS_RANGE = (0.0, 100.0, 200)
+_DMQ_RANGE = (0.0, 60.0, 120)
+
+
+def _new_hist(spec: tuple[float, float, int]) -> DeltaHist:
     lo, hi, nb = spec
-    return DeltaHist(lo=lo, hi=hi, nbins=nb)
+    return DeltaHist(lo, hi, nb)
 
 
-# ---------- IO helpers ----------
-def _filtered_files(workdir: Path, sample: str) -> list[Path]:
-    d = Path(workdir) / sample / "filtered_QCFiles"
-    if not d.exists():
-        raise FileNotFoundError(f"Not found: {d}")
-    files = sorted(d.glob("filtered_*_QCMapping.txt"))
-    if not files:
-        raise FileNotFoundError(f"No filtered_* files under {d}")
-    return files
+def edges_from_hist_counts(counts: np.ndarray, lo: float, hi: float, k: int) -> np.ndarray:
+    """
+    Given histogram counts over [lo,hi] with len(counts)=nbins,
+    compute k-1 quantile cutpoints (decile edges when k=10).
+    """
+    counts = counts.astype(np.int64, copy=False)
+    if counts.sum() == 0:
+        return np.array([], dtype=np.float64)
+
+    nbins = counts.shape[0]
+    edges = np.linspace(lo, hi, nbins + 1, dtype=np.float64)
+    cum = np.cumsum(counts)
+    tot = int(cum[-1])
+    targets = (np.linspace(0, 1, k + 1)[1:-1] * tot).astype(np.int64)
+
+    out: list[float] = []
+    for t in targets:
+        idx = int(np.searchsorted(cum, t, side="left"))
+        if idx < 0:
+            idx = 0
+        elif idx >= nbins:
+            idx = nbins - 1
+        out.append(edges[idx])
+    return np.unique(np.array(out, dtype=np.float64))
 
 
-def _iter_read_bc_rows(
-    fp: Path, bcs: set[str], chunksize: Optional[int], mapq_min: int, xa_max: int
-):
+def assign_decile_scalar(v: float, edges: np.ndarray) -> int:
+    """
+    Return 1..k where k=len(edges)+1. If edges empty => 1.
+    """
+    if edges.size == 0 or not np.isfinite(v):
+        return 1
+    # np.digitize returns 0..len(edges)
+    return int(np.digitize([v], bins=edges, right=True)[0] + 1)
+
+
+# -----------------------------
+# Lightweight per-(Read,BC) accumulator
+# -----------------------------
+@dataclass(slots=True)
+class ReadAcc:
+    best1_g: Optional[str] = None
+    best1_as: float = -np.inf
+    best1_mq: float = -np.inf
+    best1_nm: float = np.inf
+
+    best2_g: Optional[str] = None
+    best2_as: float = -np.inf
+    best2_mq: float = -np.inf
+    best2_nm: float = np.inf
+
+    worst_g: Optional[str] = None
+    worst_as: float = -np.inf
+    worst_mq: float = -np.inf
+    worst_nm: float = np.inf
+
+    n_genomes: int = 0
+
+
+def _better(nm1: float, as1: float, mq1: float, nm2: float, as2: float, mq2: float) -> bool:
+    # NM asc, AS desc, MAPQ desc
+    if nm1 != nm2:
+        return nm1 < nm2
+    if as1 != as2:
+        return as1 > as2
+    return mq1 > mq2
+
+
+def update_acc(acc: ReadAcc, genome: str, AS: float, MAPQ: float, NM: float) -> None:
+    acc.n_genomes += 1
+
+    if acc.best1_g is None:
+        acc.best1_g = genome
+        acc.best1_as = AS
+        acc.best1_mq = MAPQ
+        acc.best1_nm = NM
+
+        acc.worst_g = genome
+        acc.worst_as = AS
+        acc.worst_mq = MAPQ
+        acc.worst_nm = NM
+        return
+
+    # worst (keep "worst" as the *least good* alignment by the same comparator, i.e., inverse of _better)
+    # If current is not better than stored worst, update worst.
+    if not _better(NM, AS, MAPQ, acc.worst_nm, acc.worst_as, acc.worst_mq):
+        acc.worst_g = genome
+        acc.worst_as = AS
+        acc.worst_mq = MAPQ
+        acc.worst_nm = NM
+
+    # best1 / best2
+    if _better(NM, AS, MAPQ, acc.best1_nm, acc.best1_as, acc.best1_mq):
+        acc.best2_g = acc.best1_g
+        acc.best2_as = acc.best1_as
+        acc.best2_mq = acc.best1_mq
+        acc.best2_nm = acc.best1_nm
+
+        acc.best1_g = genome
+        acc.best1_as = AS
+        acc.best1_mq = MAPQ
+        acc.best1_nm = NM
+    else:
+        if acc.best2_g is None or _better(NM, AS, MAPQ, acc.best2_nm, acc.best2_as, acc.best2_mq):
+            acc.best2_g = genome
+            acc.best2_as = AS
+            acc.best2_mq = MAPQ
+            acc.best2_nm = NM
+
+
+# -----------------------------
+# Streaming row iterator
+# -----------------------------
+def _iter_rows(
+    fp: Path,
+    bcs: set[str],
+    chunksize: int,
+    mapq_min: int,
+    xa_max: int,
+    max_rows_for_genome: Optional[int] = None,
+) -> Iterable[Tuple[str, str, float, float, float]]:
+    """
+    Yield (Read, BC, AS, MAPQ, NM) for rows passing filters.
+    Uses stable dtypes (string/float32) to reduce memory.
+    """
     usecols = ["Read", "BC", "MAPQ", "AS", "NM", "XAcount"]
-    for c in pd.read_csv(
+    seen = 0
+
+    for df in pd.read_csv(
         fp,
         sep="\t",
-        header=0,
         usecols=usecols,
         chunksize=chunksize,
-        dtype={"Read": "string", "BC": "string"},
+        dtype={
+            "Read": "string",
+            "BC": "string",
+            "AS": "float32",
+            "MAPQ": "float32",
+            "NM": "float32",
+            "XAcount": "float32",
+        },
         engine="c",
         low_memory=True,
         memory_map=False,
     ):
-        c = c[c["BC"].astype(str).isin(bcs)]
-        if c.empty:
+        if max_rows_for_genome is not None and seen >= max_rows_for_genome:
+            break
+
+        df = df[df["BC"].isin(bcs)]
+        if df.empty:
             continue
-        for col in ("AS", "MAPQ", "NM", "XAcount"):
-            c[col] = pd.to_numeric(c[col], errors="coerce")
+
         if mapq_min > 0:
-            c = c[c["MAPQ"].fillna(0) >= mapq_min]
+            df = df[df["MAPQ"] >= mapq_min]
         if xa_max >= 0:
-            c = c[c["XAcount"].fillna(0) <= xa_max]
-        if c.empty:
+            df = df[df["XAcount"] <= xa_max]
+        if df.empty:
             continue
-        c = c.drop_duplicates(subset=["Read", "BC"], keep="first")
-        yield c.itertuples(index=False)
+
+        # dedup within chunk
+        if df.duplicated(subset=["Read", "BC"]).any():
+            df = df.drop_duplicates(subset=["Read", "BC"], keep="first")
+
+        if max_rows_for_genome is not None:
+            remaining = max_rows_for_genome - seen
+            if remaining <= 0:
+                break
+            if len(df) > remaining:
+                df = df.iloc[:remaining]
+
+        seen += len(df)
+
+        # itertuples gives python scalars; string dtype yields python str
+        for r in df.itertuples(index=False):
+            # r.Read, r.BC are pandas String scalars => convert to str once
+            yield (str(r.Read), str(r.BC), float(r.AS), float(r.MAPQ), float(r.NM))
 
 
-# ---------- decile helpers ----------
-def compute_decile_edges(values: np.ndarray, k: int = 10) -> np.ndarray:
-    vals = np.asarray(values, dtype=float)
-    vals = vals[np.isfinite(vals)]
-    if vals.size == 0:
-        return np.array([])
-    qs = np.linspace(0, 1, k + 1)
-    edges = np.quantile(vals, qs[1:-1])
-    return np.unique(edges)
-
-
-def assign_decile(v: np.ndarray, edges: np.ndarray) -> np.ndarray:
-    if edges.size == 0:
-        return np.full_like(v, np.nan, dtype=float)
-    return (np.digitize(v, bins=edges, right=True) + 1).astype(float)
-
-
-def edges_from_hist(H: DeltaHist, k: int) -> np.ndarray:
-    counts = H.counts.astype(np.int64)
-    if counts.sum() == 0:
-        return np.array([])
-    cum = np.cumsum(counts)
-    tot = int(cum[-1] + H.overflow)
-    targets = (np.linspace(0, 1, k + 1)[1:-1] * tot).astype(int)
-    edges = []
-    for t in targets:
-        idx = int(np.searchsorted(cum, t, side="left"))
-        idx = min(max(idx, 0), H.nbins - 1)
-        edges.append(H.edges[idx])
-    return np.unique(np.array(edges, dtype=float))
-
-
-def _edges_from_hist_counts(
-    as_counts: np.ndarray, mq_counts: np.ndarray, k: int
-) -> tuple[np.ndarray, np.ndarray]:
-    H_AS = _new_hist_from_spec(_AS_RANGE)
-    H_AS.counts = as_counts.copy()
-    H_MQ = _new_hist_from_spec(_MQ_RANGE)
-    H_MQ.counts = mq_counts.copy()
-    return edges_from_hist(H_AS, k), edges_from_hist(H_MQ, k)
-
-
-def _ecdf_chunk_worker(args):
-    (
-        workdir,
-        sample,
-        chf,
-        as_edges,
-        mq_edges,
-        k,
-        mapq_min,
-        xa_max,
-        chunksize,
-        verbose,
-    ) = args
-    return _map_delta_hists_for_chunk(
-        workdir,
-        sample,
-        chf,
-        as_edges,
-        mq_edges,
-        k,
-        mapq_min,
-        xa_max,
-        chunksize,
-        verbose=verbose,
-    )
-
-
-# ---------- map workers ----------
-def _map_winner_hist_for_chunk(
-    workdir: Path,
-    sample: str,
-    chunk_file: Path,
-    mapq_min: int,
-    xa_max: int,
-    chunksize: Optional[int],
-    verbose: bool = True,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return (AS_winner_counts, MAPQ_winner_counts) hist counts for this chunk."""
-    files = _filtered_files(workdir, sample)
-    bcs = _chunk_bcs(chunk_file)
-    H_AS = _new_hist_from_spec(_AS_RANGE)
-    H_MQ = _new_hist_from_spec(_MQ_RANGE)
-
-    rb_map: Dict[tuple[str, str], dict] = {}
-
-    t0 = time.time()
-    last_log = t0
-    genomes_done = 0
-    reads_kept = 0
-
-    _log(f"[edges-map] ▶ start {chunk_file.name}  BCs={len(bcs)}", verbose)
-    for fp in files:
-        genome = _genome_from_filename(fp)
-        per_file_reads = 0
-        per_file_kept = 0
-        for i, rows in enumerate(
-            _iter_read_bc_rows(fp, bcs, chunksize, mapq_min, xa_max), start=1
-        ):
-            for row in rows:
-                key = (str(row.Read), str(row.BC))
-                acc = rb_map.get(key) or {
-                    "best1": None,
-                    "best2": None,
-                    "worst": None,
-                    "seen_g": set(),
-                }
-                _pick_best_two_and_worst(
-                    acc,
-                    genome,
-                    AS=float(row.AS) if pd.notna(row.AS) else float("-inf"),
-                    MAPQ=float(row.MAPQ) if pd.notna(row.MAPQ) else float("-inf"),
-                    NM=float(row.NM) if pd.notna(row.NM) else float("inf"),
-                    XA=float(row.XAcount) if pd.notna(row.XAcount) else float("inf"),
-                )
-                rb_map[key] = acc
-                per_file_reads += 1
-                per_file_kept += 1
-
-            now = time.time()
-            if verbose and (now - last_log > 30 or i % 50 == 0):
-                _log(
-                    f"[edges-map] … {chunk_file.name} + {fp.name}  chunks={i}  kept≈{per_file_kept:,}",
-                    verbose,
-                )
-                last_log = now
-
-        genomes_done += 1
-        reads_kept += per_file_kept
-        _log(
-            f"[edges-map] ✓ {chunk_file.name} + {fp.name}  kept={per_file_kept:,}",
-            verbose,
-        )
-
-    # finalize hist fill
-    for acc in rb_map.values():
-        b1 = acc["best1"]
-        if b1 is None:
-            continue
-        H_AS.add(b1["AS"])
-        H_MQ.add(b1["MAPQ"])
-
-    dt = time.time() - t0
-    _log_ok(
-        f"[edges-map] ■ done {chunk_file.name}  genomes={genomes_done}  winners={len(rb_map):,}  kept≈{reads_kept:,}  {dt:0.1f}s",
-        verbose,
-    )
-    return H_AS.counts, H_MQ.counts
-
-
-def _map_delta_hists_for_chunk(
-    workdir: Path,
-    sample: str,
-    chunk_file: Path,
-    as_edges: np.ndarray,
-    mq_edges: np.ndarray,
-    k: int,
+# -----------------------------
+# Worker: learn winner hist counts for a batch of chunk files
+# -----------------------------
+def _edges_batch_worker(
+    bi: int,
+    chunk_files: list[str],
+    genome_files: list[str],
     mapq_min: int,
     xa_max: int,
     chunksize: int,
-    verbose: bool = True,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Return stacked counts for ΔAS and ΔMAPQ per decile.
-      dAS_counts: (k, nbins_AS), dAS_over: (k,)
-      dMQ_counts: (k, nbins_MQ), dMQ_over: (k,)
-    """
-    files = _filtered_files(workdir, sample)
-    bcs = _chunk_bcs(chunk_file)
-    H_dAS = [_new_hist_from_spec((0.0, 100.0, 200)) for _ in range(k)]
-    H_dMQ = [_new_hist_from_spec((0.0, 60.0, 120)) for _ in range(k)]
-    rb_map: Dict[tuple[str, str], dict] = {}
+    lo_as: float,
+    hi_as: float,
+    nb_as: int,
+    lo_mq: float,
+    hi_mq: float,
+    nb_mq: int,
+    max_reads_per_genome: Optional[int],
+    verbose: bool,
+) -> tuple[int, np.ndarray, np.ndarray, int]:
+    chunk_paths = [Path(x) for x in chunk_files]
+    files = [Path(x) for x in genome_files]
 
-    t0 = time.time()
-    last_log = t0
-    _log(f"[ecdf-map] ▶ start {chunk_file.name}  BCs={len(bcs)}", verbose)
+    # Build BC -> chunk routing
+    bc_to_chunk: dict[str, int] = {}
+    per_chunk_acc: list[dict[tuple[str, str], ReadAcc]] = [dict() for _ in chunk_paths]
+
+    for i, ch in enumerate(chunk_paths):
+        for bc in _chunk_bcs(ch):
+            bc_to_chunk[bc] = i
+
+    batch_bcs = set(bc_to_chunk.keys())
+    if verbose:
+        _log(f"[assign/edges] ▶ batch {bi} chunks={len(chunk_paths)} BCs={len(batch_bcs):,}", True)
+
+    # Stream each genome file once
+    for fp in files:
+        genome = _genome_from_filename(fp)
+        kept = 0
+        for read, bc, AS, MQ, NM in _iter_rows(
+            fp, batch_bcs, chunksize, mapq_min, xa_max, max_rows_for_genome=max_reads_per_genome
+        ):
+            idx = bc_to_chunk.get(bc)
+            if idx is None:
+                continue
+            rb = per_chunk_acc[idx]
+            key = (read, bc)
+            acc = rb.get(key)
+            if acc is None:
+                acc = ReadAcc()
+                rb[key] = acc
+            update_acc(acc, genome, AS, MQ, NM)
+            kept += 1
+        if verbose:
+            _log(f"[assign/edges]    ✓ genome {genome} kept≈{kept:,}", True)
+
+    # Reduce winners -> hist counts
+    as_counts = np.zeros(nb_as, dtype=np.int64)
+    mq_counts = np.zeros(nb_mq, dtype=np.int64)
+
+    scale_as = hi_as - lo_as
+    scale_mq = hi_mq - lo_mq
+
+    winners = 0
+    for rb in per_chunk_acc:
+        for acc in rb.values():
+            if acc.best1_g is None:
+                continue
+            asv = acc.best1_as
+            mqv = acc.best1_mq
+
+            if np.isfinite(asv):
+                if asv <= lo_as:
+                    idx_as = 0
+                elif asv >= hi_as:
+                    idx_as = nb_as - 1
+                else:
+                    idx_as = int((asv - lo_as) / scale_as * nb_as)
+                    if idx_as < 0:
+                        idx_as = 0
+                    elif idx_as >= nb_as:
+                        idx_as = nb_as - 1
+                as_counts[idx_as] += 1
+
+            if np.isfinite(mqv):
+                if mqv <= lo_mq:
+                    idx_mq = 0
+                elif mqv >= hi_mq:
+                    idx_mq = nb_mq - 1
+                else:
+                    idx_mq = int((mqv - lo_mq) / scale_mq * nb_mq)
+                    if idx_mq < 0:
+                        idx_mq = 0
+                    elif idx_mq >= nb_mq:
+                        idx_mq = nb_mq - 1
+                mq_counts[idx_mq] += 1
+
+            winners += 1
+
+    return bi, as_counts, mq_counts, winners
+
+
+# -----------------------------
+# Worker: learn Δ hist counts for a single chunk (safe parallel unit)
+# -----------------------------
+def _ecdf_chunk_worker(
+    chunk_file: str,
+    genome_files: list[str],
+    mapq_min: int,
+    xa_max: int,
+    chunksize: int,
+    as_edges: np.ndarray,
+    mq_edges: np.ndarray,
+    k: int,
+    verbose: bool,
+) -> tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    ch = Path(chunk_file)
+    files = [Path(x) for x in genome_files]
+    bcs = _chunk_bcs(ch)
+
+    H_dAS = [_new_hist(_DAS_RANGE) for _ in range(k)]
+    H_dMQ = [_new_hist(_DMQ_RANGE) for _ in range(k)]
+
+    rb_map: dict[tuple[str, str], ReadAcc] = {}
+
+    if verbose:
+        _log(f"[assign/ecdf] ▶ map {ch.name} BCs={len(bcs):,}", True)
 
     for fp in files:
         genome = _genome_from_filename(fp)
-        per_file_kept = 0
-        for i, rows in enumerate(
-            _iter_read_bc_rows(fp, bcs, chunksize, mapq_min, xa_max), start=1
-        ):
-            for row in rows:
-                key = (str(row.Read), str(row.BC))
-                acc = rb_map.get(key) or {
-                    "best1": None,
-                    "best2": None,
-                    "worst": None,
-                    "seen_g": set(),
-                }
-                _pick_best_two_and_worst(
-                    acc,
-                    genome,
-                    AS=float(row.AS) if pd.notna(row.AS) else float("-inf"),
-                    MAPQ=float(row.MAPQ) if pd.notna(row.MAPQ) else float("-inf"),
-                    NM=float(row.NM) if pd.notna(row.NM) else float("inf"),
-                    XA=float(row.XAcount) if pd.notna(row.XAcount) else float("inf"),
-                )
+        for read, bc, AS, MQ, NM in _iter_rows(fp, bcs, chunksize, mapq_min, xa_max):
+            key = (read, bc)
+            acc = rb_map.get(key)
+            if acc is None:
+                acc = ReadAcc()
                 rb_map[key] = acc
-                per_file_kept += 1
+            update_acc(acc, genome, AS, MQ, NM)
 
-            now = time.time()
-            if verbose and (now - last_log > 30 or i % 50 == 0):
-                _log(
-                    f"[ecdf-map] … {chunk_file.name} + {fp.name}  chunks={i}  kept≈{per_file_kept:,}",
-                    verbose,
-                )
-                last_log = now
-
-        _log(
-            f"[ecdf-map] ✓ {chunk_file.name} + {fp.name}  kept={per_file_kept:,}",
-            verbose,
-        )
-
-    # fill histograms
     pairs = 0
     for acc in rb_map.values():
-        b1, b2 = acc["best1"], acc.get("best2")
-        if b1 is None or b2 is None:
+        if acc.best1_g is None or acc.best2_g is None:
             continue
-        dAS = b1["AS"] - b2["AS"]
-        dMQ = b1["MAPQ"] - b2["MAPQ"]
-        dec_as = int(assign_decile(np.array([b1["AS"]]), as_edges)[0]) if as_edges.size else 1
-        dec_mq = int(assign_decile(np.array([b1["MAPQ"]]), mq_edges)[0]) if mq_edges.size else 1
+
+        dAS = acc.best1_as - acc.best2_as
+        dMQ = acc.best1_mq - acc.best2_mq
+
+        dec_as = assign_decile_scalar(acc.best1_as, as_edges)
+        dec_mq = assign_decile_scalar(acc.best1_mq, mq_edges)
+
         if 1 <= dec_as <= k:
             H_dAS[dec_as - 1].add(dAS)
         if 1 <= dec_mq <= k:
             H_dMQ[dec_mq - 1].add(dMQ)
         pairs += 1
 
-    dt = time.time() - t0
-    _log_ok(f"[ecdf-map] ■ done {chunk_file.name}  pairs={pairs:,}  {dt:0.1f}s", verbose)
+    dAS_counts = np.stack([h.counts for h in H_dAS], axis=0)
+    dAS_over = np.array([h.overflow for h in H_dAS], dtype=np.int64)
 
-    dAS_counts = np.stack([H.counts for H in H_dAS], axis=0)
-    dAS_over = np.array([H.overflow for H in H_dAS], dtype=np.int64)
-    dMQ_counts = np.stack([H.counts for H in H_dMQ], axis=0)
-    dMQ_over = np.array([H.overflow for H in H_dMQ], dtype=np.int64)
-    return dAS_counts, dAS_over, dMQ_counts, dMQ_over
+    dMQ_counts = np.stack([h.counts for h in H_dMQ], axis=0)
+    dMQ_over = np.array([h.overflow for h in H_dMQ], dtype=np.int64)
 
-
-####
-def _edges_batch_worker(
-    bi: int,
-    ch_paths: list[Path],
-    files: list[Path],
-    mapq_min: int,
-    xa_max: int,
-    chunksize: int,
-    k: int,
-    verbose: bool,
-    as_range: tuple[float, float, int],
-    mq_range: tuple[float, float, int],
-    max_reads_per_genome: int | None = None,
-):
-    import numpy as np
-    import pandas as pd
-
-    lo_as, hi_as, nb_as = as_range
-    lo_mq, hi_mq, nb_mq = mq_range
-    scale_as = hi_as - lo_as
-    scale_mq = hi_mq - lo_mq
-
-    # per-batch hist buffers
-    as_counts = np.zeros(nb_as, dtype=np.int64)
-    mq_counts = np.zeros(nb_mq, dtype=np.int64)
-
-    # Build BC -> chunk map + per-chunk accumulators
-    bc_to_chunk: dict[str, Path] = {}
-    per_chunk_acc: dict[Path, dict[tuple[str, str], dict]] = {}
-    for ch in ch_paths:
-        per_chunk_acc[ch] = {}
-        for bc in _chunk_bcs(ch):
-            bc_to_chunk[bc] = ch
-    batch_bcs = set(bc_to_chunk.keys())
-    if verbose:
-        _log(
-            f"[assign/edges] ▶ batch {bi}  chunks={len(ch_paths)}  BCs={len(batch_bcs):,}",
-            verbose,
-        )
-
-    # Stream each genome once
-    for fp in files:
-        kept_rows = 0
-        genome = _genome_from_filename(fp)
-        rows_seen_for_genome = 0
-        for c in pd.read_csv(
-            fp,
-            sep="\t",
-            usecols=["Read", "BC", "MAPQ", "AS", "NM", "XAcount"],
-            chunksize=chunksize,
-            dtype={"Read": "string", "BC": "string"},
-            engine="c",
-            low_memory=True,
-            memory_map=False,
-        ):
-            # Optional cap to speed up model learning
-            if max_reads_per_genome is not None and rows_seen_for_genome >= max_reads_per_genome:
-                break
-
-            c = c[c["BC"].astype(str).isin(batch_bcs)]
-            if c.empty:
-                continue
-
-            for col in ("AS", "MAPQ", "NM", "XAcount"):
-                c[col] = pd.to_numeric(c[col], errors="coerce")
-
-            if mapq_min > 0:
-                c = c[c["MAPQ"].fillna(0) >= mapq_min]
-            if xa_max >= 0:
-                c = c[c["XAcount"].fillna(0) <= xa_max]
-            if c.empty:
-                continue
-
-            c = c.drop_duplicates(subset=["Read", "BC"], keep="first")
-
-            # If capped, trim this chunk so total per genome doesn't exceed cap
-            if max_reads_per_genome is not None:
-                remaining = max_reads_per_genome - rows_seen_for_genome
-                if remaining <= 0:
-                    break
-                if len(c) > remaining:
-                    c = c.iloc[:remaining]
-
-            for row in c.itertuples(index=False):
-                key_bc = str(row.BC)
-                ch = bc_to_chunk.get(key_bc)
-                if ch is None:
-                    continue
-                rb = per_chunk_acc[ch]
-                key = (str(row.Read), key_bc)
-                acc = rb.get(key)
-                if acc is None:
-                    acc = {
-                        "best1": None,
-                        "best2": None,
-                        "worst": None,
-                        "seen_g": set(),
-                    }
-                    rb[key] = acc
-                _pick_best_two_and_worst(
-                    acc,
-                    genome,
-                    AS=float(row.AS) if pd.notna(row.AS) else float("-inf"),
-                    MAPQ=float(row.MAPQ) if pd.notna(row.MAPQ) else float("-inf"),
-                    NM=float(row.NM) if pd.notna(row.NM) else float("inf"),
-                    XA=float(row.XAcount) if pd.notna(row.XAcount) else float("inf"),
-                )
-                kept_rows += 1
-                rows_seen_for_genome += 1
-
-        if verbose:
-            _log(
-                f"[assign/edges]    ✓ genome {genome}  kept≈{kept_rows:,}",
-                verbose,
-            )
-
-    # Reduce winners -> per-batch hist
-    batch_winners = 0
-    for rb in per_chunk_acc.values():
-        for acc in rb.values():
-            b1 = acc["best1"]
-            if b1 is None:
-                continue
-            asv = b1["AS"]
-            if np.isfinite(asv):
-                if asv >= hi_as:
-                    idx_as = nb_as - 1
-                elif asv <= lo_as:
-                    idx_as = 0
-                else:
-                    idx_as = int((asv - lo_as) / scale_as * nb_as)
-                    idx_as = min(max(idx_as, 0), nb_as - 1)
-                as_counts[idx_as] += 1
-
-            mqv = b1["MAPQ"]
-            if np.isfinite(mqv):
-                if mqv >= hi_mq:
-                    idx_mq = nb_mq - 1
-                elif mqv <= lo_mq:
-                    idx_mq = 0
-                else:
-                    idx_mq = int((mqv - lo_mq) / scale_mq * nb_mq)
-                    idx_mq = min(max(idx_mq, 0), nb_mq - 1)
-                mq_counts[idx_mq] += 1
-
-            batch_winners += 1
-
-    # Return the partial histograms and counts
-    return bi, as_counts, mq_counts, batch_winners
+    return ch.name, dAS_counts, dAS_over, dMQ_counts, dMQ_over, pairs
 
 
-def _partial_ecdf_from_chunk(
-    chunk_file: Path,
-    mapq_min: int,
-    xa_max: int,
-    chunksize: int,
-    batch_size: int,
-    bins: np.ndarray,
-) -> np.ndarray:
-    """
-    Map step: stream the chunk file, filter rows, collect score distributions
-    into fixed bins; return the bin counts (histogram).
-    Assumes the per-read 'winner_score' (or your score column) exists.
-    """
-    counts = np.zeros(len(bins) - 1, dtype=np.int64)
-    usecols = ["winner_score", "MAPQ", "XAcount"]  # adjust to your schema
-    for df in pd.read_csv(
-        chunk_file, sep=None, engine="python", usecols=usecols, chunksize=chunksize
-    ):
-        if mapq_min is not None:
-            df = df[df["MAPQ"] >= mapq_min]
-        if xa_max is not None and xa_max >= 0:
-            df = df[df["XAcount"] <= xa_max]
-        s = df["winner_score"].to_numpy(dtype=np.float64, copy=False)
-        for i in range(0, s.size, batch_size):
-            counts += np.histogram(s[i : i + batch_size], bins=bins)[0]
-    return counts
-
-
-def _merge_counts(counts_list: T.Iterable[np.ndarray]) -> np.ndarray:
-    it = iter(counts_list)
-    total = next(it).copy()
-    for c in it:
-        total += c
-    return total
-
-
-def learn_ecdf_from_scores_parallel(
-    workdir: T.Union[str, Path],
-    sample: str,
-    chunks_dir: Path,
-    out_model: Path,
-    mapq_min: int = 20,
-    xa_max: int = 2,
-    chunksize: int = 500_000,
-    batch_size: int = 32,
-    workers: int = 1,
-    verbose: bool = True,
-    score_bins: T.Optional[np.ndarray] = None,
-) -> Path:
-    """
-    Parallel ECDF learning. We build a stable global ECDF by:
-      - mapping each chunk → fixed-bin histogram of winner scores
-      - reducing histograms by summation
-      - converting to an ECDF and saving to NPZ
-    """
-    workdir = Path(workdir)
-    chunks_dir = Path(chunks_dir)
-    out_model = Path(out_model)
-    out_model.parent.mkdir(parents=True, exist_ok=True)
-
-    if score_bins is None:
-        score_bins = np.linspace(0.0, 1.0, 1001)
-
-    chunk_files = sorted(chunks_dir.glob("*_cell_map_ref_chunk_*.txt"))
-    if not chunk_files:
-        raise RuntimeError(f"No chunk files found in {chunks_dir}")
-
-    if verbose:
-        _log(
-            f"[assign/ecdf] start: {len(chunk_files)} chunks, workers={workers}, bins={len(score_bins)-1}",
-            verbose,
-        )
-
-    parts: T.List[np.ndarray] = []
-    with ProcessPoolExecutor(max_workers=max(1, int(workers))) as ex:
-        futures = {
-            ex.submit(
-                _partial_ecdf_from_chunk,
-                cf,
-                mapq_min,
-                xa_max,
-                chunksize,
-                batch_size,
-                score_bins,
-            ): cf
-            for cf in chunk_files
-        }
-        done = 0
-        total = len(futures)
-        for fut in as_completed(futures):
-            parts.append(fut.result())
-            done += 1
-            if verbose and (done % 25 == 0 or done == total):
-                _log(f"[assign/ecdf] mapped {done}/{total}", True)
-
-    total_counts = _merge_counts(parts)
-    cdf = np.cumsum(total_counts, dtype=np.float64)
-    if cdf[-1] > 0:
-        cdf /= cdf[-1]
-
-    np.savez_compressed(out_model, bins=score_bins, ecdf=cdf)
-    if verbose:
-        typer.echo(
-            f"[assign/ecdf] wrote {out_model} (total N={int(total_counts.sum()):,})"
-        )
-    return out_model
-
-
-# ---------- Pass A (CLI): learn global decile edges (serial) ----------
+# -----------------------------
+# Pass A: learn edges (batched parallel)
+# -----------------------------
 @app.command()
-def learn_edges(
+def learn_edges_v2(
     workdir: Path = typer.Option(..., "--workdir"),
     sample: str = typer.Option(..., "--sample"),
     chunks_dir: Path = typer.Option(..., "--chunks-dir"),
     out_model: Optional[Path] = typer.Option(None, "--out-model"),
-    mapq_min: int = 20,
-    xa_max: int = 2,
-    chunksize: int = 1_000_000,
-    k: int = 10,
+    mapq_min: int = typer.Option(20, "--mapq-min"),
+    xa_max: int = typer.Option(2, "--xa-max"),
+    chunksize: int = typer.Option(500_000, "--chunksize"),
+    k: int = typer.Option(10, "--k"),
+    batch_size: int = typer.Option(16, "--batch-size"),
+    workers: int = typer.Option(4, "--workers"),
+    max_reads_per_genome: Optional[int] = typer.Option(None, "--max-reads-per-genome"),
+    verbose: bool = typer.Option(True, "--verbose/--quiet"),
 ):
+    """
+    Learn global AS/MAPQ decile edges from winner distributions.
+    Parallelization: chunk batches across workers; each worker streams each genome file once.
+    """
     files = _filtered_files(workdir, sample)
-    chunk_list = sorted(Path(chunks_dir).glob("*_cell_map_ref_chunk_*.txt"))
-    if not chunk_list:
+    chunk_files = sorted(Path(chunks_dir).glob("*_cell_map_ref_chunk_*.txt"))
+    if not chunk_files:
         raise typer.BadParameter(f"No chunk files under {chunks_dir}")
 
-    H_AS = DeltaHist(lo=0, hi=200, nbins=2000)
-    H_MQ = DeltaHist(lo=0, hi=60, nbins=120)
+    lo_as, hi_as, nb_as = _AS_RANGE
+    lo_mq, hi_mq, nb_mq = _MQ_RANGE
 
-    for chunk_file in chunk_list:
-        bcs = _chunk_bcs(chunk_file)
-        rb_map: Dict[Tuple[str, str], dict] = {}
-        for fp in files:
-            genome = _genome_from_filename(fp)
-            for rows in _iter_read_bc_rows(fp, bcs, chunksize, mapq_min, xa_max):
-                for row in rows:
-                    key = (str(row.Read), str(row.BC))
-                    acc = rb_map.get(key) or {
-                        "best1": None,
-                        "best2": None,
-                        "worst": None,
-                        "seen_g": set(),
-                    }
-                    _pick_best_two_and_worst(
-                        acc,
-                        genome,
-                        AS=float(row.AS) if pd.notna(row.AS) else float("-inf"),
-                        MAPQ=float(row.MAPQ) if pd.notna(row.MAPQ) else float("-inf"),
-                        NM=float(row.NM) if pd.notna(row.NM) else float("inf"),
-                        XA=float(row.XAcount)
-                        if pd.notna(row.XAcount)
-                        else float("inf"),
-                    )
-                    rb_map[key] = acc
-        for acc in rb_map.values():
-            b1 = acc["best1"]
-            if b1 is None:
-                continue
-            H_AS.add(b1["AS"])
-            H_MQ.add(b1["MAPQ"])
+    batches: list[tuple[int, list[Path]]] = []
+    for bi, ofs in enumerate(range(0, len(chunk_files), batch_size), start=1):
+        batches.append((bi, chunk_files[ofs : ofs + batch_size]))
 
-    as_edges = edges_from_hist(H_AS, k)
-    mq_edges = edges_from_hist(H_MQ, k)
-    model_path = (
-        out_model
-        or (Path(workdir) / sample / "ExplorationReadLevel" / "global_edges.npz")
-    )
-    model_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(model_path, as_edges=as_edges, mq_edges=mq_edges, k=k)
-    typer.echo(f"[assign/edges] done → {model_path}")
+    as_counts = np.zeros(nb_as, dtype=np.int64)
+    mq_counts = np.zeros(nb_mq, dtype=np.int64)
+
+    _log(f"[assign/edges] start: chunks={len(chunk_files)} batches={len(batches)} workers={workers}", verbose)
+
+    max_workers = max(1, min(int(workers), len(batches)))
+    t0 = time.time()
+
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futs = []
+        for bi, chs in batches:
+            futs.append(
+                ex.submit(
+                    _edges_batch_worker,
+                    bi,
+                    [str(p) for p in chs],
+                    [str(p) for p in files],
+                    mapq_min,
+                    xa_max,
+                    chunksize,
+                    lo_as,
+                    hi_as,
+                    nb_as,
+                    lo_mq,
+                    hi_mq,
+                    nb_mq,
+                    max_reads_per_genome,
+                    verbose,
+                )
+            )
+
+        done = 0
+        for fut in as_completed(futs):
+            try:
+                bi, as_part, mq_part, winners = fut.result()
+            except Exception as e:
+                _log_err(f"[assign/edges][ERROR] worker failed: {e}", True)
+                raise
+
+            as_counts += as_part
+            mq_counts += mq_part
+            done += 1
+            _log_ok(f"[assign/edges] ■ batch {bi} reduced winners={winners:,} ({done}/{len(futs)})", verbose)
+
+    as_edges = edges_from_hist_counts(as_counts, lo_as, hi_as, k)
+    mq_edges = edges_from_hist_counts(mq_counts, lo_mq, hi_mq, k)
+
+    exp_dir = Path(workdir) / sample / "ExplorationReadLevel"
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    model_path = out_model or (exp_dir / "global_edges.npz")
+
+    np.savez_compressed(model_path, as_edges=as_edges, mq_edges=mq_edges, k=np.array(k))
+    _log_ok(f"[assign/edges] done → {model_path} ({time.time()-t0:0.1f}s)", verbose)
     return model_path
 
 
-# ---------- Pass B (CLI): learn per-decile Δ ECDFs (serial) ----------
+# -----------------------------
+# Pass B: learn ECDFs (per-chunk parallel map-reduce)
+# -----------------------------
 @app.command()
-def learn_ecdfs(
+def learn_ecdfs_v2(
     workdir: Path = typer.Option(..., "--workdir"),
     sample: str = typer.Option(..., "--sample"),
     chunks_dir: Path = typer.Option(..., "--chunks-dir"),
     edges_model: Path = typer.Option(..., "--edges"),
     out_model: Optional[Path] = typer.Option(None, "--out-model"),
-    mapq_min: int = 20,
-    xa_max: int = 2,
-    chunksize: int = 1_000_000,
+    mapq_min: int = typer.Option(20, "--mapq-min"),
+    xa_max: int = typer.Option(2, "--xa-max"),
+    chunksize: int = typer.Option(500_000, "--chunksize"),
+    workers: int = typer.Option(4, "--workers"),
+    verbose: bool = typer.Option(True, "--verbose/--quiet"),
 ):
+    """
+    Learn per-decile ΔAS/ΔMAPQ hist counts + overflow, in parallel over chunks.
+    Each worker loads all genomes for *one* chunk => stable memory profile.
+    """
     files = _filtered_files(workdir, sample)
-    chunk_list = sorted(Path(chunks_dir).glob("*_cell_map_ref_chunk_*.txt"))
-    if not chunk_list:
+    chunk_files = sorted(Path(chunks_dir).glob("*_cell_map_ref_chunk_*.txt"))
+    if not chunk_files:
         raise typer.BadParameter(f"No chunk files under {chunks_dir}")
 
     dat = np.load(edges_model)
-    as_edges, mq_edges, k = dat["as_edges"], dat["mq_edges"], int(dat["k"])
-    H_dAS = {d: DeltaHist(lo=0, hi=100, nbins=200) for d in range(1, k + 1)}
-    H_dMQ = {d: DeltaHist(lo=0, hi=60, nbins=120) for d in range(1, k + 1)}
+    as_edges = dat["as_edges"]
+    mq_edges = dat["mq_edges"]
+    k = int(dat["k"])
 
-    for chunk_file in chunk_list:
-        bcs = _chunk_bcs(chunk_file)
-        rb_map: Dict[Tuple[str, str], dict] = {}
-        for fp in files:
-            genome = _genome_from_filename(fp)
-            for rows in _iter_read_bc_rows(fp, bcs, chunksize, mapq_min, xa_max):
-                for row in rows:
-                    key = (str(row.Read), str(row.BC))
-                    acc = rb_map.get(key) or {
-                        "best1": None,
-                        "best2": None,
-                        "worst": None,
-                        "seen_g": set(),
-                    }
-                    _pick_best_two_and_worst(
-                        acc,
-                        genome,
-                        AS=float(row.AS) if pd.notna(row.AS) else float("-inf"),
-                        MAPQ=float(row.MAPQ) if pd.notna(row.MAPQ) else float("-inf"),
-                        NM=float(row.NM) if pd.notna(row.NM) else float("inf"),
-                        XA=float(row.XAcount)
-                        if pd.notna(row.XAcount)
-                        else float("inf"),
-                    )
-                    rb_map[key] = acc
-        for acc in rb_map.values():
-            b1, b2 = acc["best1"], acc.get("best2")
-            if b1 is None or b2 is None:
-                continue
-            dAS = b1["AS"] - b2["AS"]
-            dMQ = b1["MAPQ"] - b2["MAPQ"]
-            dec_as = (
-                int(assign_decile(np.array([b1["AS"]]), as_edges)[0])
-                if as_edges.size
-                else 1
-            )
-            dec_mq = (
-                int(assign_decile(np.array([b1["MAPQ"]]), mq_edges)[0])
-                if mq_edges.size
-                else 1
-            )
-            if 1 <= dec_as <= k:
-                H_dAS[dec_as].add(dAS)
-            if 1 <= dec_mq <= k:
-                H_dMQ[dec_mq].add(dMQ)
+    # global accumulators
+    Htmp_AS = _new_hist(_DAS_RANGE)
+    Htmp_MQ = _new_hist(_DMQ_RANGE)
 
-    payload = {
-        "k": np.array(k),
-        "as_edges": as_edges,
-        "mq_edges": mq_edges,
-        "dAS_lo": np.array([H_dAS[1].lo]),
-        "dAS_hi": np.array([H_dAS[1].hi]),
-        "dAS_nbins": np.array([H_dAS[1].nbins]),
-        "dMQ_lo": np.array([H_dMQ[1].lo]),
-        "dMQ_hi": np.array([H_dMQ[1].hi]),
-        "dMQ_nbins": np.array([H_dMQ[1].nbins]),
-        "dAS_counts": np.stack(
-            [H_dAS[d].counts for d in range(1, k + 1)], axis=0
-        ),
-        "dAS_overflow": np.array(
-            [H_dAS[d].overflow for d in range(1, k + 1)], dtype=np.int64
-        ),
-        "dMQ_counts": np.stack(
-            [H_dMQ[d].counts for d in range(1, k + 1)], axis=0
-        ),
-        "dMQ_overflow": np.array(
-            [H_dMQ[d].overflow for d in range(1, k + 1)], dtype=np.int64
-        ),
-    }
-    model_path = (
-        out_model
-        or (Path(workdir) / sample / "ExplorationReadLevel" / "global_ecdf.npz")
-    )
-    model_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(model_path, **payload)
-    typer.echo(f"[assign/ecdf] saved {model_path}")
-    return model_path
+    dAS_counts = np.zeros((k, Htmp_AS.nbins), dtype=np.int64)
+    dAS_over = np.zeros((k,), dtype=np.int64)
 
+    dMQ_counts = np.zeros((k, Htmp_MQ.nbins), dtype=np.int64)
+    dMQ_over = np.zeros((k,), dtype=np.int64)
 
-# ---------- Parallel map-reduce learners (library-level helpers) ----------
-def learn_edges_parallel(
-    workdir: Path,
-    sample: str,
-    chunks_dir: Path,
-    out_model: Optional[Path],
-    mapq_min: int,
-    xa_max: int,
-    chunksize: int,
-    k: int,
-    batch_size: int = 32,
-    threads: int = 8,
-    verbose: bool = False,
-    edges_workers: Optional[int] = None,
-    edges_max_reads: Optional[int] = None,
-) -> Path:
-    """
-    Parallel *batched* map-reduce with concurrent batches:
-    read each genome once per batch, route rows by BC, then reduce winners to hist counts.
-    """
-    import numpy as np
+    max_workers = max(1, min(int(workers), len(chunk_files)))
+    _log(f"[assign/ecdf] start: chunks={len(chunk_files)} workers={max_workers}", verbose)
 
-    chunk_files = sorted(Path(chunks_dir).glob(f"{sample}_cell_map_ref_chunk_*.txt"))
-    if not chunk_files:
-        raise typer.BadParameter(f"No chunk files under {chunks_dir}")
-    files = _filtered_files(workdir, sample)
-
-    # global hist buffers
-    as_counts = np.zeros(_AS_RANGE[2], dtype=np.int64)
-    mq_counts = np.zeros(_MQ_RANGE[2], dtype=np.int64)
-
-    total_chunks = len(chunk_files)
-    batches = [
-        (i, chunk_files[i : i + batch_size])
-        for i in range(0, total_chunks, batch_size)
-    ]
-    _log(
-        f"[assign/edges] start: {total_chunks} chunks in {len(batches)} batches (batch_size={batch_size})",
-        verbose,
-    )
-
-    max_workers = min(edges_workers or threads, len(batches))
-    futures = []
+    t0 = time.time()
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        for bi, ch_paths in batches:
-            fut = ex.submit(
-                _edges_batch_worker,
-                bi,
-                ch_paths,
-                files,
+        futs = {
+            ex.submit(
+                _ecdf_chunk_worker,
+                str(ch),
+                [str(p) for p in files],
                 mapq_min,
                 xa_max,
                 chunksize,
+                as_edges,
+                mq_edges,
                 k,
                 verbose,
-                _AS_RANGE,
-                _MQ_RANGE,
-                edges_max_reads,
-            )
-            futures.append(fut)
+            ): ch
+            for ch in chunk_files
+        }
 
-        for f in as_completed(futures):
-            bi, as_part, mq_part, won = f.result()
-            as_counts += as_part
-            mq_counts += mq_part
-            _log_ok(
-                f"[assign/edges] ■ batch {bi} reduced  winners={won:,}", verbose
-            )
-
-    as_edges, mq_edges = _edges_from_hist_counts(as_counts, mq_counts, k)
-    model_path = (
-        out_model
-        or (Path(workdir) / sample / "ExplorationReadLevel" / "global_edges.npz")
-    )
-    model_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(model_path, as_edges=as_edges, mq_edges=mq_edges, k=k)
-    _log_ok(f"[assign/edges] done → {model_path}", verbose)
-    return model_path
-
-
-def learn_ecdfs_parallel(
-    workdir: Path,
-    sample: str,
-    chunks_dir: Path,
-    edges_model: Path,
-    out_model: T.Optional[Path],
-    mapq_min: int,
-    xa_max: int,
-    chunksize: int,
-    workers: int = 1,
-    verbose: bool = False,
-) -> Path:
-    """Parallel map-reduce: per-chunk per-decile Δ histograms → global ECDF model."""
-
-    chunks_dir = Path(chunks_dir)
-    chunk_files = sorted(chunks_dir.glob(f"{sample}_cell_map_ref_chunk_*.txt"))
-    if not chunk_files:
-        raise typer.BadParameter(f"No chunk files under {chunks_dir}")
-
-    dat = np.load(edges_model)
-    as_edges, mq_edges, k = dat["as_edges"], dat["mq_edges"], int(dat["k"])
-
-    Htmp_AS = _new_hist_from_spec((0.0, 100.0, 200))
-    Htmp_MQ = _new_hist_from_spec((0.0, 60.0, 120))
-    dAS_over = np.zeros((k,), dtype=np.int64)
-    dMQ_over = np.zeros((k,), dtype=np.int64)
-    dMQ_counts = np.zeros((k, Htmp_MQ.nbins), dtype=np.int64)
-    dAS_counts = np.zeros((k, Htmp_AS.nbins), dtype=np.int64)
-
-    max_workers = max(1, min(int(workers), len(chunk_files)))
-    if verbose:
-        _log(
-            f"[assign/ecdf] start: {len(chunk_files)} chunks, workers={max_workers}",
-            True,
-        )
-
-    args_iter = [
-        (
-            workdir,
-            sample,
-            ch,
-            as_edges,
-            mq_edges,
-            k,
-            mapq_min,
-            xa_max,
-            chunksize,
-            verbose,
-        )
-        for ch in chunk_files
-    ]
-    done = 0
-    total = len(args_iter)
-    with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        fut = {ex.submit(_ecdf_chunk_worker, a): a[2] for a in args_iter}
-        for f in as_completed(fut):
-            ch = fut[f]
+        done = 0
+        for fut in as_completed(futs):
+            ch = futs[fut]
             try:
-                das, daso, dmq, dmqo = f.result()
-                dAS_counts += das
-                dAS_over += daso
-                dMQ_counts += dmq
-                dMQ_over += dmqo
+                _, das, daso, dmq, dmqo, pairs = fut.result()
             except Exception as e:
                 _log_err(f"[assign/ecdf][ERROR] {ch.name}: {e}", True)
                 raise
+
+            dAS_counts += das
+            dAS_over += daso
+            dMQ_counts += dmq
+            dMQ_over += dmqo
+
             done += 1
-            if verbose and (done % 5 == 0 or done == total):
-                _log(f"[assign/ecdf] {done}/{total} chunks", True)
+            if verbose and (done % 5 == 0 or done == len(chunk_files)):
+                _log(f"[assign/ecdf] {done}/{len(chunk_files)} chunks reduced (last pairs={pairs:,})", True)
 
-    model_path = (
-        out_model
-        or (Path(workdir) / sample / "ExplorationReadLevel" / "global_ecdf.npz")
-    )
-    model_path.parent.mkdir(parents=True, exist_ok=True)
+    exp_dir = Path(workdir) / sample / "ExplorationReadLevel"
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    model_path = out_model or (exp_dir / "global_ecdf.npz")
+
     np.savez_compressed(
         model_path,
         k=np.array(k),
@@ -1028,254 +719,64 @@ def learn_ecdfs_parallel(
         dMQ_counts=dMQ_counts,
         dMQ_overflow=dMQ_over,
     )
-    _log_ok(f"[assign/ecdf] done → {model_path}", verbose)
+
+    _log_ok(f"[assign/ecdf] done → {model_path} ({time.time()-t0:0.1f}s)", verbose)
     return model_path
 
 
-def learn_ecdfs_batched(
-    workdir: Path,
-    sample: str,
-    chunks_dir: Path,
-    edges_model: Path,
-    out_model: Optional[Path],
-    mapq_min: int,
-    xa_max: int,
-    chunksize: Optional[int],
-    batch_size: int = 32,
-    verbose: bool = True,
-) -> Path:
-    """
-    Batched map-reduce: read each genome once per batch of chunk files, route rows
-    by BC to per-chunk accumulators, then reduce to global per-decile Δ histograms.
-    """
-    dat = np.load(edges_model)
-    as_edges, mq_edges, k = dat["as_edges"], dat["mq_edges"], int(dat["k"])
-
-    Htmp_AS = _new_hist_from_spec((0.0, 100.0, 200))
-    Htmp_MQ = _new_hist_from_spec((0.0, 60.0, 120))
-    dAS_counts = np.zeros((k, Htmp_AS.nbins), dtype=np.int64)
-    dAS_over = np.zeros((k,), dtype=np.int64)
-    dMQ_counts = np.zeros((k, Htmp_MQ.nbins), dtype=np.int64)
-    dMQ_over = np.zeros((k,), dtype=np.int64)
-
-    chunk_files = sorted(Path(chunks_dir).glob("*_cell_map_ref_chunk_*.txt"))
-
-    files = _filtered_files(workdir, sample)
-    if not chunk_files:
-        raise typer.BadParameter(f"No chunk files under {chunks_dir}")
-
-    _log(
-        f"[assign/ecdf-batched] start: {len(chunk_files)} chunks, batch_size={batch_size}",
-        verbose,
-    )
-    t0_all = time.time()
-
-    for ofs in range(0, len(chunk_files), batch_size):
-        batch = chunk_files[ofs : ofs + batch_size]
-        t0 = time.time()
-        _log(
-            f"[assign/ecdf-batched] ▶ batch {ofs//batch_size+1}: {len(batch)} chunks",
-            verbose,
-        )
-
-        bc_to_chunk: dict[str, Path] = {}
-        per_chunk_acc: dict[Path, dict[tuple[str, str], dict]] = {}
-        for ch in batch:
-            per_chunk_acc[ch] = {}
-            for bc in _chunk_bcs(ch):
-                bc_to_chunk[bc] = ch
-
-        bc_view = set(bc_to_chunk.keys())
-        for fp in files:
-            genome = _genome_from_filename(fp)
-            per_file_kept = 0
-            for c in pd.read_csv(
-                fp,
-                sep="\t",
-                usecols=["Read", "BC", "MAPQ", "AS", "NM", "XAcount"],
-                chunksize=chunksize,
-                dtype={
-                    "Read": "string",
-                    "BC": "string",
-                    "AS": "float32",
-                    "MAPQ": "float32",
-                    "NM": "float32",
-                    "XAcount": "float32",
-                },
-                engine="c",
-                low_memory=True,
-                memory_map=False,
-            ):
-                c = c[c["BC"].astype(str).isin(bc_view)]
-                if c.empty:
-                    continue
-
-                if mapq_min > 0:
-                    c = c[c["MAPQ"].fillna(0) >= mapq_min]
-                if xa_max >= 0:
-                    c = c[c["XAcount"].fillna(0) <= xa_max]
-                if c.empty:
-                    continue
-
-                if c.duplicated(subset=["Read", "BC"]).any():
-                    c = c.drop_duplicates(subset=["Read", "BC"], keep="first")
-
-                for row in c.itertuples(index=False):
-                    ch = bc_to_chunk.get(str(row.BC))
-                    if ch is None:
-                        continue
-                    rb = per_chunk_acc[ch]
-                    key = (str(row.Read), str(row.BC))
-                    acc = rb.get(key)
-                    if acc is None:
-                        acc = {
-                            "best1": None,
-                            "best2": None,
-                            "worst": None,
-                            "seen_g": set(),
-                        }
-                        rb[key] = acc
-                    _pick_best_two_and_worst(
-                        acc,
-                        genome,
-                        AS=float(row.AS) if pd.notna(row.AS) else float("-inf"),
-                        MAPQ=float(row.MAPQ) if pd.notna(row.MAPQ) else float("-inf"),
-                        NM=float(row.NM) if pd.notna(row.NM) else float("inf"),
-                        XA=float(row.XAcount)
-                        if pd.notna(row.XAcount)
-                        else float("inf"),
-                    )
-                    per_file_kept += 1
-            _log(
-                f"[assign/ecdf-batched]   ✓ {fp.name} kept≈{per_file_kept:,}",
-                verbose,
-            )
-
-        pairs = 0
-        for rb in per_chunk_acc.values():
-            for acc in rb.values():
-                b1, b2 = acc["best1"], acc.get("best2")
-                if b1 is None or b2 is None:
-                    continue
-                dAS = b1["AS"] - b2["AS"]
-                dMQ = b1["MAPQ"] - b2["MAPQ"]
-                dec_as = (
-                    int(assign_decile(np.array([b1["AS"]]), as_edges)[0])
-                    if as_edges.size
-                    else 1
-                )
-                dec_mq = (
-                    int(assign_decile(np.array([b1["MAPQ"]]), mq_edges)[0])
-                    if mq_edges.size
-                    else 1
-                )
-                if 1 <= dec_as <= k:
-                    H = Htmp_AS
-                    if not np.isfinite(dAS):
-                        pass
-                    elif dAS >= H.hi:
-                        dAS_over[dec_as - 1] += 1
-                    else:
-                        idx = int(
-                            min(
-                                max((dAS - H.lo) / (H.hi - H.lo) * H.nbins, 0),
-                                H.nbins - 1,
-                            )
-                        )
-                        dAS_counts[dec_as - 1, idx] += 1
-                if 1 <= dec_mq <= k:
-                    H = Htmp_MQ
-                    if not np.isfinite(dMQ):
-                        pass
-                    elif dMQ >= H.hi:
-                        dMQ_over[dec_mq - 1] += 1
-                    else:
-                        idx = int(
-                            min(
-                                max((dMQ - H.lo) / (H.hi - H.lo) * H.nbins, 0),
-                                H.nbins - 1,
-                            )
-                        )
-                        dMQ_counts[dec_mq - 1, idx] += 1
-                pairs += 1
-
-        dt = time.time() - t0
-        _log_ok(
-            f"[assign/ecdf-batched] ■ batch {ofs//batch_size+1} done  pairs={pairs:,}  {dt:0.1f}s",
-            verbose,
-        )
-
-    model_path = (
-        out_model
-        or (Path(workdir) / sample / "ExplorationReadLevel" / "global_ecdf.npz")
-    )
-    model_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        model_path,
-        k=np.array(k),
-        as_edges=as_edges,
-        mq_edges=mq_edges,
-        dAS_lo=np.array([Htmp_AS.lo]),
-        dAS_hi=np.array([Htmp_AS.hi]),
-        dAS_nbins=np.array([Htmp_AS.nbins]),
-        dMQ_lo=np.array([Htmp_MQ.lo]),
-        dMQ_hi=np.array([Htmp_MQ.hi]),
-        dMQ_nbins=np.array([Htmp_MQ.nbins]),
-        dAS_counts=dAS_counts,
-        dAS_overflow=dAS_over,
-        dMQ_counts=dMQ_counts,
-        dMQ_overflow=dMQ_over,
-    )
-    _log_ok(
-        f"[assign/ecdf-batched] done → {model_path}  total {time.time()-t0_all:0.1f}s",
-        verbose,
-    )
-    return model_path
-
-
-# ---------- model loader ----------
 def _load_ecdf_model(path: Path):
     dat = np.load(path)
     k = int(dat["k"])
-    as_edges, mq_edges = dat["as_edges"], dat["mq_edges"]
-    dAS, dMQ = [], []
+    as_edges = dat["as_edges"]
+    mq_edges = dat["mq_edges"]
+
+    dAS = []
+    dMQ = []
+
     for i in range(k):
-        H = DeltaHist(
-            float(dat["dAS_lo"][0]),
-            float(dat["dAS_hi"][0]),
-            int(dat["dAS_nbins"][0]),
-        )
+        H = DeltaHist(float(dat["dAS_lo"][0]), float(dat["dAS_hi"][0]), int(dat["dAS_nbins"][0]))
         H.counts = dat["dAS_counts"][i].astype(np.int64)
         H.overflow = int(dat["dAS_overflow"][i])
         dAS.append(H)
+
     for i in range(k):
-        H = DeltaHist(
-            float(dat["dMQ_lo"][0]),
-            float(dat["dMQ_hi"][0]),
-            int(dat["dMQ_nbins"][0]),
-        )
+        H = DeltaHist(float(dat["dMQ_lo"][0]), float(dat["dMQ_hi"][0]), int(dat["dMQ_nbins"][0]))
         H.counts = dat["dMQ_counts"][i].astype(np.int64)
         H.overflow = int(dat["dMQ_overflow"][i])
         dMQ.append(H)
+
     return k, as_edges, mq_edges, dAS, dMQ
 
 
-# ---------- Pass C (CLI): score one chunk ----------
+# -----------------------------
+# Pass C: score one chunk (single-pass + streaming output)
+# -----------------------------
 @app.command()
-def score_chunk(
+def score_chunk_v2(
     workdir: Path = typer.Option(..., "--workdir"),
     sample: str = typer.Option(..., "--sample"),
     chunk_file: Path = typer.Option(..., "--chunk-file"),
     ecdf_model: Path = typer.Option(..., "--model"),
     out_raw_dir: Optional[Path] = typer.Option(None, "--out-raw"),
     out_filtered_dir: Optional[Path] = typer.Option(None, "--out-filtered"),
-    mapq_min: int = 20,
-    xa_max: int = 2,
-    chunksize: int = 1_000_000,
-    alpha: float = 0.05,
+    mapq_min: int = typer.Option(20, "--mapq-min"),
+    xa_max: int = typer.Option(2, "--xa-max"),
+    chunksize: int = typer.Option(500_000, "--chunksize"),
+    alpha: float = typer.Option(0.05, "--alpha"),
+    verbose: bool = typer.Option(True, "--verbose/--quiet"),
 ):
-    k, as_edges, mq_edges, H_dAS, H_dMQ = _load_ecdf_model(ecdf_model)
+    """
+    Score a single chunk:
+      - build per-(Read,BC) best1/best2/worst across genomes
+      - compute p-values for ΔAS/ΔMAPQ using global ECDF model
+      - write raw per-read summary and filtered per-read/per-genome table
+
+    Filtering rule (compatible with your current behavior):
+      - Always keep winner genome rows
+      - Keep all genome rows for ambiguous reads (so downstream can see alternatives)
+    """
     files = _filtered_files(workdir, sample)
+    k, as_edges, mq_edges, H_dAS, H_dMQ = _load_ecdf_model(ecdf_model)
 
     out_raw_dir = out_raw_dir or (Path(workdir) / sample / "raw_cell_map_ref_chunks")
     out_filtered_dir = out_filtered_dir or (Path(workdir) / sample / "cell_map_ref_chunks")
@@ -1283,167 +784,93 @@ def score_chunk(
     out_filtered_dir.mkdir(parents=True, exist_ok=True)
 
     tag = chunk_file.stem
-    suff = (
-        tag.split("_cell_map_ref_chunk_")[-1]
-        if "_cell_map_ref_chunk_" in tag
-        else tag
-    )
+    suff = tag.split("_cell_map_ref_chunk_")[-1] if "_cell_map_ref_chunk_" in tag else tag
     base = f"{sample}_chunk{suff}"
     raw_out = out_raw_dir / f"{base}_raw.tsv.gz"
     filt_out = out_filtered_dir / f"{base}_filtered.tsv.gz"
 
     bcs = _chunk_bcs(chunk_file)
-    rb_map: Dict[Tuple[str, str], dict] = {}
+    rb_map: dict[tuple[str, str], ReadAcc] = {}
 
+    _log(f"[assign/score] ▶ {chunk_file.name} BCs={len(bcs):,}", verbose)
+    t0 = time.time()
+
+    # Accumulate best1/best2/worst across all genomes
     for fp in files:
         genome = _genome_from_filename(fp)
-        for rows in _iter_read_bc_rows(fp, bcs, chunksize, mapq_min, xa_max):
-            for row in rows:
-                key = (str(row.Read), str(row.BC))
-                acc = rb_map.get(key) or {
-                    "best1": None,
-                    "best2": None,
-                    "worst": None,
-                    "seen_g": set(),
-                }
-                _pick_best_two_and_worst(
-                    acc,
-                    genome,
-                    AS=float(row.AS) if pd.notna(row.AS) else float("-inf"),
-                    MAPQ=float(row.MAPQ) if pd.notna(row.MAPQ) else float("-inf"),
-                    NM=float(row.NM) if pd.notna(row.NM) else float("inf"),
-                    XA=float(row.XAcount) if pd.notna(row.XAcount) else float("inf"),
-                )
+        for read, bc, AS, MQ, NM in _iter_rows(fp, bcs, chunksize, mapq_min, xa_max):
+            key = (read, bc)
+            acc = rb_map.get(key)
+            if acc is None:
+                acc = ReadAcc()
                 rb_map[key] = acc
+            update_acc(acc, genome, AS, MQ, NM)
 
-    # RAW table + dominance filter
+    if not rb_map:
+        # Write empty outputs
+        pd.DataFrame().to_csv(raw_out, sep="\t", index=False, compression="gzip")
+        pd.DataFrame().to_csv(filt_out, sep="\t", index=False, compression="gzip")
+        _log_ok(f"[assign/score] ■ empty chunk → wrote empty outputs", verbose)
+        return
+
+    # Build raw summary table (vectorized-ish via list accumulation)
     raw_rows = []
-    keep_genomes: Dict[Tuple[str, str], set] = {}
+    class_by: dict[tuple[str, str], str] = {}
+    p_lookup: dict[tuple[str, str], tuple[float, float]] = {}
+    gwin_by: dict[tuple[str, str], str] = {}
 
     for (read, bc), acc in rb_map.items():
-        b1, b2, bw = acc["best1"], acc.get("best2"), acc.get("worst")
-        if b1 is None:
+        if acc.best1_g is None:
             continue
 
-        as1, mq1, nm1 = b1["AS"], b1["MAPQ"], b1["NM"]
-        if b2 is not None:
-            as2, mq2, nm2 = b2["AS"], b2["MAPQ"], b2["NM"]
-            dAS, dMQ, dNM = as1 - as2, mq1 - mq2, nm2 - nm1
+        as1, mq1, nm1 = acc.best1_as, acc.best1_mq, acc.best1_nm
+
+        if acc.best2_g is not None:
+            as2, mq2, nm2 = acc.best2_as, acc.best2_mq, acc.best2_nm
+            dAS = as1 - as2
+            dMQ = mq1 - mq2
+            dNM = nm2 - nm1
         else:
             as2 = mq2 = nm2 = np.nan
             dAS = dMQ = dNM = np.nan
 
-        dec_as = int(assign_decile(np.array([as1]), as_edges)[0]) if as_edges.size else 1
-        dec_mq = int(assign_decile(np.array([mq1]), mq_edges)[0]) if mq_edges.size else 1
+        dec_as = assign_decile_scalar(as1, as_edges)
+        dec_mq = assign_decile_scalar(mq1, mq_edges)
+
         p_as = H_dAS[dec_as - 1].tail_p(dAS) if np.isfinite(dAS) else np.nan
         p_mq = H_dMQ[dec_mq - 1].tail_p(dMQ) if np.isfinite(dMQ) else np.nan
 
-        clear_by_p = (np.isfinite(p_as) and p_as <= alpha) or (
-            np.isfinite(p_mq) and p_mq <= alpha
-        )
+        clear_by_p = (np.isfinite(p_as) and p_as <= alpha) or (np.isfinite(p_mq) and p_mq <= alpha)
         clear_by_nm = np.isfinite(dNM) and dNM > 0
-        single_hit = b2 is None
+        single_hit = acc.best2_g is None
 
         klass = "winner" if (clear_by_p or clear_by_nm or single_hit) else "ambiguous"
 
-        # Dominance filter: top1 vs all genomes using per_g and ECDFs
-        per_g = acc.get("per_g", {})
-        keep_g: set = set()
-        if per_g:
-            # choose best genome by NM, then AS, then MAPQ
-            best_g = None
-            best_key = None
-            for g, m in per_g.items():
-                t = (m["NM"], -m["AS"], -m["MAPQ"])
-                if best_key is None or t < best_key:
-                    best_key = t
-                    best_g = g
-
-            if best_g is not None:
-                as_best = per_g[best_g]["AS"]
-                mq_best = per_g[best_g]["MAPQ"]
-                nm_best = per_g[best_g]["NM"]
-
-                dec_as_best = (
-                    int(assign_decile(np.array([as_best]), as_edges)[0])
-                    if as_edges.size
-                    else 1
-                )
-                dec_mq_best = (
-                    int(assign_decile(np.array([mq_best]), mq_edges)[0])
-                    if mq_edges.size
-                    else 1
-                )
-                H_dec_as = H_dAS[dec_as_best - 1] if 1 <= dec_as_best <= k else None
-                H_dec_mq = H_dMQ[dec_mq_best - 1] if 1 <= dec_mq_best <= k else None
-
-                alpha_dom = alpha
-
-                for g, m in per_g.items():
-                    if g == best_g:
-                        keep_g.add(g)
-                        continue
-
-                    dAS_g = as_best - m["AS"]
-                    dMQ_g = mq_best - m["MAPQ"]
-                    dNM_g = m["NM"] - nm_best
-
-                    p_as_g = (
-                        H_dec_as.tail_p(dAS_g)
-                        if (H_dec_as is not None and np.isfinite(dAS_g))
-                        else np.nan
-                    )
-                    p_mq_g = (
-                        H_dec_mq.tail_p(dMQ_g)
-                        if (H_dec_mq is not None and np.isfinite(dMQ_g))
-                        else np.nan
-                    )
-
-                    dom_by_snp = (
-                        np.isfinite(dNM_g)
-                        and dNM_g > 0
-                        and (
-                            (np.isfinite(p_as_g) and p_as_g <= alpha_dom)
-                            or (np.isfinite(p_mq_g) and p_mq_g <= alpha_dom)
-                        )
-                    )
-                    dom_by_quality = (
-                        np.isfinite(dNM_g)
-                        and dNM_g == 0
-                        and np.isfinite(p_as_g)
-                        and np.isfinite(p_mq_g)
-                        and p_as_g <= alpha_dom
-                        and p_mq_g <= alpha_dom
-                    )
-
-                    if not (dom_by_snp or dom_by_quality):
-                        keep_g.add(g)
-
-        keep_genomes[(str(read), str(bc))] = keep_g
+        key = (read, bc)
+        class_by[key] = klass
+        p_lookup[key] = (float(p_as) if np.isfinite(p_as) else np.nan, float(p_mq) if np.isfinite(p_mq) else np.nan)
+        gwin_by[key] = acc.best1_g
 
         raw_rows.append(
             {
                 "Read": read,
                 "BC": bc,
-                "Genome_winner": b1["g"],
+                "Genome_winner": acc.best1_g,
                 "AS_winner": as1,
                 "MAPQ_winner": mq1,
                 "NM_winner": nm1,
-                "Genome_2": b2["g"] if b2 else "",
+                "Genome_2": acc.best2_g or "",
                 "AS_2": as2,
                 "MAPQ_2": mq2,
                 "NM_2": nm2,
-                "Genome_last": bw["g"] if bw else "",
-                "AS_last": (bw["AS"] if bw else np.nan),
-                "MAPQ_last": (bw["MAPQ"] if bw else np.nan),
-                "NM_last": (bw["NM"] if bw else np.nan),
+                "Genome_last": acc.worst_g or "",
+                "AS_last": acc.worst_as if np.isfinite(acc.worst_as) else np.nan,
+                "MAPQ_last": acc.worst_mq if np.isfinite(acc.worst_mq) else np.nan,
+                "NM_last": acc.worst_nm if np.isfinite(acc.worst_nm) else np.nan,
                 "delta_AS_1_2": dAS,
                 "delta_MAPQ_1_2": dMQ,
                 "delta_NM_1_2": dNM,
-                "delta_AS_1_last": (as1 - (bw["AS"] if bw else np.nan)),
-                "delta_MAPQ_1_last": (mq1 - (bw["MAPQ"] if bw else np.nan)),
-                "delta_NM_1_last": ((bw["NM"] if bw else np.nan) - nm1),
-                "n_genomes_considered": len(acc.get("seen_g", [])),
+                "n_genomes_considered": acc.n_genomes,
                 "decile_AS": dec_as,
                 "decile_MAPQ": dec_mq,
                 "p_as": p_as,
@@ -1455,142 +882,173 @@ def score_chunk(
     raw_df = pd.DataFrame(raw_rows)
     raw_df.to_csv(raw_out, sep="\t", index=False, compression="gzip")
 
-    if raw_df.empty:
-        pd.DataFrame(
-            columns=[
-                "Read",
-                "BC",
-                "AS",
-                "MAPQ",
-                "NM",
-                "XAcount",
-                "Genome",
-                "delta_AS",
-                "assigned_class",
-                "p_as",
-                "p_mq",
-            ]
-        ).to_csv(filt_out, sep="\t", index=False, compression="gzip")
-        return
-
-    p_lookup = {
-        (r, b): (pa, pm)
-        for r, b, pa, pm in zip(
-            raw_df["Read"].astype(str),
-            raw_df["BC"].astype(str),
-            raw_df["p_as"].astype(float),
-            raw_df["p_mq"].astype(float),
-        )
-    }
-
-    keep_pairs = set(zip(raw_df["Read"].astype(str), raw_df["BC"].astype(str)))
-    class_by = {
-        (r, b): k0
-        for r, b, k0 in zip(
-            raw_df["Read"].astype(str),
-            raw_df["BC"].astype(str),
-            raw_df["assigned_class"],
-        )
-    }
-    gwin_by = {
-        (r, b): g
-        for r, b, g in zip(
-            raw_df["Read"].astype(str),
-            raw_df["BC"].astype(str),
-            raw_df["Genome_winner"],
-        )
-    }
+    # Filtered per-read/per-genome table:
+    # Keep all genome rows for ambiguous reads; for winner reads keep only winner genome.
+    keep_pairs = set(class_by.keys())
+    bc_keep = {bc for (_, bc) in keep_pairs}
 
     out_rows = []
-    usecols2 = ["Read", "BC", "AS", "MAPQ", "NM", "XAcount"]
+    usecols = ["Read", "BC", "MAPQ", "AS", "NM", "XAcount"]
 
     for fp in files:
         genome = _genome_from_filename(fp)
-        for c in pd.read_csv(
-            fp, sep="\t", header=0, usecols=usecols2, chunksize=chunksize
+
+        for df in pd.read_csv(
+            fp,
+            sep="\t",
+            usecols=usecols,
+            chunksize=chunksize,
+            dtype={
+                "Read": "string",
+                "BC": "string",
+                "AS": "float32",
+                "MAPQ": "float32",
+                "NM": "float32",
+                "XAcount": "float32",
+            },
+            engine="c",
+            low_memory=True,
+            memory_map=False,
         ):
-            if c.empty:
+            df = df[df["BC"].isin(bc_keep)]
+            if df.empty:
                 continue
 
-            c = c[c["BC"].astype(str).isin({bc for _, bc in rb_map.keys()})]
-            if c.empty:
+            if mapq_min > 0:
+                df = df[df["MAPQ"] >= mapq_min]
+            if xa_max >= 0:
+                df = df[df["XAcount"] <= xa_max]
+            if df.empty:
                 continue
 
-            pair_col = list(zip(c["Read"].astype(str), c["BC"].astype(str)))
-            c = c[[pair in keep_pairs for pair in pair_col]]
-            if c.empty:
+            # We only care about (Read,BC) pairs in rb_map
+            # Build pairs vector; avoid Python list membership per-row by using merge keys
+            reads = df["Read"].astype(str).to_numpy()
+            bcs2 = df["BC"].astype(str).to_numpy()
+            mask = np.fromiter(((r, b) in keep_pairs for r, b in zip(reads, bcs2)), dtype=bool, count=len(df))
+            if not mask.any():
                 continue
+            df = df.loc[mask]
 
-            for col in ("AS", "MAPQ", "NM", "XAcount"):
-                c[col] = pd.to_numeric(c[col], errors="coerce")
+            for row in df.itertuples(index=False):
+                read = str(row.Read)
+                bc = str(row.BC)
+                key = (read, bc)
 
-            for row in c.itertuples(index=False):
-                r, b = str(row.Read), str(row.BC)
+                klass = class_by.get(key, "ambiguous")
+                gwin = gwin_by.get(key, "")
+                pa, pm = p_lookup.get(key, (np.nan, np.nan))
 
-                keep_set = keep_genomes.get((r, b))
-                if keep_set is not None and len(keep_set) > 0 and genome not in keep_set:
+                # if winner-class, keep only the winner genome row
+                if klass == "winner" and genome != gwin:
                     continue
 
-                klass = class_by.get((r, b), "ambiguous")
-                pa, pm = p_lookup.get((r, b), (np.nan, np.nan))
-                base = row._asdict()
-                base.update(
+                out_rows.append(
                     {
+                        "Read": read,
+                        "BC": bc,
                         "Genome": genome,
-                        "delta_AS": np.nan,
+                        "AS": float(row.AS),
+                        "MAPQ": float(row.MAPQ),
+                        "NM": float(row.NM),
+                        "XAcount": float(row.XAcount),
                         "assigned_class": klass,
                         "p_as": pa,
                         "p_mq": pm,
                     }
                 )
 
-                if (klass != "winner") or (genome == gwin_by.get((r, b))):
-                    out_rows.append(base)
+    out_df = pd.DataFrame(out_rows)
+    out_df.to_csv(filt_out, sep="\t", index=False, compression="gzip")
 
-    pd.DataFrame(out_rows).to_csv(filt_out, sep="\t", index=False, compression="gzip")
+    _log_ok(f"[assign/score] ■ done {chunk_file.name} ({time.time()-t0:0.1f}s) raw={raw_out.name} filt={filt_out.name}", verbose)
 
 
-# ---------- convenience: run all three passes serially ----------
+# -----------------------------
+# Convenience pipeline: edges -> ecdfs -> score all chunks
+# -----------------------------
 @app.command()
-def assign_streaming_pipeline(
+def assign_streaming_pipeline_v2(
     workdir: Path = typer.Option(..., "--workdir"),
     sample: str = typer.Option(..., "--sample"),
     chunks_dir: Path = typer.Option(..., "--chunks-dir"),
     alpha: float = typer.Option(0.05, "--alpha"),
-    mapq_min: int = 20,
-    xa_max: int = 2,
-    chunksize: int = 1_000_000,
-    k: int = 10,
+    mapq_min: int = typer.Option(20, "--mapq-min"),
+    xa_max: int = typer.Option(2, "--xa-max"),
+    chunksize: int = typer.Option(500_000, "--chunksize"),
+    k: int = typer.Option(10, "--k"),
+    batch_size: int = typer.Option(16, "--batch-size"),
+    workers: int = typer.Option(4, "--workers"),
+    max_reads_per_genome: Optional[int] = typer.Option(None, "--max-reads-per-genome"),
+    verbose: bool = typer.Option(True, "--verbose/--quiet"),
 ):
-    edges_path = Path(workdir) / sample / "ExplorationReadLevel" / "global_edges.npz"
-    ecdf_path = Path(workdir) / sample / "ExplorationReadLevel" / "global_ecdf.npz"
-    if not edges_npz.exists():
-        learn_edges(
-        workdir, sample, chunks_dir, edges_path, mapq_min, xa_max, chunksize, k
-        )  # type: ignore
-    else:
-        typer.echo(f"[assign] reuse existing edges model: {edges_npz}")
+    """
+    Convenience:
+      - learn edges if missing
+      - learn ecdfs if missing
+      - score all chunks serially (safe) OR you can parallelize externally via SLURM array
+    """
+    exp_dir = Path(workdir) / sample / "ExplorationReadLevel"
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    edges_path = exp_dir / "global_edges.npz"
+    ecdf_path = exp_dir / "global_ecdf.npz"
 
-    if not ecdf_npz.exists():
-        learn_ecdfs(
-            workdir, sample, chunks_dir, edges_path, ecdf_path, mapq_min, xa_max, chunksize
-        )  # type: ignore
+    if not edges_path.exists():
+        _log(f"[assign] learn edges → {edges_path}", verbose)
+        learn_edges_v2(  # type: ignore
+            workdir=workdir,
+            sample=sample,
+            chunks_dir=chunks_dir,
+            out_model=edges_path,
+            mapq_min=mapq_min,
+            xa_max=xa_max,
+            chunksize=chunksize,
+            k=k,
+            batch_size=batch_size,
+            workers=workers,
+            max_reads_per_genome=max_reads_per_genome,
+            verbose=verbose,
+        )
     else:
-        typer.echo(f"[assign] reuse existing ECDF model: {ecdf_npz}")
-        
-    for chunk_file in sorted(Path(chunks_dir).glob("*_cell_map_ref_chunk_*.txt")):
-        score_chunk(
-            workdir,
-            sample,
-            chunk_file,
-            ecdf_path,
-            None,
-            None,
-            mapq_min,
-            xa_max,
-            chunksize,
-            alpha,
-        )  # type: ignore
+        _log(f"[assign] reuse edges model: {edges_path}", verbose)
+
+    if not ecdf_path.exists():
+        _log(f"[assign] learn ECDFs → {ecdf_path}", verbose)
+        learn_ecdfs_v2(  # type: ignore
+            workdir=workdir,
+            sample=sample,
+            chunks_dir=chunks_dir,
+            edges_model=edges_path,
+            out_model=ecdf_path,
+            mapq_min=mapq_min,
+            xa_max=xa_max,
+            chunksize=chunksize,
+            workers=workers,
+            verbose=verbose,
+        )
+    else:
+        _log(f"[assign] reuse ECDF model: {ecdf_path}", verbose)
+
+    chunk_files = sorted(Path(chunks_dir).glob("*_cell_map_ref_chunk_*.txt"))
+    if not chunk_files:
+        raise typer.BadParameter(f"No chunk files under {chunks_dir}")
+
+    _log(f"[assign/score] scoring {len(chunk_files)} chunks (serial). For parallel, run score-chunk-v2 in SLURM array.", verbose)
+
+    for ch in chunk_files:
+        score_chunk_v2(  # type: ignore
+            workdir=workdir,
+            sample=sample,
+            chunk_file=ch,
+            ecdf_model=ecdf_path,
+            out_raw_dir=None,
+            out_filtered_dir=None,
+            mapq_min=mapq_min,
+            xa_max=xa_max,
+            chunksize=chunksize,
+            alpha=alpha,
+            verbose=verbose,
+        )
 
 
 if __name__ == "__main__":
