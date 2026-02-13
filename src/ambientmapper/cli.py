@@ -440,7 +440,7 @@ def assign(
     resume: bool = typer.Option(True, "--resume/--no-resume"),
 ) -> None:
     """Learn edges/ECDFs and score each chunk (parallel)."""
-    from .assign_streaming import learn_edges_parallel, learn_ecdfs_parallel, score_chunk
+    from .assign_streaming import learn_edges, learn_ecdfs, score_chunk
 
     if only_score:
         skip_edges = True
