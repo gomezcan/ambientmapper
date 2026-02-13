@@ -412,11 +412,33 @@ def assign(
     ecdf_workers: Optional[int] = typer.Option(None, "--ecdf-workers"),
     chunksize: Optional[int] = typer.Option(None, "--chunksize"),
     batch_size: Optional[int] = typer.Option(None, "--batch-size"),
+    # ----------------------------
+    # NEW: step control flags
+    # ----------------------------
+    skip_edges: bool = typer.Option(
+        False,
+        "--skip-edges",
+        help="Skip learning global edges; requires ExplorationReadLevel/global_edges.npz to exist.",
+    ),
+    skip_ecdf: bool = typer.Option(
+        False,
+        "--skip-ecdf",
+        help="Skip learning global ECDFs; requires ExplorationReadLevel/global_ecdf.npz to exist.",
+    ),
+    only_score: bool = typer.Option(
+        False,
+        "--only-score",
+        help="Only score chunks; implies --skip-edges and --skip-ecdf (models must exist).",
+    ),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
     resume: bool = typer.Option(True, "--resume/--no-resume"),
 ) -> None:
     """Learn edges/ECDFs and score each chunk (parallel)."""
     from .assign_streaming import learn_edges_parallel, learn_ecdfs_parallel, score_chunk
+
+    if only_score:
+        skip_edges = True
+        skip_ecdf = True
 
     cfgs = _load_one_or_many_configs(config=config, configs=configs)
     for cfg in cfgs:
@@ -442,7 +464,6 @@ def assign(
 
         chunks_dir = d["chunks"]
         aconf = cfg.get("assign", {}) if isinstance(cfg.get("assign"), dict) else {}
-
         alpha_eff = float(aconf.get("alpha", 0.05))
         k_eff = int(aconf.get("k", 10))
         mapq_min_eff = int(aconf.get("mapq_min", 20))
@@ -458,6 +479,7 @@ def assign(
         if edges_max_reads_eff is not None and int(edges_max_reads_eff) <= 0:
             edges_max_reads_eff = None
 
+        # NOTE: sentinel should not gate partial runs; only gate full runs.
         params = {
             "threads": threads_eff,
             "alpha": alpha_eff,
@@ -469,9 +491,13 @@ def assign(
             "edges_workers": edges_workers_eff,
             "ecdf_workers": ecdf_workers_eff,
             "edges_max_reads": edges_max_reads_eff,
+            "skip_edges": bool(skip_edges),
+            "skip_ecdf": bool(skip_ecdf),
+            "only_score": bool(only_score),
         }
 
-        if resume and _has_sentinel(d, "assign", cfg, params):
+        # If doing a partial run, DO NOT skip via sentinel (because outputs are partial).
+        if (not skip_edges) and (not skip_ecdf) and resume and _has_sentinel(d, "assign", cfg, params):
             typer.echo(f"[assign] skip (sentinel): {sample}")
             continue
 
@@ -482,51 +508,72 @@ def assign(
 
         exp_dir = workdir / sample / "ExplorationReadLevel"
         exp_dir.mkdir(parents=True, exist_ok=True)
-
         edges_npz = exp_dir / "global_edges.npz"
         ecdf_npz = exp_dir / "global_ecdf.npz"
+
+        if skip_edges and not edges_npz.exists():
+            raise typer.BadParameter(
+                f"--skip-edges requested but missing edges model: {edges_npz}. "
+                f"Run without --skip-edges at least once."
+            )
+        if skip_ecdf and not ecdf_npz.exists():
+            raise typer.BadParameter(
+                f"--skip-ecdf requested but missing ECDF model: {ecdf_npz}. "
+                f"Run without --skip-ecdf at least once."
+            )
 
         if verbose:
             typer.echo(
                 f"[assign] {sample} chunksize={chunksize_val:,} batch_size={batch_size_val} threads={threads_eff} "
                 f"edges_workers={edges_workers_eff} ecdf_workers={ecdf_workers_eff}"
                 + (f" edges_max_reads={int(edges_max_reads_eff):,}" if edges_max_reads_eff is not None else "")
+                + (" [only-score]" if only_score else "")
+                + (" [skip-edges]" if (skip_edges and not only_score) else "")
+                + (" [skip-ecdf]" if (skip_ecdf and not only_score) else "")
             )
 
-        learn_edges_parallel(
-            workdir=workdir,
-            sample=sample,
-            chunks_dir=chunks_dir,
-            out_model=edges_npz,
-            mapq_min=mapq_min_eff,
-            xa_max=xa_max_eff,
-            chunksize=chunksize_val,
-            k=k_eff,
-            batch_size=batch_size_val,
-            threads=threads_eff,
-            verbose=verbose,
-            edges_workers=edges_workers_eff,
-            edges_max_reads=edges_max_reads_eff,
-        )
+        # (1) edges
+        if not skip_edges:
+            learn_edges_parallel(
+                workdir=workdir,
+                sample=sample,
+                chunks_dir=chunks_dir,
+                out_model=edges_npz,
+                mapq_min=mapq_min_eff,
+                xa_max=xa_max_eff,
+                chunksize=chunksize_val,
+                k=k_eff,
+                batch_size=batch_size_val,
+                threads=threads_eff,
+                verbose=verbose,
+                edges_workers=edges_workers_eff,
+                edges_max_reads=edges_max_reads_eff,
+            )
+        else:
+            if verbose:
+                typer.echo(f"[assign/edges] skip: reuse {edges_npz}")
 
-        learn_ecdfs_parallel(
-            workdir=workdir,
-            sample=sample,
-            chunks_dir=chunks_dir,
-            edges_model=edges_npz,
-            out_model=ecdf_npz,
-            mapq_min=mapq_min_eff,
-            xa_max=xa_max_eff,
-            chunksize=chunksize_val,
-            verbose=verbose,
-            workers=ecdf_workers_eff,
-        )
+        # (2) ecdf
+        if not skip_ecdf:
+            learn_ecdfs_parallel(
+                workdir=workdir,
+                sample=sample,
+                chunks_dir=chunks_dir,
+                edges_model=edges_npz,
+                out_model=ecdf_npz,
+                mapq_min=mapq_min_eff,
+                xa_max=xa_max_eff,
+                chunksize=chunksize_val,
+                verbose=verbose,
+                workers=ecdf_workers_eff,
+            )
+        else:
+            if verbose:
+                typer.echo(f"[assign/ecdf] skip: reuse {ecdf_npz}")
 
-        threads_eff = int(threads) if threads is not None else 2
-        pool_n = max(1, min(score_workers_eff, 2))  # for local-friendly default cap
-        
+        # (3) score chunks
+        pool_n = min(threads_eff, len(chunk_files))
         typer.echo(f"[assign/score] {sample}: start {len(chunk_files)} chunks, procs={pool_n}")
-
         with ProcessPoolExecutor(max_workers=pool_n) as ex:
             fut = {
                 ex.submit(
@@ -547,14 +594,18 @@ def assign(
             for f in as_completed(fut):
                 f.result()
 
-        outputs = {
-            "edges_model": str(edges_npz),
-            "ecdf_model": str(ecdf_npz),
-            "chunks_dir": str(chunks_dir),
-            "n_chunks": len(chunk_files),
-        }
-        sp = _write_sentinel(d, step="assign", cfg=cfg, params=params, outputs=outputs)
-        typer.echo(f"[assign] done: {sample} sentinel={sp.name}")
+        # Only write an assign sentinel for FULL runs (so it remains meaningful).
+        if (not skip_edges) and (not skip_ecdf):
+            outputs = {
+                "edges_model": str(edges_npz),
+                "ecdf_model": str(ecdf_npz),
+                "chunks_dir": str(chunks_dir),
+                "n_chunks": len(chunk_files),
+            }
+            sp = _write_sentinel(d, step="assign", cfg=cfg, params=params, outputs=outputs)
+            typer.echo(f"[assign] done: {sample} sentinel={sp.name}")
+        else:
+            typer.echo(f"[assign] done: {sample} (partial run; no sentinel)")
 
 
 @app.command()
