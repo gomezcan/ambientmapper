@@ -541,7 +541,7 @@ def assign(
 
         # (1) edges
         if not skip_edges:
-            learn_edges_parallel(
+            learn_edges(
                 workdir=workdir,
                 sample=sample,
                 chunks_dir=chunks_dir,
@@ -562,7 +562,7 @@ def assign(
 
         # (2) ecdf
         if not skip_ecdf:
-            learn_ecdfs_parallel(
+            learn_ecdfs(
                 workdir=workdir,
                 sample=sample,
                 chunks_dir=chunks_dir,
