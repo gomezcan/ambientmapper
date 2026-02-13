@@ -426,15 +426,14 @@ def assign(
         help="Skip learning global ECDFs; requires ExplorationReadLevel/global_ecdf.npz to exist.",
     ),
     only_score: bool = typer.Option(
-            False,
+        False,
         "--only-score",
         help="Only score chunks; implies --skip-edges and --skip-ecdf (models must exist).",
     ),
     score_workers: Optional[int] = typer.Option(
-            None,
-            "--score-workers",
-            help="Number of parallel workers for scoring chunks. "
-            "Default: 2 (independent of --threads).",
+        None,
+        "--score-workers",
+        help="Number of parallel workers for scoring chunks. Default: 2 (independent of --threads).",
     ),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
     resume: bool = typer.Option(True, "--resume/--no-resume"),
@@ -470,6 +469,7 @@ def assign(
 
         chunks_dir = d["chunks"]
         aconf = cfg.get("assign", {}) if isinstance(cfg.get("assign"), dict) else {}
+
         alpha_eff = float(aconf.get("alpha", 0.05))
         k_eff = int(aconf.get("k", 10))
         mapq_min_eff = int(aconf.get("mapq_min", 20))
@@ -484,6 +484,8 @@ def assign(
         edges_max_reads_eff = aconf.get("edges_max_reads", None)
         if edges_max_reads_eff is not None and int(edges_max_reads_eff) <= 0:
             edges_max_reads_eff = None
+        if edges_max_reads_eff is not None:
+            edges_max_reads_eff = int(edges_max_reads_eff)
 
         # NOTE: sentinel should not gate partial runs; only gate full runs.
         params = {
@@ -528,6 +530,10 @@ def assign(
                 f"Run without --skip-ecdf at least once."
             )
 
+        # scoring workers is independent of --threads; default 2
+        score_workers_eff = 2 if score_workers is None else max(1, int(score_workers))
+        pool_n = min(score_workers_eff, len(chunk_files))
+
         if verbose:
             typer.echo(
                 f"[assign] {sample} chunksize={chunksize_val:,} batch_size={batch_size_val} threads={threads_eff} "
@@ -551,10 +557,9 @@ def assign(
                 chunksize=chunksize_val,
                 k=k_eff,
                 batch_size=batch_size_val,
-                threads=threads_eff,
+                workers=edges_workers_eff,
+                max_reads_per_genome=edges_max_reads_eff,
                 verbose=verbose,
-                edges_workers=edges_workers_eff,
-                edges_max_reads=edges_max_reads_eff,
             )
         else:
             if verbose:
@@ -571,22 +576,15 @@ def assign(
                 mapq_min=mapq_min_eff,
                 xa_max=xa_max_eff,
                 chunksize=chunksize_val,
-                verbose=verbose,
                 workers=ecdf_workers_eff,
+                verbose=verbose,
             )
         else:
             if verbose:
                 typer.echo(f"[assign/ecdf] skip: reuse {ecdf_npz}")
 
-        # (3) score chunks: scoring workers independent from edges/ecdf threads        
-        if score_workers is None:
-            score_workers_eff = 2
-        else:
-            score_workers_eff = max(1, int(score_workers))
-            
-        pool_n = min(score_workers_eff, len(chunk_files))
-        
-        typer.echo(f"[assign/score] {sample}: start {len(chunk_files)} chunks, "f"procs={pool_n}")
+        # (3) score chunks
+        typer.echo(f"[assign/score] {sample}: start {len(chunk_files)} chunks, procs={pool_n}")
         with ProcessPoolExecutor(max_workers=pool_n) as ex:
             fut = {
                 ex.submit(
@@ -601,6 +599,7 @@ def assign(
                     xa_max=xa_max_eff,
                     chunksize=chunksize_val,
                     alpha=alpha_eff,
+                    verbose=verbose,
                 ): chf
                 for chf in chunk_files
             }
@@ -619,6 +618,7 @@ def assign(
             typer.echo(f"[assign] done: {sample} sentinel={sp.name}")
         else:
             typer.echo(f"[assign] done: {sample} (partial run; no sentinel)")
+
 
 
 @app.command()
