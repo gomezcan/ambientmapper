@@ -426,9 +426,15 @@ def assign(
         help="Skip learning global ECDFs; requires ExplorationReadLevel/global_ecdf.npz to exist.",
     ),
     only_score: bool = typer.Option(
-        False,
+            False,
         "--only-score",
         help="Only score chunks; implies --skip-edges and --skip-ecdf (models must exist).",
+    ),
+    score_workers: Optional[int] = typer.Option(
+            None,
+            "--score-workers",
+            help="Number of parallel workers for scoring chunks. "
+            "Default: 2 (independent of --threads).",
     ),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
     resume: bool = typer.Option(True, "--resume/--no-resume"),
@@ -530,6 +536,7 @@ def assign(
                 + (" [only-score]" if only_score else "")
                 + (" [skip-edges]" if (skip_edges and not only_score) else "")
                 + (" [skip-ecdf]" if (skip_ecdf and not only_score) else "")
+                + f" score_workers={score_workers_eff}"
             )
 
         # (1) edges
@@ -571,9 +578,15 @@ def assign(
             if verbose:
                 typer.echo(f"[assign/ecdf] skip: reuse {ecdf_npz}")
 
-        # (3) score chunks
-        pool_n = min(threads_eff, len(chunk_files))
-        typer.echo(f"[assign/score] {sample}: start {len(chunk_files)} chunks, procs={pool_n}")
+        # (3) score chunks: scoring workers independent from edges/ecdf threads        
+        if score_workers is None:
+            score_workers_eff = 2
+        else:
+            score_workers_eff = max(1, int(score_workers))
+            
+        pool_n = min(score_workers_eff, len(chunk_files))
+        
+        typer.echo(f"[assign/score] {sample}: start {len(chunk_files)} chunks, "f"procs={pool_n}")
         with ProcessPoolExecutor(max_workers=pool_n) as ex:
             fut = {
                 ex.submit(
