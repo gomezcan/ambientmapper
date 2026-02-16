@@ -675,8 +675,9 @@ def genotyping(
     topk_genomes: Optional[int] = typer.Option(None, "--topk-genomes"),
     resume: bool = typer.Option(True, "--resume/--no-resume"),
 ) -> None:
-    """Posterior-aware genotyping (merge → per-cell genotype calls)."""
-    from .genotyping import genotyping as _run_genotyping
+    """Posterior-aware genotyping (merge → per-cell genotype calls)."""    
+    from .genotyping import run_genotyping as _run_genotyping
+
 
     cfg = _load_config(config)
     d = _cfg_dirs(cfg)
