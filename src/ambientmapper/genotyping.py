@@ -4,17 +4,29 @@ src/ambientmapper/genotyping.py
 
 ambientmapper genotyping — posterior-aware merge → per-cell genotype calls (+ empty-aware)
 
-This version:
-- Matches ambientmapper/cli.py genotyping parameter set (no "unexpected keyword argument" errors).
-- Uses empty parameters in the model (empty_bic_margin, empty_seed_bic_min, empty_jsd_max, jsd_normalize).
-- Implements chunk-defined spill/calling by default when chunk lists are available:
-    - assign outputs are per-chunk (cell_map_ref_chunks/*_filtered.tsv.gz)
-    - barcode lists are per-chunk (cell_map_ref_chunks/*_cell_map_ref_chunk_*.txt)
-  This makes Pass3 calling "bulletproof": each barcode is called exactly once.
-- Falls back to hashed shard spill if chunk lists are not found.
+Key behaviors (DO NOT change gate design):
+- Decision 1 (Empty/Noise): compare BIC_empty vs min(BIC_single, BIC_doublet) using empty_bic_margin,
+  and optionally constrain empties by eta-likeness (JSD) + simple structural gates.
+- Decision 2 (Singlet vs Doublet): compare BIC_single vs BIC_doublet using bic_margin (ΔBIC gate).
+- Purity/strength sublabels: use near_tie_margin (optional) + purity thresholds to label dirty_singlet/weak_doublet.
 
-Notes:
-- Input expected columns: Read/BC/Genome/AS/MAPQ/NM/assigned_class (gz or plain tsv accepted).
+Shard policy (NEW, requested):
+- If you provide --cell-chunks-glob pointing to the *cell_map_ref_chunk_XXXX.txt files, we precompute
+  barcode->chunk_id and route reads to shards based on chunk_id (deterministic; no barcode appears in >1 chunk).
+- If no cell chunk lists are available, we fall back to hash(barcode) % shards.
+
+Calling is made bulletproof:
+- For each shard spill file, we accumulate rows per barcode across all read_csv chunks and call each barcode once.
+  This is safe because each spill file corresponds to a small set of barcodes under the new shard policy.
+
+CLI compatibility (FIXED):
+- The genotyping() command accepts the same kwargs that ambientmapper/cli.py forwards:
+  config, assign (optional), outdir (optional), sample (optional), plus all tuning knobs.
+- Unknown keyword errors (e.g., empty_bic_margin, assign) are eliminated.
+
+Expected inputs:
+- assign "filtered" outputs: TSV(.gz) with columns like Read, BC, Genome, AS, MAPQ, NM, assigned_class, ...
+- cell chunk lists: one barcode per line, e.g. subset2000_Seedling_cell_map_ref_chunk_0001.txt
 """
 
 from __future__ import annotations
@@ -38,9 +50,8 @@ app = typer.Typer(add_completion=False, no_args_is_help=True)
 
 
 # --------------------------------------------------------------------------------------
-# Config model
+# Config
 # --------------------------------------------------------------------------------------
-
 
 class MergeConfig(BaseModel):
     # Fusion / scoring -> posteriors
@@ -48,31 +59,37 @@ class MergeConfig(BaseModel):
     w_as: float = 1.0
     w_mapq: float = 1.0
     w_nm: float = 1.0
-    ambient_const: float = 1e-3
+    ambient_const: float = 1e-3  # ambient pseudocount in posterior denominator
 
-    # Calling thresholds / gates
+    # Calling thresholds
     min_reads: int = 5
     single_mass_min: float = 0.6
-    ratio_top1_top2_min: float = 2.0
     doublet_minor_min: float = 0.20
 
-    # Margins
-    bic_margin: float = 6.0            # single vs doublet confidence (near tie uses near_tie_margin)
-    near_tie_margin: float = 2.0       # if |BIC(single)-BIC(doublet)| <= near_tie_margin => near tie
-    empty_bic_margin: float = 10.0     # empty override margin: if bic_empty + empty_bic_margin < bic_best => empty
+    # BIC gates (match figure)
+    empty_bic_margin: float = 10.0      # Decision 1: empty vs non-empty
+    bic_margin: float = 6.0             # Decision 2: singlet vs doublet (ΔBIC >= bic_margin)
+
+    # Optional “near tie” band for dirty/weak labels (sub-gates)
+    near_tie_margin: float = 2.0
+
+    # Ratio/purity gate for singlets
+    ratio_top1_top2_min: float = 2.0
 
     # Ambient learning
     eta_iters: int = 2
-    eta_seed_quantile: float = 0.02
-    empty_tau_quantile: float = 0.95   # JSD quantile threshold
+    eta_seed_quantile: float = 0.02       # initial seed fraction by n_effective
+    empty_tau_quantile: float = 0.95      # refine seed by JSD threshold (quantile of "most eta-like")
 
-    # Empty gate (structure) to restrict eta candidates
+    # Empty structural gates (used for eta-seed refinement + optional empty call constraints)
     empty_top1_max: float = 0.6
     empty_ratio12_max: float = 1.5
     empty_reads_max: Optional[int] = None
 
-    # Empty seed strengthening
-    empty_seed_bic_min: float = 10.0   # require bic_best - bic_empty >= empty_seed_bic_min for eta-seed membership
+    # Eta seed quality (NEW, used ONLY for selecting eta training seed)
+    empty_seed_bic_min: float = 10.0
+
+    # Optional absolute JSD threshold for empty calling (if provided)
     empty_jsd_max: Optional[float] = None
     jsd_normalize: bool = True
 
@@ -91,94 +108,89 @@ class MergeConfig(BaseModel):
     # Posterior mode
     winner_only: bool = True
 
-    # Pass 1 parallelism
+    # Pass 1 parallelism (files)
     pass1_workers: int = 1
 
-    # Promiscuous ambiguous filter (assigned_class=="ambiguous" only)
+    # Promiscuous ambiguous filter (applies only to assigned_class=="ambiguous")
     max_hits: Optional[int] = None
     hits_delta_mapq: Optional[float] = None
     max_rows_per_read_guard: Optional[int] = 500
 
 
 # --------------------------------------------------------------------------------------
-# Config loader / inference
+# Config JSON helpers (minimal; matches your pipeline conventions)
 # --------------------------------------------------------------------------------------
-
 
 def _read_cfg_json(config_path: Path) -> Dict[str, Any]:
     with open(config_path, "rt") as f:
-        cfg = json.load(f)
-    return cfg
+        return json.load(f)
 
-
-def _infer_sample(cfg: Dict[str, Any], sample_override: Optional[str]) -> str:
+def _infer_sample(cfg_json: Dict[str, Any], sample_override: Optional[str]) -> str:
     if sample_override:
         return str(sample_override)
-    if "sample" in cfg and cfg["sample"]:
-        return str(cfg["sample"])
-    # fallback: config file stem
+    # common patterns
+    if "sample" in cfg_json and cfg_json["sample"]:
+        return str(cfg_json["sample"])
+    # fallback: try top-level name-like key
     return "sample"
 
-
-def _infer_paths(cfg: Dict[str, Any], sample: str) -> Dict[str, Path]:
+def _infer_paths(cfg_json: Dict[str, Any], sample: str) -> Dict[str, Path]:
     """
-    Best-effort inference of pipeline directories.
-    Prefers cfg['d'] if present (as seen in your traceback).
+    Matches the structure shown in your traceback: d['root'], d['qc'], d['filtered'], d['chunks'], d['final'].
     """
-    d: Dict[str, Path] = {}
-    if isinstance(cfg.get("d"), dict):
-        for k, v in cfg["d"].items():
-            try:
-                d[k] = Path(v)
-            except Exception:
-                pass
+    workdir = cfg_json.get("workdir", None)
+    if not workdir:
+        raise ValueError("config JSON missing required key: 'workdir'")
+    root = Path(workdir) / sample
 
-    # fallback if d not present
-    if not d:
-        workdir = Path(cfg.get("workdir", "."))
-        d["root"] = workdir / sample
-        d["filtered"] = d["root"] / "filtered"
-        d["chunks"] = d["root"] / "chunks"
-        d["final"] = d["root"] / "final"
+    # standard pipeline subdirs
+    qc = root / "qc"
+    filtered = root / "filtered"
+    chunks = root / "chunks"
+    final = root / "final"
 
-    # ensure key existence
-    for k in ["root", "filtered", "chunks", "final"]:
-        d.setdefault(k, d.get("root", Path(".")) / k)
-
-    return d
-
+    # some runs place cell_map_ref_chunks under chunks/
+    return {"root": root, "qc": qc, "filtered": filtered, "chunks": chunks, "final": final}
 
 def _infer_assign_glob(d: Dict[str, Path]) -> str:
-    """
-    Default: <filtered>/cell_map_ref_chunks/*_filtered.tsv.gz
-    fallback: <chunks>/cell_map_ref_chunks/*_filtered.tsv.gz
-    """
-    p1 = d["filtered"] / "cell_map_ref_chunks" / "*_filtered.tsv.gz"
-    if glob.glob(str(p1)):
-        return str(p1)
-    p2 = d["chunks"] / "cell_map_ref_chunks" / "*_filtered.tsv.gz"
-    if glob.glob(str(p2)):
-        return str(p2)
-    # last resort: look under root
-    p3 = d["root"] / "cell_map_ref_chunks" / "*_filtered.tsv.gz"
-    return str(p3)
+    # expected assign filtered outputs live inside cell_map_ref_chunks under chunks/
+    candidates = [
+        str(d["chunks"] / "cell_map_ref_chunks" / "*_filtered.tsv.gz"),
+        str(d["chunks"] / "cell_map_ref_chunks" / "*_filtered.tsv"),
+        str(d["chunks"] / "cell_map_ref_chunks" / "*filtered.tsv.gz"),
+        str(d["chunks"] / "cell_map_ref_chunks" / "*filtered.tsv"),
+    ]
+    for pat in candidates:
+        if glob.glob(pat):
+            return pat
+    # last resort: search deeper
+    deep = str(d["root"] / "**" / "cell_map_ref_chunks" / "*_filtered.tsv.gz")
+    return deep
 
-
-def _infer_cell_chunks_glob_from_assign(assign_glob: str) -> str:
-    """
-    Default: same directory as assign glob, matching *_cell_map_ref_chunk_*.txt
-    """
-    parent = Path(assign_glob).parent
-    return str(parent / "*_cell_map_ref_chunk_*.txt")
+def _infer_cell_chunks_glob(d: Dict[str, Path]) -> str:
+    candidates = [
+        str(d["chunks"] / "cell_map_ref_chunks" / "*cell_map_ref_chunk_*.txt"),
+        str(d["chunks"] / "cell_map_ref_chunks" / "*chunk_*.txt"),
+    ]
+    for pat in candidates:
+        if glob.glob(pat):
+            return pat
+    deep = str(d["root"] / "**" / "cell_map_ref_chunks" / "*chunk_*.txt")
+    return deep
 
 
 # --------------------------------------------------------------------------------------
 # Helpers: schema and coercion
 # --------------------------------------------------------------------------------------
 
-
 def _coerce_assign_schema(df: pd.DataFrame) -> pd.DataFrame:
-    m = {"BC": "barcode", "Read": "read_id", "Genome": "genome"}
+    m = {
+        "BC": "barcode",
+        "Read": "read_id",
+        "Genome": "genome",
+        "p_as_decile": "p_as",
+        "p_mq_decile": "p_mq",
+    }
     out = df.rename(columns=m)
 
     required = ["barcode", "read_id", "genome", "AS", "MAPQ", "NM"]
@@ -208,18 +220,15 @@ def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------------------
-# Promiscuous ambiguous filter (MAPQ-based)
+# Promiscuous ambiguous filter (NumPy)
 # --------------------------------------------------------------------------------------
 
-
-def _filter_promiscuous_ambiguous_reads(
-    df: pd.DataFrame, cfg: MergeConfig
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def _filter_promiscuous_ambiguous_reads(df: pd.DataFrame, cfg: MergeConfig) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     if cfg.max_hits is None or cfg.hits_delta_mapq is None:
         return df, {"enabled": False}
 
     assigned = df["assigned_class"].to_numpy()
-    is_amb = assigned == "ambiguous"
+    is_amb = (assigned == "ambiguous")
     if not is_amb.any():
         return df, {"enabled": True, "dropped_groups": 0, "dropped_rows": 0}
 
@@ -292,15 +301,12 @@ def _filter_promiscuous_ambiguous_reads(
 
 
 # --------------------------------------------------------------------------------------
-# Posterior computation
+# Core: posterior computation (vectorized)
 # --------------------------------------------------------------------------------------
-
 
 def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame:
     df = df[["barcode", "read_id", "genome", "AS", "MAPQ", "NM"]].copy()
     df = df.dropna(subset=["barcode", "read_id", "genome"])
-    if df.empty:
-        return pd.DataFrame(columns=["barcode", "read_id", "genome", "L", "L_amb"])
 
     AS = df["AS"].to_numpy(np.float32, copy=False)
     MQ = df["MAPQ"].to_numpy(np.float32, copy=False)
@@ -323,6 +329,7 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
     max_per = np.full(n_codes, -np.inf, dtype=np.float32)
     np.maximum.at(max_per, codes, score)
     s = score - max_per[codes]
+
     w = np.exp(np.clip(float(cfg.beta) * s, -50, 50)).astype(np.float32)
     denom = np.bincount(codes, weights=w).astype(np.float32) + float(cfg.ambient_const)
 
@@ -335,7 +342,6 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
 # Likelihood / BIC / JSD
 # --------------------------------------------------------------------------------------
 
-
 def _loglik_empty(L_block: pd.DataFrame, eta: pd.Series) -> float:
     eta_row = eta.reindex(L_block["genome"]).fillna(0.0).to_numpy(dtype=float)
     wL = eta_row * L_block["L"].to_numpy(dtype=float)
@@ -346,7 +352,6 @@ def _loglik_empty(L_block: pd.DataFrame, eta: pd.Series) -> float:
         .to_numpy()
     )
     return float(np.log(np.clip(s, 1e-12, None)).sum())
-
 
 def _loglik_for_params(
     L_block: pd.DataFrame,
@@ -376,10 +381,8 @@ def _loglik_for_params(
     )
     return float(np.log(np.clip(s, 1e-12, None)).sum())
 
-
 def _bic(loglik: float, n_params: int, n_reads: int) -> float:
     return -2.0 * loglik + n_params * math.log(max(n_reads, 1))
-
 
 def _barcode_jsd_from_mass(mass: pd.Series, eta: pd.Series, normalize: bool = True) -> float:
     idx = sorted(set(mass.index) | set(eta.index))
@@ -398,9 +401,8 @@ def _barcode_jsd_from_mass(mass: pd.Series, eta: pd.Series, normalize: bool = Tr
 
 
 # --------------------------------------------------------------------------------------
-# Model selection + gates
+# Model selection (implements your original gate design)
 # --------------------------------------------------------------------------------------
-
 
 def _select_model_for_barcode(
     L_block: pd.DataFrame,
@@ -417,6 +419,9 @@ def _select_model_for_barcode(
     p_top1 = float(props[0]) if len(props) > 0 else 0.0
     p_top2 = float(props[1]) if len(props) > 1 else 0.0
     ratio12 = (p_top1 / max(p_top2, 1e-12)) if p_top2 > 0 else float("inf")
+    minor_frac = float(min(p_top1, p_top2)) if (p_top1 > 0 and p_top2 > 0) else 0.0
+
+    jsd = _barcode_jsd_from_mass(mass, eta, normalize=bool(cfg.jsd_normalize))
 
     out: Dict[str, Any] = {
         "n_reads": read_count,
@@ -425,199 +430,241 @@ def _select_model_for_barcode(
         "p_top2": p_top2,
         "ratio12": ratio12,
         "top_genome": (mass.index[0] if len(mass) else None),
-        "jsd_to_eta": _barcode_jsd_from_mass(mass, eta, normalize=bool(cfg.jsd_normalize)),
+        "jsd_to_eta": jsd,
+        "doublet_minor_frac": minor_frac,
     }
 
-    out["bic_empty"] = _bic(_loglik_empty(L_block, eta), 0, read_count)
+    # Always compute empty BIC
+    bic_empty = _bic(_loglik_empty(L_block, eta), 0, read_count)
+    out["bic_empty"] = float(bic_empty)
+
+    # if too few reads, stop early
+    if read_count < int(cfg.min_reads) or not candidate_genomes:
+        out.update(
+            call="low_reads",
+            model=None,
+            genome_1=None,
+            genome_2=None,
+            bic_best=None,
+            alpha=None,
+            rho=None,
+            bic_single=None,
+            bic_doublet=None,
+            bic_gap_sd=None,
+            near_tie_sd=None,
+        )
+        return out
+
+    # Fit best singlet/doublet on candidate genomes
+    alphas = np.arange(0.0, float(cfg.max_alpha) + 1e-9, float(cfg.alpha_grid))
 
     best_single: Optional[Dict[str, Any]] = None
+    for g1 in candidate_genomes:
+        for a in alphas:
+            bic = _bic(_loglik_for_params(L_block, eta, "single", g1, None, float(a)), 1, read_count)
+            if best_single is None or bic < best_single["bic"]:
+                best_single = {"model": "single", "g1": g1, "alpha": float(a), "bic": float(bic)}
+
     best_doublet: Optional[Dict[str, Any]] = None
+    if len(candidate_genomes) >= 2:
+        rhos = np.arange(0.1, 0.9 + 1e-9, float(cfg.rho_grid))
+        for i in range(len(candidate_genomes)):
+            for j in range(i + 1, len(candidate_genomes)):
+                g1, g2 = candidate_genomes[i], candidate_genomes[j]
+                for a in alphas:
+                    for r in rhos:
+                        bic = _bic(_loglik_for_params(L_block, eta, "doublet", g1, g2, float(a), float(r)), 2, read_count)
+                        if best_doublet is None or bic < best_doublet["bic"]:
+                            best_doublet = {"model": "doublet", "g1": g1, "g2": g2, "alpha": float(a), "rho": float(r), "bic": float(bic)}
 
-    if read_count >= cfg.min_reads and candidate_genomes:
-        alphas = np.arange(0.0, float(cfg.max_alpha) + 1e-9, float(cfg.alpha_grid))
+    bic_s = float(best_single["bic"]) if best_single else float("inf")
+    bic_d = float(best_doublet["bic"]) if best_doublet else float("inf")
+    out["bic_single"] = bic_s if np.isfinite(bic_s) else None
+    out["bic_doublet"] = bic_d if np.isfinite(bic_d) else None
 
-        for g1 in candidate_genomes:
-            for a in alphas:
-                bic = _bic(_loglik_for_params(L_block, eta, "single", g1, None, float(a)), 1, read_count)
-                if best_single is None or bic < best_single["bic"]:
-                    best_single = {"model": "single", "g1": g1, "alpha": float(a), "bic": float(bic)}
+    # ------------------------------------------------------------------
+    # Decision 1: Empty/Noise (BIC margin is empty_bic_margin, per design)
+    # Optional: also constrain by structural gates and/or absolute JSD threshold.
+    # ------------------------------------------------------------------
+    bic_best_non_empty = min(bic_s, bic_d)
+    empty_by_bic = (bic_empty + float(cfg.empty_bic_margin)) < bic_best_non_empty
 
-        if len(candidate_genomes) >= 2:
-            rhos = np.arange(0.1, 0.9 + 1e-9, float(cfg.rho_grid))
-            for i in range(len(candidate_genomes)):
-                for j in range(i + 1, len(candidate_genomes)):
-                    g1, g2 = candidate_genomes[i], candidate_genomes[j]
-                    for a in alphas:
-                        for r in rhos:
-                            bic = _bic(
-                                _loglik_for_params(L_block, eta, "doublet", g1, g2, float(a), float(r)),
-                                2,
-                                read_count,
-                            )
-                            if best_doublet is None or bic < best_doublet["bic"]:
-                                best_doublet = {
-                                    "model": "doublet",
-                                    "g1": g1,
-                                    "g2": g2,
-                                    "alpha": float(a),
-                                    "rho": float(r),
-                                    "bic": float(bic),
-                                }
+    # structural candidate (your Part 3 structural gate idea)
+    structural_empty = (p_top1 <= float(cfg.empty_top1_max)) and (ratio12 <= float(cfg.empty_ratio12_max))
+    if cfg.empty_reads_max is not None:
+        structural_empty = structural_empty and (read_count <= int(cfg.empty_reads_max))
 
-    bic_s = best_single["bic"] if best_single else float("inf")
-    bic_d = best_doublet["bic"] if best_doublet else float("inf")
-    best_non_empty = best_single if bic_s <= bic_d else best_doublet
-    bic_best = min(bic_s, bic_d)
-    bic_second = max(bic_s, bic_d)
-    bic_gap = float(bic_second - bic_best) if np.isfinite(bic_second) else float("inf")
+    jsd_ok = True
+    if cfg.empty_jsd_max is not None:
+        jsd_ok = (jsd <= float(cfg.empty_jsd_max))
 
-    out["bic_gap_sd"] = float(bic_gap)
-    out["call"] = "low_reads" if read_count < cfg.min_reads else "uncalled"
-    out["model"] = None
-    out["genome_1"] = None
-    out["genome_2"] = None
-    out["bic_best"] = None
-    out["alpha"] = None
-    out["rho"] = None
-
-    if best_non_empty is None:
+    if empty_by_bic and structural_empty and jsd_ok:
+        out.update(
+            call="empty",
+            model="empty",
+            genome_1=None,
+            genome_2=None,
+            bic_best=float(bic_empty),
+            alpha=None,
+            rho=None,
+            bic_gap_sd=None,
+            near_tie_sd=None,
+        )
         return out
 
-    out["bic_best"] = float(best_non_empty["bic"])
-    out["model"] = best_non_empty["model"]
-    out["genome_1"] = best_non_empty.get("g1")
-    out["genome_2"] = best_non_empty.get("g2")
-    out["alpha"] = best_non_empty.get("alpha")
-    out["rho"] = best_non_empty.get("rho")
+    # ------------------------------------------------------------------
+    # Decision 2: Singlet vs Doublet using bic_margin (ΔBIC gate, per design)
+    # ------------------------------------------------------------------
+    # Define ΔBIC in the direction “single better than doublet” etc
+    # If both exist:
+    #  - single if bic_s + bic_margin < bic_d
+    #  - doublet if bic_d + bic_margin < bic_s
+    #  - else ambiguous between single/doublet
+    chosen: Optional[Dict[str, Any]] = None
+    call_core: str = "ambiguous"
 
-    # Empty override uses empty_bic_margin (not bic_margin)
-    if (out["bic_empty"] + float(cfg.empty_bic_margin)) < float(best_non_empty["bic"]):
-        out["call"] = "empty"
-        out["doublet_minor_frac"] = 0.0
-        out["near_tie_sd"] = False
+    if np.isfinite(bic_s) and np.isfinite(bic_d):
+        if (bic_s + float(cfg.bic_margin)) < bic_d:
+            chosen = best_single
+            call_core = "single"
+        elif (bic_d + float(cfg.bic_margin)) < bic_s:
+            chosen = best_doublet
+            call_core = "doublet"
+        else:
+            chosen = best_single if bic_s <= bic_d else best_doublet
+            call_core = "ambiguous"
+        bic_gap = abs(bic_s - bic_d)
+    else:
+        # Only one model exists
+        chosen = best_single if np.isfinite(bic_s) else best_doublet
+        call_core = "single" if (chosen and chosen["model"] == "single") else ("doublet" if chosen else "ambiguous")
+        bic_gap = float("inf")
+
+    out["bic_gap_sd"] = float(bic_gap) if np.isfinite(bic_gap) else None
+    out["near_tie_sd"] = bool(np.isfinite(bic_gap) and (bic_gap <= float(cfg.near_tie_margin)))
+
+    if chosen is None:
+        out.update(call="uncalled", model=None, genome_1=None, genome_2=None, bic_best=None, alpha=None, rho=None)
         return out
 
-    minor_frac = float(min(p_top1, p_top2)) if (p_top1 > 0 and p_top2 > 0) else 0.0
-    out["doublet_minor_frac"] = float(minor_frac)
+    out["model"] = chosen["model"]
+    out["genome_1"] = chosen.get("g1")
+    out["genome_2"] = chosen.get("g2")
+    out["alpha"] = chosen.get("alpha")
+    out["rho"] = chosen.get("rho")
+    out["bic_best"] = float(chosen["bic"])
 
-    near_tie = (bic_gap <= float(cfg.near_tie_margin))
-    out["near_tie_sd"] = bool(near_tie)
-
-    if best_non_empty["model"] == "single":
+    # ------------------------------------------------------------------
+    # Purity/strength sublabels (do not change core design; only label)
+    # ------------------------------------------------------------------
+    if call_core == "single":
         passes_mass = (p_top1 >= float(cfg.single_mass_min))
         passes_ratio = (ratio12 >= float(cfg.ratio_top1_top2_min))
-        if passes_mass and passes_ratio and (not near_tie):
+        if passes_mass and passes_ratio and (not out["near_tie_sd"]):
             out["call"] = "single_clean"
         else:
             out["call"] = "dirty_singlet"
-    else:
+    elif call_core == "doublet":
         passes_minor = (minor_frac >= float(cfg.doublet_minor_min))
-        if passes_minor and (not near_tie):
+        if passes_minor and (not out["near_tie_sd"]):
             out["call"] = "doublet"
         else:
             out["call"] = "weak_doublet"
+    else:
+        out["call"] = "ambiguous"
 
     return out
 
 
 # --------------------------------------------------------------------------------------
-# Chunk policy helpers
+# NEW: Cell chunk parsing for shard routing
 # --------------------------------------------------------------------------------------
 
+def _parse_chunk_id_from_path(p: Path, chunk_id_regex: str) -> Optional[int]:
+    m = re.search(chunk_id_regex, p.name)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
 
-def _infer_chunk_id(name: str, chunk_id_regex: str) -> Optional[str]:
-    rx = re.compile(chunk_id_regex)
-    m = rx.search(name)
-    return m.group(1) if m else None
+def _load_barcode_to_chunk_id(cell_chunks_glob: str, chunk_id_regex: str) -> Dict[str, int]:
+    """
+    Reads all chunk list files and returns barcode->chunk_id.
 
-
-def _load_chunk_barcode_lists(cell_chunks_glob: str, chunk_id_regex: str) -> Dict[str, set]:
-    out: Dict[str, set] = {}
-    rx = re.compile(chunk_id_regex)
-    files = sorted(glob.glob(cell_chunks_glob))
-    if not files:
-        return {}
-
-    for fp in files:
-        m = rx.search(Path(fp).name)
-        if not m:
+    Assumes each barcode appears in exactly one chunk list (your guarantee).
+    """
+    out: Dict[str, int] = {}
+    files = [Path(x) for x in glob.glob(cell_chunks_glob)]
+    for fp in sorted(files):
+        cid = _parse_chunk_id_from_path(fp, chunk_id_regex)
+        if cid is None:
             continue
-        cid = m.group(1)
-        bcs: set = set()
-        with open(fp, "rt") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
+        with open(fp, "rt") as f:
+            for line in f:
+                bc = line.strip()
+                if not bc:
                     continue
-                bcs.add(line.split()[0])
-        out[cid] = bcs
-
+                # keep first occurrence; duplicates indicate upstream violation
+                if bc not in out:
+                    out[bc] = cid
     return out
 
 
-# --------------------------------------------------------------------------------------
-# Pass 1 spill variants
-# --------------------------------------------------------------------------------------
+def _route_shards_for_barcodes(
+    barcodes: pd.Series,
+    cfg: MergeConfig,
+    bc_to_chunk: Optional[Dict[str, int]],
+) -> np.ndarray:
+    """
+    Returns shard id per barcode.
+    Priority: chunk-based routing if bc_to_chunk is available; else hash-based.
+    """
+    bcs = barcodes.astype(str).to_numpy()
 
+    if bc_to_chunk:
+        # vectorized lookup via pandas map
+        ser = pd.Series(bcs, dtype="string").map(bc_to_chunk)
+        # fallback for missing barcodes: hash routing
+        miss = ser.isna().to_numpy()
+        sid = np.empty(len(bcs), dtype=np.int32)
+
+        # chunk-based: shard = chunk_id % shards
+        cid = ser.fillna(-1).to_numpy(dtype=np.int64)
+        ok = (cid >= 0)
+        sid[ok] = (cid[ok] % int(cfg.shards)).astype(np.int32)
+
+        if miss.any():
+            h = pd.util.hash_pandas_object(pd.Series(bcs[miss], dtype="string"), index=False).to_numpy(np.uint64)
+            sid[miss] = (h % np.uint64(cfg.shards)).astype(np.int32)
+
+        return sid
+
+    # default: hash-based
+    h = pd.util.hash_pandas_object(pd.Series(bcs, dtype="string"), index=False).to_numpy(np.uint64)
+    return (h % np.uint64(cfg.shards)).astype(np.int32)
+
+
+# --------------------------------------------------------------------------------------
+# Pass 1: stream assign files -> (C_all, N_all) + shard spill
+# --------------------------------------------------------------------------------------
 
 @dataclass
 class Pass1Outputs:
     C: pd.DataFrame
     N: pd.DataFrame
-    spill_paths: List[Path]
+    shard_dir: Path
 
 
-def _pass1_chunkspill_one_file(
-    fp: Path,
-    cfg: MergeConfig,
-    spill_path: Path,
-    chunk_barcodes: Optional[set],
-) -> Tuple[pd.DataFrame, pd.DataFrame, Path]:
-    spill_path.parent.mkdir(parents=True, exist_ok=True)
-    wrote_header = False
-    C_parts: List[pd.DataFrame] = []
-    N_parts: List[pd.DataFrame] = []
-
-    with gzip.open(spill_path, "wt") as oh:
-        for raw in pd.read_csv(fp, sep="\t", chunksize=int(cfg.chunk_rows), low_memory=False):
-            df = _coerce_assign_schema(raw)
-            df = _reduce_alignments_to_per_genome(df)
-            df = df.dropna(subset=["barcode", "read_id", "genome"])
-            if df.empty:
-                continue
-
-            if chunk_barcodes is not None:
-                df = df[df["barcode"].isin(chunk_barcodes)]
-                if df.empty:
-                    continue
-
-            df, _ = _filter_promiscuous_ambiguous_reads(df, cfg)
-            if df.empty:
-                continue
-
-            Ldf = _compute_read_posteriors(df, cfg)
-            if Ldf.empty:
-                continue
-
-            C_parts.append(Ldf.groupby(["barcode", "genome"], sort=False)["L"].sum().rename("C").reset_index())
-            N_parts.append(Ldf.groupby("barcode", sort=False)["read_id"].nunique().rename("n_reads").reset_index())
-
-            if not wrote_header:
-                oh.write("barcode\tread_id\tgenome\tL\tL_amb\n")
-                wrote_header = True
-            Ldf.to_csv(oh, sep="\t", header=False, index=False)
-
-    C_out = pd.concat(C_parts, ignore_index=True) if C_parts else pd.DataFrame(columns=["barcode", "genome", "C"])
-    N_out = pd.concat(N_parts, ignore_index=True) if N_parts else pd.DataFrame(columns=["barcode", "n_reads"])
-    return C_out, N_out, spill_path
-
-
-def _pass1_hashed_shards_one_file(
+def _pass1_process_one_file(
     fp: Path,
     cfg: MergeConfig,
     shard_dir: Path,
-) -> Tuple[pd.DataFrame, pd.DataFrame, List[Path]]:
+    bc_to_chunk: Optional[Dict[str, int]],
+) -> Pass1Outputs:
     shard_dir.mkdir(parents=True, exist_ok=True)
+
     handles = [gzip.open(shard_dir / f"shard_{i:02d}.tsv.gz", "at") for i in range(cfg.shards)]
     header_written = np.zeros(cfg.shards, dtype=bool)
 
@@ -628,10 +675,8 @@ def _pass1_hashed_shards_one_file(
         df = _coerce_assign_schema(raw)
         df = _reduce_alignments_to_per_genome(df)
         df = df.dropna(subset=["barcode", "read_id", "genome"])
-        if df.empty:
-            continue
 
-        df, _ = _filter_promiscuous_ambiguous_reads(df, cfg)
+        df, _meta = _filter_promiscuous_ambiguous_reads(df, cfg)
         if df.empty:
             continue
 
@@ -639,12 +684,22 @@ def _pass1_hashed_shards_one_file(
         if Ldf.empty:
             continue
 
-        C_parts.append(Ldf.groupby(["barcode", "genome"], sort=False)["L"].sum().rename("C").reset_index())
-        N_parts.append(Ldf.groupby("barcode", sort=False)["read_id"].nunique().rename("n_reads").reset_index())
+        C = (
+            Ldf.groupby(["barcode", "genome"], sort=False)["L"]
+            .sum()
+            .rename("C")
+            .reset_index()
+        )
+        N = (
+            Ldf.groupby("barcode", sort=False)["read_id"]
+            .nunique()
+            .rename("n_reads")
+            .reset_index()
+        )
+        C_parts.append(C)
+        N_parts.append(N)
 
-        bcs = Ldf["barcode"].astype(str)
-        h = pd.util.hash_pandas_object(bcs, index=False).to_numpy(np.uint64)
-        sid = (h % np.uint64(cfg.shards)).astype(np.int32)
+        sid = _route_shards_for_barcodes(Ldf["barcode"], cfg, bc_to_chunk)
         Ldf = Ldf.assign(_sid=sid)
 
         for i in range(cfg.shards):
@@ -661,30 +716,16 @@ def _pass1_hashed_shards_one_file(
 
     C_out = pd.concat(C_parts, ignore_index=True) if C_parts else pd.DataFrame(columns=["barcode", "genome", "C"])
     N_out = pd.concat(N_parts, ignore_index=True) if N_parts else pd.DataFrame(columns=["barcode", "n_reads"])
-    shard_paths = [shard_dir / f"shard_{i:02d}.tsv.gz" for i in range(cfg.shards)]
-    return C_out, N_out, shard_paths
 
-
-# --------------------------------------------------------------------------------------
-# Spill iterators
-# --------------------------------------------------------------------------------------
-
-
-def _iter_spills(spill_root: Path) -> Iterable[Path]:
-    yield from sorted(spill_root.glob("L_chunk_*.tsv.gz"))
-
-
-def _iter_shards(shard_root: Path) -> Iterable[Path]:
-    yield from sorted(shard_root.rglob("shard_*.tsv.gz"))
+    return Pass1Outputs(C=C_out, N=N_out, shard_dir=shard_dir)
 
 
 # --------------------------------------------------------------------------------------
 # Ambient learning (eta)
 # --------------------------------------------------------------------------------------
 
-
-def _compute_eta_from_files(
-    files_iter: Iterable[Path],
+def _compute_eta_from_shards(
+    shard_root: Path,
     target_bcs: Sequence[str],
     all_genomes: Sequence[str],
     cfg: MergeConfig,
@@ -696,9 +737,9 @@ def _compute_eta_from_files(
         eta = pd.Series({g: 1.0 for g in all_genomes}, dtype=float)
         return eta / eta.sum()
 
-    for fp in files_iter:
+    for shard in shard_root.rglob("shard_*.tsv.gz"):
         for chunk in pd.read_csv(
-            fp,
+            shard,
             sep="\t",
             compression="gzip",
             chunksize=int(cfg.pass2_chunksize),
@@ -715,7 +756,6 @@ def _compute_eta_from_files(
     eta = pd.Series(mix, dtype=float) + 1e-12
     return eta / eta.sum()
 
-
 def _pick_initial_eta_seed(C_all: pd.DataFrame, N_all: pd.DataFrame, cfg: MergeConfig) -> List[str]:
     if C_all.empty:
         return []
@@ -728,16 +768,18 @@ def _pick_initial_eta_seed(C_all: pd.DataFrame, N_all: pd.DataFrame, cfg: MergeC
     if df.empty:
         return []
 
-    q = min(max(float(cfg.eta_seed_quantile), 1e-6), 1.0)
+    q = float(cfg.eta_seed_quantile)
+    q = min(max(q, 1e-6), 1.0)
     n = max(1, int(math.ceil(q * len(df))))
     return df.sort_values("n_effective", ascending=True)["barcode"].head(n).astype(str).tolist()
 
-
-def _refine_eta_seed_by_jsd(
+def _refine_eta_seed_by_jsd_and_bic(
     C_all: pd.DataFrame,
     N_all: pd.DataFrame,
     eta: pd.Series,
     cfg: MergeConfig,
+    # Optional: pass precomputed bic evidence for empty-likeness; if not available, we use structural gates only.
+    empty_like_bcs: Optional[set] = None,
 ) -> List[str]:
     if C_all.empty:
         return []
@@ -745,6 +787,7 @@ def _refine_eta_seed_by_jsd(
     mass = C_all.groupby(["barcode", "genome"], sort=False)["C"].sum().reset_index()
     mass["rank"] = mass.groupby("barcode", sort=False)["C"].rank(method="first", ascending=False)
     top = mass[mass["rank"] <= 2].copy()
+
     top1 = top[top["rank"] == 1].set_index("barcode")["C"]
     top2 = top[top["rank"] == 2].set_index("barcode")["C"]
 
@@ -765,20 +808,19 @@ def _refine_eta_seed_by_jsd(
     cand = stats[(stats["p_top1"] <= float(cfg.empty_top1_max)) & (stats["ratio12"] <= float(cfg.empty_ratio12_max))]
     if cfg.empty_reads_max is not None:
         cand = cand[cand["n_reads"] <= int(cfg.empty_reads_max)]
+    if empty_like_bcs is not None:
+        cand = cand[cand.index.astype(str).isin(empty_like_bcs)]
+
     if cand.empty:
         cand = stats
 
-    cand_idx = set(cand.index.astype(str).tolist())
     jsd_vals: Dict[str, float] = {}
     for bc, sub in mass.groupby("barcode", sort=False):
         bc_s = str(bc)
-        if bc_s not in cand_idx:
+        if bc_s not in cand.index.astype(str):
             continue
         s = sub.set_index("genome")["C"]
-        jsd = _barcode_jsd_from_mass(s, eta, normalize=bool(cfg.jsd_normalize))
-        if cfg.empty_jsd_max is not None and jsd > float(cfg.empty_jsd_max):
-            continue
-        jsd_vals[bc_s] = jsd
+        jsd_vals[bc_s] = _barcode_jsd_from_mass(s, eta, normalize=bool(cfg.jsd_normalize))
 
     if not jsd_vals:
         return []
@@ -787,59 +829,11 @@ def _refine_eta_seed_by_jsd(
     tau = jsd_ser.quantile(float(cfg.empty_tau_quantile))
     return jsd_ser[jsd_ser <= tau].index.astype(str).tolist()
 
-
-def _filter_seed_by_bic_competitiveness(
-    files_iter: Iterable[Path],
-    seed: Sequence[str],
-    eta: pd.Series,
-    topk: Dict[str, List[str]],
-    cfg: MergeConfig,
-) -> List[str]:
-    """
-    Enforce --empty-seed-bic-min:
-      keep bc if bic_best - bic_empty >= empty_seed_bic_min
-    This is evaluated on full per-read L blocks (streamed from spill files).
-    """
-    target_set = set(map(str, seed))
-    if not target_set:
-        return []
-
-    acc: Dict[str, List[pd.DataFrame]] = {}
-    for fp in files_iter:
-        for chunk in pd.read_csv(
-            fp,
-            sep="\t",
-            compression="gzip",
-            chunksize=int(cfg.pass2_chunksize),
-            dtype={"barcode": "string", "read_id": "string", "genome": "string", "L": "float32", "L_amb": "float32"},
-        ):
-            sub = chunk[chunk["barcode"].isin(target_set)]
-            if sub.empty:
-                continue
-            for bc, g in sub.groupby("barcode", sort=False):
-                bc_s = str(bc)
-                acc.setdefault(bc_s, []).append(g[["read_id", "genome", "L"]].copy())
-
-    kept: List[str] = []
-    thresh = float(cfg.empty_seed_bic_min)
-    for bc_s, parts in acc.items():
-        L_block = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
-        cand = topk.get(bc_s, [])
-        res = _select_model_for_barcode(L_block, eta, cfg, cand)
-        bic_empty = float(res.get("bic_empty", float("inf")))
-        bic_best = float(res.get("bic_best", float("inf")))
-        if np.isfinite(bic_empty) and np.isfinite(bic_best):
-            if (bic_best - bic_empty) >= thresh:
-                kept.append(bc_s)
-    return kept
-
-
 def _learn_eta(
     C_all: pd.DataFrame,
     N_all: pd.DataFrame,
-    files_iter_factory,
+    shard_root: Path,
     all_genomes: Sequence[str],
-    topk: Dict[str, List[str]],
     cfg: MergeConfig,
 ) -> Tuple[pd.Series, Dict[str, Any]]:
     meta: Dict[str, Any] = {"iters": int(cfg.eta_iters), "seed_sizes": []}
@@ -847,66 +841,40 @@ def _learn_eta(
     seed = _pick_initial_eta_seed(C_all, N_all, cfg)
     meta["seed_sizes"].append(len(seed))
 
-    eta = _compute_eta_from_files(files_iter_factory(), seed, list(all_genomes), cfg)
+    eta = _compute_eta_from_shards(shard_root, seed, list(all_genomes), cfg)
 
+    # NOTE: we do not require BIC evidence here because BIC needs read-level blocks.
+    # If you want seed-by-BIC, you can add a pre-pass that computes empty-likeness per barcode and pass it in.
     for _ in range(int(cfg.eta_iters)):
-        seed = _refine_eta_seed_by_jsd(C_all, N_all, eta, cfg)
-        # enforce empty_seed_bic_min with current eta
-        if seed and cfg.empty_seed_bic_min is not None:
-            seed = _filter_seed_by_bic_competitiveness(files_iter_factory(), seed, eta, topk, cfg)
+        seed = _refine_eta_seed_by_jsd_and_bic(C_all, N_all, eta, cfg, empty_like_bcs=None)
         meta["seed_sizes"].append(len(seed))
         if not seed:
             break
-        eta = _compute_eta_from_files(files_iter_factory(), seed, list(all_genomes), cfg)
+        eta = _compute_eta_from_shards(shard_root, seed, list(all_genomes), cfg)
 
     return eta, meta
 
 
 # --------------------------------------------------------------------------------------
-# Calling
+# Calling: bulletproof per-shard file (call each barcode once)
 # --------------------------------------------------------------------------------------
 
-
-def _write_call_row(out_handle, bc_s: str, res: Dict[str, Any]) -> None:
-    out_handle.write(
-        "\t".join(
-            [
-                bc_s,
-                str(res.get("call", "")),
-                str(res.get("model", "")),
-                str(res.get("genome_1", "")),
-                str(res.get("genome_2", "")),
-                f"{float(res.get('alpha')):.6g}" if res.get("alpha") is not None else "",
-                f"{float(res.get('rho')):.6g}" if res.get("rho") is not None else "",
-                str(int(res.get("n_reads", 0))),
-                f"{float(res.get('n_effective', 0.0)):.6g}",
-                f"{float(res.get('p_top1', 0.0)):.6g}",
-                f"{float(res.get('p_top2', 0.0)):.6g}",
-                f"{float(res.get('ratio12', 0.0)):.6g}",
-                f"{float(res.get('jsd_to_eta', 0.0)):.6g}",
-                f"{float(res.get('bic_gap_sd', 0.0)):.6g}",
-                f"{float(res.get('doublet_minor_frac', 0.0)):.6g}" if res.get("doublet_minor_frac") is not None else "",
-                str(bool(res.get("near_tie_sd", False))),
-                f"{float(res.get('bic_empty', 0.0)):.6g}" if res.get("bic_empty") is not None else "",
-                f"{float(res.get('bic_best', 0.0)):.6g}" if res.get("bic_best") is not None else "",
-            ]
-        )
-        + "\n"
-    )
-
-
-def _call_from_file_streaming(
-    fp: Path,
+def _call_from_shard_file(
+    shard_path: Path,
     eta: pd.Series,
     topk: Dict[str, List[str]],
     cfg: MergeConfig,
     out_handle,
 ) -> int:
-    called = 0
-    acc: Dict[str, List[pd.DataFrame]] = {}
+    """
+    Bulletproof:
+    - Accumulate all rows per barcode across all read_csv chunks for this shard file.
+    - Call each barcode exactly once.
+    """
+    buckets: Dict[str, List[pd.DataFrame]] = {}
 
     for chunk in pd.read_csv(
-        fp,
+        shard_path,
         sep="\t",
         compression="gzip",
         chunksize=int(cfg.pass2_chunksize),
@@ -916,28 +884,63 @@ def _call_from_file_streaming(
             continue
         for bc, sub in chunk.groupby("barcode", sort=False):
             bc_s = str(bc)
-            acc.setdefault(bc_s, []).append(sub[["read_id", "genome", "L"]].copy())
+            buckets.setdefault(bc_s, []).append(sub[["read_id", "genome", "L"]].copy())
 
-    for bc_s, parts in acc.items():
+    called = 0
+    for bc_s, parts in buckets.items():
         L_block = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
         cand = topk.get(bc_s, [])
         res = _select_model_for_barcode(L_block, eta, cfg, cand)
-        _write_call_row(out_handle, bc_s, res)
+
+        out_handle.write(
+            "\t".join(
+                [
+                    bc_s,
+                    str(res.get("call", "")),
+                    str(res.get("model", "")),
+                    str(res.get("genome_1", "")),
+                    str(res.get("genome_2", "")),
+                    f"{float(res.get('alpha')):.6g}" if res.get("alpha") is not None else "",
+                    f"{float(res.get('rho')):.6g}" if res.get("rho") is not None else "",
+                    str(int(res.get("n_reads", 0))),
+                    f"{float(res.get('n_effective', 0.0)):.6g}",
+                    f"{float(res.get('p_top1', 0.0)):.6g}",
+                    f"{float(res.get('p_top2', 0.0)):.6g}",
+                    f"{float(res.get('ratio12', 0.0)):.6g}",
+                    f"{float(res.get('jsd_to_eta', 0.0)):.6g}",
+                    f"{float(res.get('bic_empty', 0.0)):.6g}" if res.get("bic_empty") is not None else "",
+                    f"{float(res.get('bic_best', 0.0)):.6g}" if res.get("bic_best") is not None else "",
+                    f"{float(res.get('bic_single')):.6g}" if res.get("bic_single") is not None else "",
+                    f"{float(res.get('bic_doublet')):.6g}" if res.get("bic_doublet") is not None else "",
+                    f"{float(res.get('bic_gap_sd')):.6g}" if res.get("bic_gap_sd") is not None else "",
+                    "1" if res.get("near_tie_sd") else "0" if res.get("near_tie_sd") is not None else "",
+                    f"{float(res.get('doublet_minor_frac', 0.0)):.6g}",
+                ]
+            )
+            + "\n"
+        )
         called += 1
 
     return called
 
 
 # --------------------------------------------------------------------------------------
-# Main command signature: matches cli.py forwarding
+# Main command (signature matches cli.py forwarded kwargs)
 # --------------------------------------------------------------------------------------
-
 
 @app.command()
 def genotyping(
-    # from cli
+    # REQUIRED by pipeline wrapper
     config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
-    assign: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs. If omitted, inferred."),
+    # Optional overrides / inferred defaults
+    assign: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs. If omitted, inferred from config/workdir."),
+    cell_chunks_glob: Optional[str] = typer.Option(
+        None,
+        "--cell-chunks-glob",
+        help="Glob to cell_map_ref_chunk_*.txt files listing barcodes per chunk. If omitted, inferred from config/workdir. "
+             "Used to route shards deterministically by chunk id.",
+    ),
+    chunk_id_regex: str = typer.Option(r"chunk_(\d+)", "--chunk-id-regex", help="Regex to extract chunk id from chunk list filename."),
     outdir: Optional[Path] = typer.Option(None, "--outdir", help="Override output dir (default: <workdir>/<sample>/final)."),
     sample: Optional[str] = typer.Option(None, "--sample", help="Override sample name from config."),
     # core
@@ -952,7 +955,8 @@ def genotyping(
     winner_only: Optional[bool] = typer.Option(None, "--winner-only/--no-winner-only"),
     # optional read-filter
     max_hits: Optional[int] = typer.Option(None, "--max-hits"),
-    hits_delta_mapq: Optional[int] = typer.Option(None, "--hits-delta-mapq"),
+    hits_delta_mapq: Optional[float] = typer.Option(None, "--hits-delta-mapq"),
+    max_rows_per_read_guard: Optional[int] = typer.Option(None, "--max-rows-per-read-guard"),
     # fusion
     beta: Optional[float] = typer.Option(None, "--beta"),
     w_as: Optional[float] = typer.Option(None, "--w-as"),
@@ -971,150 +975,144 @@ def genotyping(
     # doublet gates
     bic_margin: Optional[float] = typer.Option(None, "--bic-margin"),
     doublet_minor_min: Optional[float] = typer.Option(None, "--doublet-minor-min"),
+    near_tie_margin: Optional[float] = typer.Option(None, "--near-tie-margin"),
     # ambient iteration
     eta_iters: Optional[int] = typer.Option(None, "--eta-iters"),
     eta_seed_quantile: Optional[float] = typer.Option(None, "--eta-seed-quantile"),
     topk_genomes: Optional[int] = typer.Option(None, "--topk-genomes"),
     resume: bool = typer.Option(True, "--resume/--no-resume"),
-
-    # NEW: chunk policy knobs (optional; defaults inferred)
-    cell_chunks_glob: Optional[str] = typer.Option(
-        None,
-        "--cell-chunks-glob",
-        help="Glob to per-chunk barcode lists. If omitted, inferred from assign directory.",
-    ),
-    chunk_id_regex: str = typer.Option(r"chunk_(\d+)", "--chunk-id-regex"),
-):
+) -> None:
     cfg_json = _read_cfg_json(config)
     sample_eff = _infer_sample(cfg_json, sample)
     d = _infer_paths(cfg_json, sample_eff)
 
-    outdir_eff = Path(outdir) if outdir is not None else Path(d["final"])
+    outdir_eff = Path(outdir) if outdir is not None else d["final"]
     outdir_eff.mkdir(parents=True, exist_ok=True)
 
-    assign_eff = assign if assign is not None else _infer_assign_glob(d)
-    files = [Path(f) for f in glob.glob(assign_eff, recursive=True)]
-    if not files:
-        raise typer.BadParameter(f"No files matched: {assign_eff}")
+    assign_glob = assign if assign is not None else _infer_assign_glob(d)
+    cell_chunks_pat = cell_chunks_glob if cell_chunks_glob is not None else _infer_cell_chunks_glob(d)
 
-    # Infer cell_chunks_glob default from assign directory
-    cell_chunks_eff = cell_chunks_glob if cell_chunks_glob is not None else _infer_cell_chunks_glob_from_assign(assign_eff)
-
-    # Resolve effective params
+    # resolve effective worker count
     threads_eff = int(threads) if threads is not None else 1
     pass1_workers_eff = int(pass1_workers) if pass1_workers is not None else int(threads_eff)
-    shards_eff = int(shards) if shards is not None else 32
-    chunk_rows_eff = int(chunk_rows) if chunk_rows is not None else 5_000_000
-    pass2_chunksize_eff = int(pass2_chunksize) if pass2_chunksize is not None else 200_000
 
-    # Winner only default True if not specified
-    winner_only_eff = bool(winner_only) if winner_only is not None else True
-
-    # Optional read filter: enabled only if both provided and max_hits>0
+    # disable filter unless BOTH are provided and max_hits>0
     max_hits_eff = None if (max_hits is None or int(max_hits) <= 0) else int(max_hits)
-    hits_delta_mapq_eff = None if (hits_delta_mapq is None or max_hits_eff is None) else float(hits_delta_mapq)
+    hits_delta_mapq_eff = None if (max_hits_eff is None or hits_delta_mapq is None) else float(hits_delta_mapq)
 
+    # Build cfg from defaults then override with CLI where provided
     cfg = MergeConfig(
-        sample=sample_eff,
-        shards=shards_eff,
-        chunk_rows=chunk_rows_eff,
-        pass2_chunksize=pass2_chunksize_eff,
-        winner_only=winner_only_eff,
-        pass1_workers=pass1_workers_eff,
-
-        max_hits=max_hits_eff,
-        hits_delta_mapq=hits_delta_mapq_eff,
-
-        beta=float(beta) if beta is not None else 1.0,
-        w_as=float(w_as) if w_as is not None else 1.0,
-        w_mapq=float(w_mapq) if w_mapq is not None else 1.0,
-        w_nm=float(w_nm) if w_nm is not None else 1.0,
-        ambient_const=float(ambient_const) if ambient_const is not None else 1e-3,
-
-        min_reads=int(min_reads) if min_reads is not None else 5,
-        single_mass_min=float(single_mass_min) if single_mass_min is not None else 0.6,
-        ratio_top1_top2_min=float(ratio_top1_top2_min) if ratio_top1_top2_min is not None else 2.0,
-        doublet_minor_min=float(doublet_minor_min) if doublet_minor_min is not None else 0.20,
-
-        bic_margin=float(bic_margin) if bic_margin is not None else 6.0,
-        empty_bic_margin=float(empty_bic_margin) if empty_bic_margin is not None else 10.0,
-
-        empty_top1_max=float(empty_top1_max) if empty_top1_max is not None else 0.6,
-        empty_ratio12_max=float(empty_ratio12_max) if empty_ratio12_max is not None else 1.5,
-        empty_reads_max=int(empty_reads_max) if empty_reads_max is not None else None,
-        empty_seed_bic_min=float(empty_seed_bic_min) if empty_seed_bic_min is not None else 10.0,
-        empty_tau_quantile=float(empty_tau_quantile) if empty_tau_quantile is not None else 0.95,
-        empty_jsd_max=float(empty_jsd_max) if empty_jsd_max is not None else None,
-        jsd_normalize=bool(jsd_normalize) if jsd_normalize is not None else True,
-
-        eta_iters=int(eta_iters) if eta_iters is not None else 2,
-        eta_seed_quantile=float(eta_seed_quantile) if eta_seed_quantile is not None else 0.02,
-        topk_genomes=int(topk_genomes) if topk_genomes is not None else 3,
+        sample=str(sample_eff),
+        pass1_workers=int(pass1_workers_eff),
     )
 
-    # Resume behavior: if outputs exist, skip
-    calls_path = outdir_eff / f"{sample_eff}_genotype_calls.tsv.gz"
-    eta_out = outdir_eff / f"{sample_eff}_eta.tsv.gz"
-    if resume and calls_path.exists() and eta_out.exists():
-        typer.echo(f"[genotyping] resume: outputs exist, skipping: {calls_path.name}")
-        return
+    # apply overrides
+    if shards is not None:
+        cfg.shards = int(shards)
+    if chunk_rows is not None:
+        cfg.chunk_rows = int(chunk_rows)
+    if pass2_chunksize is not None:
+        cfg.pass2_chunksize = int(pass2_chunksize)
+    if winner_only is not None:
+        cfg.winner_only = bool(winner_only)
 
-    # Try enabling chunk policy automatically if chunk lists exist
-    chunk_map = _load_chunk_barcode_lists(cell_chunks_eff, chunk_id_regex)
-    use_chunk_policy = bool(chunk_map)
+    if max_rows_per_read_guard is not None:
+        cfg.max_rows_per_read_guard = int(max_rows_per_read_guard)
+    cfg.max_hits = max_hits_eff
+    cfg.hits_delta_mapq = hits_delta_mapq_eff
+
+    if beta is not None:
+        cfg.beta = float(beta)
+    if w_as is not None:
+        cfg.w_as = float(w_as)
+    if w_mapq is not None:
+        cfg.w_mapq = float(w_mapq)
+    if w_nm is not None:
+        cfg.w_nm = float(w_nm)
+    if ambient_const is not None:
+        cfg.ambient_const = float(ambient_const)
+
+    if min_reads is not None:
+        cfg.min_reads = int(min_reads)
+    if single_mass_min is not None:
+        cfg.single_mass_min = float(single_mass_min)
+    if ratio_top1_top2_min is not None:
+        cfg.ratio_top1_top2_min = float(ratio_top1_top2_min)
+
+    if empty_bic_margin is not None:
+        cfg.empty_bic_margin = float(empty_bic_margin)
+    if empty_top1_max is not None:
+        cfg.empty_top1_max = float(empty_top1_max)
+    if empty_ratio12_max is not None:
+        cfg.empty_ratio12_max = float(empty_ratio12_max)
+    if empty_reads_max is not None:
+        cfg.empty_reads_max = int(empty_reads_max)
+    if empty_seed_bic_min is not None:
+        cfg.empty_seed_bic_min = float(empty_seed_bic_min)
+    if empty_tau_quantile is not None:
+        cfg.empty_tau_quantile = float(empty_tau_quantile)
+    if empty_jsd_max is not None:
+        cfg.empty_jsd_max = float(empty_jsd_max)
+    if jsd_normalize is not None:
+        cfg.jsd_normalize = bool(jsd_normalize)
+
+    if bic_margin is not None:
+        cfg.bic_margin = float(bic_margin)
+    if doublet_minor_min is not None:
+        cfg.doublet_minor_min = float(doublet_minor_min)
+    if near_tie_margin is not None:
+        cfg.near_tie_margin = float(near_tie_margin)
+
+    if eta_iters is not None:
+        cfg.eta_iters = int(eta_iters)
+    if eta_seed_quantile is not None:
+        cfg.eta_seed_quantile = float(eta_seed_quantile)
+    if topk_genomes is not None:
+        cfg.topk_genomes = int(topk_genomes)
+
+    # resolve input files
+    files = [Path(f) for f in glob.glob(assign_glob, recursive=True)]
+    if not files:
+        raise typer.BadParameter(f"No files matched: {assign_glob}")
 
     tmp_dir = outdir_eff / f"tmp_{sample_eff}"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    shard_root = tmp_dir / "L_shards_workers"
+    shard_root.mkdir(parents=True, exist_ok=True)
 
-    if use_chunk_policy:
-        spill_root = tmp_dir / "L_chunk_spill"
-        spill_root.mkdir(parents=True, exist_ok=True)
-        typer.echo(f"[genotyping] chunk policy ON  chunks={len(chunk_map)}  cell_chunks_glob={cell_chunks_eff}")
+    # load barcode->chunk_id mapping for new shard policy (best-effort)
+    bc_to_chunk: Optional[Dict[str, int]] = None
+    chunk_files = glob.glob(cell_chunks_pat)
+    if chunk_files:
+        bc_to_chunk = _load_barcode_to_chunk_id(cell_chunks_pat, chunk_id_regex)
+        typer.echo(f"[genotyping] shard policy: chunk-based ({len(bc_to_chunk):,} barcodes from {len(chunk_files)} chunk files)")
     else:
-        shard_root = tmp_dir / "L_shards_workers"
-        shard_root.mkdir(parents=True, exist_ok=True)
-        typer.echo(f"[genotyping] chunk policy OFF (no chunk lists found) -> hashed shards shards={cfg.shards}")
+        typer.echo("[genotyping] shard policy: hash(barcode)%shards (no chunk list files found)")
 
-    typer.echo(f"[genotyping] sample={sample_eff} files={len(files)} pass1_workers={pass1_workers_eff}")
+    typer.echo(f"[genotyping] sample={sample_eff} files={len(files)} pass1_workers={pass1_workers_eff} shards={cfg.shards}")
+    typer.echo(f"[genotyping] assign_glob={assign_glob}")
+    typer.echo(f"[genotyping] filter: max_hits={cfg.max_hits} hits_delta_mapq={cfg.hits_delta_mapq} guard={cfg.max_rows_per_read_guard}")
     typer.echo(f"[genotyping] winner_only={cfg.winner_only} ambient_const={cfg.ambient_const}")
-    typer.echo(f"[genotyping] filter: max_hits={cfg.max_hits} hits_delta_mapq={cfg.hits_delta_mapq}")
+    typer.echo(f"[genotyping] gates: empty_bic_margin={cfg.empty_bic_margin} bic_margin={cfg.bic_margin} near_tie_margin={cfg.near_tie_margin}")
 
     # -----------------------
     # Pass 1
     # -----------------------
-    typer.echo("[1/3] Pass 1: stream assign -> C_all/N_all + spill")
+    typer.echo("[1/4] Pass 1: streaming assign inputs → per-read posteriors + spill shards")
     C_list: List[pd.DataFrame] = []
     N_list: List[pd.DataFrame] = []
-    spill_files: List[Path] = []
 
-    def _job_chunk(i: int, f: Path):
-        cid = _infer_chunk_id(f.name, chunk_id_regex) or f"{i:04d}"
-        bc_set = chunk_map.get(cid)
-        if bc_set is None:
-            raise ValueError(f"chunk_id={cid} (from {f.name}) not present in chunk barcode lists")
-        spill_path = spill_root / f"L_chunk_{cid}.tsv.gz"
-        return _pass1_chunkspill_one_file(f, cfg, spill_path, bc_set)
-
-    def _job_shard(i: int, f: Path):
+    def _job(i: int, f: Path) -> Pass1Outputs:
         wdir = shard_root / f"w{i:03d}"
-        return _pass1_hashed_shards_one_file(f, cfg, wdir)
+        return _pass1_process_one_file(f, cfg, wdir, bc_to_chunk)
 
     with ProcessPoolExecutor(max_workers=int(pass1_workers_eff)) as ex:
-        if use_chunk_policy:
-            futs = [ex.submit(_job_chunk, i, f) for i, f in enumerate(files)]
-        else:
-            futs = [ex.submit(_job_shard, i, f) for i, f in enumerate(files)]
-
+        futs = [ex.submit(_job, i, f) for i, f in enumerate(files)]
         for fut in as_completed(futs):
-            C_out, N_out, paths = fut.result()
-            if not C_out.empty:
-                C_list.append(C_out)
-            if not N_out.empty:
-                N_list.append(N_out)
-            if use_chunk_policy:
-                spill_files.append(paths)  # single spill file
-            else:
-                spill_files.extend(paths)  # list of shard files
+            out = fut.result()
+            if not out.C.empty:
+                C_list.append(out.C)
+            if not out.N.empty:
+                N_list.append(out.N)
 
     C_all = (
         pd.concat(C_list, ignore_index=True).groupby(["barcode", "genome"], sort=False)["C"].sum().reset_index()
@@ -1124,35 +1122,36 @@ def genotyping(
         pd.concat(N_list, ignore_index=True).groupby("barcode", sort=False)["n_reads"].sum().reset_index()
         if N_list else pd.DataFrame(columns=["barcode", "n_reads"])
     )
+
     if C_all.empty:
-        raise RuntimeError("Pass 1 produced no mass (C_all empty). Check inputs and schema.")
+        raise RuntimeError("Pass 1 produced no mass (C_all empty). Check input tables and schema.")
+
+    all_genomes = C_all["genome"].astype(str).unique().tolist()
+
+    # top-k genomes per barcode
+    topk: Dict[str, List[str]] = {}
+    for bc, sub in C_all.groupby("barcode", sort=False):
+        s = sub.sort_values("C", ascending=False)["genome"].astype(str).head(int(cfg.topk_genomes)).tolist()
+        topk[str(bc)] = s
 
     C_all.to_csv(outdir_eff / f"{sample_eff}_C_all.tsv.gz", sep="\t", index=False, compression="gzip")
     N_all.to_csv(outdir_eff / f"{sample_eff}_N_all.tsv.gz", sep="\t", index=False, compression="gzip")
-
-    all_genomes = C_all["genome"].astype(str).unique().tolist()
-    topk: Dict[str, List[str]] = {}
-    for bc, sub in C_all.groupby("barcode", sort=False):
-        topk[str(bc)] = sub.sort_values("C", ascending=False)["genome"].astype(str).head(int(cfg.topk_genomes)).tolist()
-
-    # choose iterator factory for eta learning / seed BIC filtering
-    if use_chunk_policy:
-        files_iter_factory = lambda: _iter_spills(spill_root)
-    else:
-        files_iter_factory = lambda: _iter_shards(shard_root)
+    typer.echo(f"[1/4] wrote: {sample_eff}_C_all.tsv.gz, {sample_eff}_N_all.tsv.gz")
 
     # -----------------------
-    # Pass 2: eta
+    # Pass 2
     # -----------------------
-    typer.echo("[2/3] Pass 2: ambient learning (eta)")
-    eta, eta_meta = _learn_eta(C_all, N_all, files_iter_factory, all_genomes, topk, cfg)
+    typer.echo("[2/4] Pass 2: ambient learning (eta) from shard spill")
+    eta, eta_meta = _learn_eta(C_all, N_all, shard_root, all_genomes, cfg)
+    eta_out = outdir_eff / f"{sample_eff}_eta.tsv.gz"
     eta.to_frame("eta").to_csv(eta_out, sep="\t", compression="gzip")
-    typer.echo(f"[2/3] eta saved: {eta_out.name} seed_sizes={eta_meta.get('seed_sizes')}")
+    typer.echo(f"[2/4] eta saved: {eta_out.name}  seed_sizes={eta_meta.get('seed_sizes')}")
 
     # -----------------------
-    # Pass 3: calls
+    # Pass 3
     # -----------------------
-    typer.echo("[3/3] Pass 3: calls")
+    typer.echo("[3/4] Pass 3: model selection / calls from shards")
+    calls_path = outdir_eff / f"{sample_eff}_genotype_calls.tsv.gz"
     with gzip.open(calls_path, "wt") as oh:
         oh.write(
             "\t".join(
@@ -1170,21 +1169,33 @@ def genotyping(
                     "p_top2",
                     "ratio12",
                     "jsd_to_eta",
-                    "bic_gap_sd",
-                    "doublet_minor_frac",
-                    "near_tie_sd",
                     "bic_empty",
                     "bic_best",
+                    "bic_single",
+                    "bic_doublet",
+                    "bic_gap_sd",
+                    "near_tie_sd",
+                    "doublet_minor_frac",
                 ]
             )
             + "\n"
         )
-        called_total = 0
-        for fp in sorted(set(spill_files)):
-            if fp.exists():
-                called_total += _call_from_file_streaming(fp, eta, topk, cfg, oh)
 
-    typer.echo(f"[genotyping] calls written: {calls_path.name} (rows={called_total})")
+        called_total = 0
+        for shard in sorted(shard_root.rglob("shard_*.tsv.gz")):
+            called_total += _call_from_shard_file(shard, eta, topk, cfg, oh)
+
+    typer.echo(f"[3/4] calls written: {calls_path.name} (emitted rows={called_total})")
+
+    # -----------------------
+    # Pass 4
+    # -----------------------
+    typer.echo("[4/4] Done.")
+    typer.echo(f"  - Mass table:   {outdir_eff / f'{sample_eff}_C_all.tsv.gz'}")
+    typer.echo(f"  - Reads table:  {outdir_eff / f'{sample_eff}_N_all.tsv.gz'}")
+    typer.echo(f"  - Eta:          {eta_out}")
+    typer.echo(f"  - Calls:        {calls_path}")
+    typer.echo(f"  - Shards root:  {shard_root}")
 
 
 if __name__ == "__main__":
