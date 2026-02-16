@@ -785,8 +785,7 @@ def genotyping(
     w_as: float = typer.Option(1.0, "--w-as"),
     w_mapq: float = typer.Option(1.0, "--w-mapq"),
     w_nm: float = typer.Option(1.0, "--w-nm"),
-    ambient_const: float = typer.Option(1e-3, "--ambient-const"),
-    min_reads: int = typer.Option(5, "--min-reads"),
+    ambient_const: float = typer.Option(1e-3, "--ambient-const"),    
     single_mass_min: float = typer.Option(0.6, "--single-mass-min"),
     ratio_top1_top2_min: float = typer.Option(2.0, "--ratio-top1-top2-min"),
 ):
