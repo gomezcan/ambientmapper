@@ -10,19 +10,15 @@ Key behaviors (DO NOT change gate design):
 - Decision 2 (Singlet vs Doublet): compare BIC_single vs BIC_doublet using bic_margin (ΔBIC gate).
 - Purity/strength sublabels: use near_tie_margin (optional) + purity thresholds to label dirty_singlet/weak_doublet.
 
-Shard policy (NEW, requested):
-- If you provide --cell-chunks-glob pointing to the *cell_map_ref_chunk_XXXX.txt files, we precompute
-  barcode->chunk_id and route reads to shards based on chunk_id (deterministic; no barcode appears in >1 chunk).
-- If no cell chunk lists are available, we fall back to hash(barcode) % shards.
+Shard policy (requested):
+- If --cell-chunks-glob points to cell_map_ref_chunk_*.txt barcode lists, we precompute barcode->chunk_id
+  and route reads to shards deterministically by chunk_id % shards.
+- Otherwise, fall back to hash(barcode) % shards.
 
-Calling is made bulletproof:
-- For each shard spill file, we accumulate rows per barcode across all read_csv chunks and call each barcode once.
-  This is safe because each spill file corresponds to a small set of barcodes under the new shard policy.
-
-CLI compatibility (FIXED):
-- The genotyping() command accepts the same kwargs that ambientmapper/cli.py forwards:
-  config, assign (optional), outdir (optional), sample (optional), plus all tuning knobs.
-- Unknown keyword errors (e.g., empty_bic_margin, assign) are eliminated.
+IMPORTANT entrypoint separation:
+- _run_genotyping(...) is a plain Python function and is the only function that cli.py should call.
+- genotyping_cmd(...) is the Typer CLI wrapper that parses flags and forwards them to _run_genotyping.
+  This prevents OptionInfo leakage when called programmatically (your previous crash).
 
 Expected inputs:
 - assign "filtered" outputs: TSV(.gz) with columns like Read, BC, Genome, AS, MAPQ, NM, assigned_class, ...
@@ -39,12 +35,13 @@ import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import typer
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
@@ -54,6 +51,15 @@ app = typer.Typer(add_completion=False, no_args_is_help=True)
 # --------------------------------------------------------------------------------------
 
 class MergeConfig(BaseModel):
+    """
+    Runtime config used by _run_genotyping.
+
+    Notes:
+    - empty_seed_bic_min is kept as a parameter (CLI-compatible), but is not currently used in eta learning
+      because BIC-empty evidence requires read-level blocks. Do not silently reinterpret it.
+    """
+    model_config = ConfigDict(extra="forbid")
+
     # Fusion / scoring -> posteriors
     beta: float = 1.0
     w_as: float = 1.0
@@ -64,34 +70,26 @@ class MergeConfig(BaseModel):
     # Calling thresholds
     min_reads: int = 5
     single_mass_min: float = 0.6
+    ratio_top1_top2_min: float = 2.0
     doublet_minor_min: float = 0.20
 
     # BIC gates (match figure)
     empty_bic_margin: float = 10.0      # Decision 1: empty vs non-empty
-    bic_margin: float = 6.0             # Decision 2: singlet vs doublet (ΔBIC >= bic_margin)
+    bic_margin: float = 6.0             # Decision 2: singlet vs doublet (ΔBIC gate)
+    near_tie_margin: float = 2.0        # sub-gate for dirty/weak labeling only
 
-    # Optional “near tie” band for dirty/weak labels (sub-gates)
-    near_tie_margin: float = 2.0
-
-    # Ratio/purity gate for singlets
-    ratio_top1_top2_min: float = 2.0
-
-    # Ambient learning
-    eta_iters: int = 2
-    eta_seed_quantile: float = 0.02       # initial seed fraction by n_effective
-    empty_tau_quantile: float = 0.95      # refine seed by JSD threshold (quantile of "most eta-like")
-
-    # Empty structural gates (used for eta-seed refinement + optional empty call constraints)
+    # Empty structural gates (used for optional empty call constraints + eta seed refinement)
     empty_top1_max: float = 0.6
     empty_ratio12_max: float = 1.5
     empty_reads_max: Optional[int] = None
-
-    # Eta seed quality (NEW, used ONLY for selecting eta training seed)
-    empty_seed_bic_min: float = 10.0
-
-    # Optional absolute JSD threshold for empty calling (if provided)
     empty_jsd_max: Optional[float] = None
     jsd_normalize: bool = True
+
+    # Ambient learning (eta)
+    eta_iters: int = 2
+    eta_seed_quantile: float = 0.02
+    empty_tau_quantile: float = 0.95
+    empty_seed_bic_min: float = 10.0  # currently not used (kept for CLI compatibility)
 
     # Search grid
     alpha_grid: float = 0.02
@@ -128,32 +126,24 @@ def _read_cfg_json(config_path: Path) -> Dict[str, Any]:
 def _infer_sample(cfg_json: Dict[str, Any], sample_override: Optional[str]) -> str:
     if sample_override:
         return str(sample_override)
-    # common patterns
-    if "sample" in cfg_json and cfg_json["sample"]:
+    if cfg_json.get("sample"):
         return str(cfg_json["sample"])
-    # fallback: try top-level name-like key
     return "sample"
 
 def _infer_paths(cfg_json: Dict[str, Any], sample: str) -> Dict[str, Path]:
-    """
-    Matches the structure shown in your traceback: d['root'], d['qc'], d['filtered'], d['chunks'], d['final'].
-    """
-    workdir = cfg_json.get("workdir", None)
+    workdir = cfg_json.get("workdir")
     if not workdir:
         raise ValueError("config JSON missing required key: 'workdir'")
     root = Path(workdir) / sample
-
-    # standard pipeline subdirs
-    qc = root / "qc"
-    filtered = root / "filtered"
-    chunks = root / "chunks"
-    final = root / "final"
-
-    # some runs place cell_map_ref_chunks under chunks/
-    return {"root": root, "qc": qc, "filtered": filtered, "chunks": chunks, "final": final}
+    return {
+        "root": root,
+        "qc": root / "qc",
+        "filtered": root / "filtered",
+        "chunks": root / "chunks",
+        "final": root / "final",
+    }
 
 def _infer_assign_glob(d: Dict[str, Path]) -> str:
-    # expected assign filtered outputs live inside cell_map_ref_chunks under chunks/
     candidates = [
         str(d["chunks"] / "cell_map_ref_chunks" / "*_filtered.tsv.gz"),
         str(d["chunks"] / "cell_map_ref_chunks" / "*_filtered.tsv"),
@@ -163,9 +153,7 @@ def _infer_assign_glob(d: Dict[str, Path]) -> str:
     for pat in candidates:
         if glob.glob(pat):
             return pat
-    # last resort: search deeper
-    deep = str(d["root"] / "**" / "cell_map_ref_chunks" / "*_filtered.tsv.gz")
-    return deep
+    return str(d["root"] / "**" / "cell_map_ref_chunks" / "*_filtered.tsv.gz")
 
 def _infer_cell_chunks_glob(d: Dict[str, Path]) -> str:
     candidates = [
@@ -175,8 +163,7 @@ def _infer_cell_chunks_glob(d: Dict[str, Path]) -> str:
     for pat in candidates:
         if glob.glob(pat):
             return pat
-    deep = str(d["root"] / "**" / "cell_map_ref_chunks" / "*chunk_*.txt")
-    return deep
+    return str(d["root"] / "**" / "cell_map_ref_chunks" / "*chunk_*.txt")
 
 
 # --------------------------------------------------------------------------------------
@@ -184,13 +171,7 @@ def _infer_cell_chunks_glob(d: Dict[str, Path]) -> str:
 # --------------------------------------------------------------------------------------
 
 def _coerce_assign_schema(df: pd.DataFrame) -> pd.DataFrame:
-    m = {
-        "BC": "barcode",
-        "Read": "read_id",
-        "Genome": "genome",
-        "p_as_decile": "p_as",
-        "p_mq_decile": "p_mq",
-    }
+    m = {"BC": "barcode", "Read": "read_id", "Genome": "genome"}
     out = df.rename(columns=m)
 
     required = ["barcode", "read_id", "genome", "AS", "MAPQ", "NM"]
@@ -211,7 +192,6 @@ def _coerce_assign_schema(df: pd.DataFrame) -> pd.DataFrame:
         out["assigned_class"] = pd.Series(["ambiguous"] * len(out), dtype="string")
 
     return out
-
 
 def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
     keys = ["barcode", "read_id", "genome"]
@@ -301,7 +281,7 @@ def _filter_promiscuous_ambiguous_reads(df: pd.DataFrame, cfg: MergeConfig) -> T
 
 
 # --------------------------------------------------------------------------------------
-# Core: posterior computation (vectorized)
+# Core: posterior computation
 # --------------------------------------------------------------------------------------
 
 def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame:
@@ -345,6 +325,7 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
 def _loglik_empty(L_block: pd.DataFrame, eta: pd.Series) -> float:
     eta_row = eta.reindex(L_block["genome"]).fillna(0.0).to_numpy(dtype=float)
     wL = eta_row * L_block["L"].to_numpy(dtype=float)
+
     s = (
         pd.DataFrame({"read_id": L_block["read_id"].values, "wL": wL})
         .groupby("read_id", sort=False)["wL"]
@@ -366,9 +347,11 @@ def _loglik_for_params(
     eta_row = eta.reindex(L_block["genome"]).fillna(0.0).to_numpy(dtype=float)
 
     if model == "single":
+        # P(r|single) = (1-alpha)*delta_g1 + alpha*eta
         w = np.where(gn == g1, (1.0 - alpha) + alpha * float(eta.get(g1, 0.0)), alpha * eta_row)
     else:
         assert g2 is not None
+        # P(r|doublet) = (1-alpha)*(rho*delta_g1 + (1-rho)*delta_g2) + alpha*eta
         mix = np.where(gn == g1, rho, np.where(gn == g2, 1.0 - rho, 0.0))
         w = (1.0 - alpha) * mix + alpha * eta_row
 
@@ -401,7 +384,7 @@ def _barcode_jsd_from_mass(mass: pd.Series, eta: pd.Series, normalize: bool = Tr
 
 
 # --------------------------------------------------------------------------------------
-# Model selection (implements your original gate design)
+# Model selection (gate design preserved)
 # --------------------------------------------------------------------------------------
 
 def _select_model_for_barcode(
@@ -434,11 +417,9 @@ def _select_model_for_barcode(
         "doublet_minor_frac": minor_frac,
     }
 
-    # Always compute empty BIC
     bic_empty = _bic(_loglik_empty(L_block, eta), 0, read_count)
     out["bic_empty"] = float(bic_empty)
 
-    # if too few reads, stop early
     if read_count < int(cfg.min_reads) or not candidate_genomes:
         out.update(
             call="low_reads",
@@ -455,7 +436,6 @@ def _select_model_for_barcode(
         )
         return out
 
-    # Fit best singlet/doublet on candidate genomes
     alphas = np.arange(0.0, float(cfg.max_alpha) + 1e-9, float(cfg.alpha_grid))
 
     best_single: Optional[Dict[str, Any]] = None
@@ -482,14 +462,12 @@ def _select_model_for_barcode(
     out["bic_single"] = bic_s if np.isfinite(bic_s) else None
     out["bic_doublet"] = bic_d if np.isfinite(bic_d) else None
 
-    # ------------------------------------------------------------------
-    # Decision 1: Empty/Noise (BIC margin is empty_bic_margin, per design)
-    # Optional: also constrain by structural gates and/or absolute JSD threshold.
-    # ------------------------------------------------------------------
+    # --------------------------
+    # Decision 1: Empty/Noise
+    # --------------------------
     bic_best_non_empty = min(bic_s, bic_d)
     empty_by_bic = (bic_empty + float(cfg.empty_bic_margin)) < bic_best_non_empty
 
-    # structural candidate (your Part 3 structural gate idea)
     structural_empty = (p_top1 <= float(cfg.empty_top1_max)) and (ratio12 <= float(cfg.empty_ratio12_max))
     if cfg.empty_reads_max is not None:
         structural_empty = structural_empty and (read_count <= int(cfg.empty_reads_max))
@@ -512,14 +490,9 @@ def _select_model_for_barcode(
         )
         return out
 
-    # ------------------------------------------------------------------
-    # Decision 2: Singlet vs Doublet using bic_margin (ΔBIC gate, per design)
-    # ------------------------------------------------------------------
-    # Define ΔBIC in the direction “single better than doublet” etc
-    # If both exist:
-    #  - single if bic_s + bic_margin < bic_d
-    #  - doublet if bic_d + bic_margin < bic_s
-    #  - else ambiguous between single/doublet
+    # --------------------------
+    # Decision 2: Single vs Doublet (ΔBIC gate)
+    # --------------------------
     chosen: Optional[Dict[str, Any]] = None
     call_core: str = "ambiguous"
 
@@ -535,7 +508,6 @@ def _select_model_for_barcode(
             call_core = "ambiguous"
         bic_gap = abs(bic_s - bic_d)
     else:
-        # Only one model exists
         chosen = best_single if np.isfinite(bic_s) else best_doublet
         call_core = "single" if (chosen and chosen["model"] == "single") else ("doublet" if chosen else "ambiguous")
         bic_gap = float("inf")
@@ -554,22 +526,16 @@ def _select_model_for_barcode(
     out["rho"] = chosen.get("rho")
     out["bic_best"] = float(chosen["bic"])
 
-    # ------------------------------------------------------------------
-    # Purity/strength sublabels (do not change core design; only label)
-    # ------------------------------------------------------------------
+    # --------------------------
+    # Purity/strength sublabels
+    # --------------------------
     if call_core == "single":
         passes_mass = (p_top1 >= float(cfg.single_mass_min))
         passes_ratio = (ratio12 >= float(cfg.ratio_top1_top2_min))
-        if passes_mass and passes_ratio and (not out["near_tie_sd"]):
-            out["call"] = "single_clean"
-        else:
-            out["call"] = "dirty_singlet"
+        out["call"] = "single_clean" if (passes_mass and passes_ratio and (not out["near_tie_sd"])) else "dirty_singlet"
     elif call_core == "doublet":
         passes_minor = (minor_frac >= float(cfg.doublet_minor_min))
-        if passes_minor and (not out["near_tie_sd"]):
-            out["call"] = "doublet"
-        else:
-            out["call"] = "weak_doublet"
+        out["call"] = "doublet" if (passes_minor and (not out["near_tie_sd"])) else "weak_doublet"
     else:
         out["call"] = "ambiguous"
 
@@ -577,7 +543,7 @@ def _select_model_for_barcode(
 
 
 # --------------------------------------------------------------------------------------
-# NEW: Cell chunk parsing for shard routing
+# Cell chunk parsing for shard routing
 # --------------------------------------------------------------------------------------
 
 def _parse_chunk_id_from_path(p: Path, chunk_id_regex: str) -> Optional[int]:
@@ -590,11 +556,6 @@ def _parse_chunk_id_from_path(p: Path, chunk_id_regex: str) -> Optional[int]:
         return None
 
 def _load_barcode_to_chunk_id(cell_chunks_glob: str, chunk_id_regex: str) -> Dict[str, int]:
-    """
-    Reads all chunk list files and returns barcode->chunk_id.
-
-    Assumes each barcode appears in exactly one chunk list (your guarantee).
-    """
     out: Dict[str, int] = {}
     files = [Path(x) for x in glob.glob(cell_chunks_glob)]
     for fp in sorted(files):
@@ -606,31 +567,17 @@ def _load_barcode_to_chunk_id(cell_chunks_glob: str, chunk_id_regex: str) -> Dic
                 bc = line.strip()
                 if not bc:
                     continue
-                # keep first occurrence; duplicates indicate upstream violation
                 if bc not in out:
                     out[bc] = cid
     return out
 
-
-def _route_shards_for_barcodes(
-    barcodes: pd.Series,
-    cfg: MergeConfig,
-    bc_to_chunk: Optional[Dict[str, int]],
-) -> np.ndarray:
-    """
-    Returns shard id per barcode.
-    Priority: chunk-based routing if bc_to_chunk is available; else hash-based.
-    """
+def _route_shards_for_barcodes(barcodes: pd.Series, cfg: MergeConfig, bc_to_chunk: Optional[Dict[str, int]]) -> np.ndarray:
     bcs = barcodes.astype(str).to_numpy()
-
     if bc_to_chunk:
-        # vectorized lookup via pandas map
         ser = pd.Series(bcs, dtype="string").map(bc_to_chunk)
-        # fallback for missing barcodes: hash routing
         miss = ser.isna().to_numpy()
         sid = np.empty(len(bcs), dtype=np.int32)
 
-        # chunk-based: shard = chunk_id % shards
         cid = ser.fillna(-1).to_numpy(dtype=np.int64)
         ok = (cid >= 0)
         sid[ok] = (cid[ok] % int(cfg.shards)).astype(np.int32)
@@ -638,10 +585,8 @@ def _route_shards_for_barcodes(
         if miss.any():
             h = pd.util.hash_pandas_object(pd.Series(bcs[miss], dtype="string"), index=False).to_numpy(np.uint64)
             sid[miss] = (h % np.uint64(cfg.shards)).astype(np.int32)
-
         return sid
 
-    # default: hash-based
     h = pd.util.hash_pandas_object(pd.Series(bcs, dtype="string"), index=False).to_numpy(np.uint64)
     return (h % np.uint64(cfg.shards)).astype(np.int32)
 
@@ -654,15 +599,8 @@ def _route_shards_for_barcodes(
 class Pass1Outputs:
     C: pd.DataFrame
     N: pd.DataFrame
-    shard_dir: Path
 
-
-def _pass1_process_one_file(
-    fp: Path,
-    cfg: MergeConfig,
-    shard_dir: Path,
-    bc_to_chunk: Optional[Dict[str, int]],
-) -> Pass1Outputs:
+def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path, bc_to_chunk: Optional[Dict[str, int]]) -> Pass1Outputs:
     shard_dir.mkdir(parents=True, exist_ok=True)
 
     handles = [gzip.open(shard_dir / f"shard_{i:02d}.tsv.gz", "at") for i in range(cfg.shards)]
@@ -676,7 +614,7 @@ def _pass1_process_one_file(
         df = _reduce_alignments_to_per_genome(df)
         df = df.dropna(subset=["barcode", "read_id", "genome"])
 
-        df, _meta = _filter_promiscuous_ambiguous_reads(df, cfg)
+        df, _ = _filter_promiscuous_ambiguous_reads(df, cfg)
         if df.empty:
             continue
 
@@ -684,20 +622,8 @@ def _pass1_process_one_file(
         if Ldf.empty:
             continue
 
-        C = (
-            Ldf.groupby(["barcode", "genome"], sort=False)["L"]
-            .sum()
-            .rename("C")
-            .reset_index()
-        )
-        N = (
-            Ldf.groupby("barcode", sort=False)["read_id"]
-            .nunique()
-            .rename("n_reads")
-            .reset_index()
-        )
-        C_parts.append(C)
-        N_parts.append(N)
+        C_parts.append(Ldf.groupby(["barcode", "genome"], sort=False)["L"].sum().rename("C").reset_index())
+        N_parts.append(Ldf.groupby("barcode", sort=False)["read_id"].nunique().rename("n_reads").reset_index())
 
         sid = _route_shards_for_barcodes(Ldf["barcode"], cfg, bc_to_chunk)
         Ldf = Ldf.assign(_sid=sid)
@@ -716,20 +642,14 @@ def _pass1_process_one_file(
 
     C_out = pd.concat(C_parts, ignore_index=True) if C_parts else pd.DataFrame(columns=["barcode", "genome", "C"])
     N_out = pd.concat(N_parts, ignore_index=True) if N_parts else pd.DataFrame(columns=["barcode", "n_reads"])
-
-    return Pass1Outputs(C=C_out, N=N_out, shard_dir=shard_dir)
+    return Pass1Outputs(C=C_out, N=N_out)
 
 
 # --------------------------------------------------------------------------------------
 # Ambient learning (eta)
 # --------------------------------------------------------------------------------------
 
-def _compute_eta_from_shards(
-    shard_root: Path,
-    target_bcs: Sequence[str],
-    all_genomes: Sequence[str],
-    cfg: MergeConfig,
-) -> pd.Series:
+def _compute_eta_from_shards(shard_root: Path, target_bcs: Sequence[str], all_genomes: Sequence[str], cfg: MergeConfig) -> pd.Series:
     target_set = set(map(str, target_bcs))
     mix = {g: 0.0 for g in all_genomes}
 
@@ -768,49 +688,36 @@ def _pick_initial_eta_seed(C_all: pd.DataFrame, N_all: pd.DataFrame, cfg: MergeC
     if df.empty:
         return []
 
-    q = float(cfg.eta_seed_quantile)
-    q = min(max(q, 1e-6), 1.0)
+    q = min(max(float(cfg.eta_seed_quantile), 1e-6), 1.0)
     n = max(1, int(math.ceil(q * len(df))))
     return df.sort_values("n_effective", ascending=True)["barcode"].head(n).astype(str).tolist()
 
-def _refine_eta_seed_by_jsd_and_bic(
-    C_all: pd.DataFrame,
-    N_all: pd.DataFrame,
-    eta: pd.Series,
-    cfg: MergeConfig,
-    # Optional: pass precomputed bic evidence for empty-likeness; if not available, we use structural gates only.
-    empty_like_bcs: Optional[set] = None,
-) -> List[str]:
+def _refine_eta_seed_by_jsd(C_all: pd.DataFrame, N_all: pd.DataFrame, eta: pd.Series, cfg: MergeConfig) -> List[str]:
     if C_all.empty:
         return []
 
     mass = C_all.groupby(["barcode", "genome"], sort=False)["C"].sum().reset_index()
-    mass["rank"] = mass.groupby("barcode", sort=False)["C"].rank(method="first", ascending=False)
-    top = mass[mass["rank"] <= 2].copy()
-
-    top1 = top[top["rank"] == 1].set_index("barcode")["C"]
-    top2 = top[top["rank"] == 2].set_index("barcode")["C"]
-
     eff = mass.groupby("barcode", sort=False)["C"].sum().rename("n_effective")
-    stats = pd.DataFrame({"n_effective": eff})
+    top = mass.sort_values(["barcode", "C"], ascending=[True, False]).groupby("barcode", sort=False).head(2)
+
+    top1 = top.groupby("barcode", sort=False)["C"].nth(0)
+    top2 = top.groupby("barcode", sort=False)["C"].nth(1).reindex(top1.index).fillna(0.0)
+
+    stats = pd.DataFrame({"n_effective": eff.reindex(top1.index).fillna(0.0)})
     stats["top1"] = top1
     stats["top2"] = top2
-    stats = stats.fillna(0.0)
     stats["p_top1"] = stats["top1"] / (stats["n_effective"] + 1e-12)
     stats["p_top2"] = stats["top2"] / (stats["n_effective"] + 1e-12)
     stats["ratio12"] = stats["p_top1"] / (stats["p_top2"] + 1e-12)
 
     if not N_all.empty:
-        stats["n_reads"] = N_all.set_index("barcode")["n_reads"]
+        stats["n_reads"] = N_all.set_index("barcode")["n_reads"].reindex(stats.index).fillna(0).astype(int)
     else:
         stats["n_reads"] = 0
 
     cand = stats[(stats["p_top1"] <= float(cfg.empty_top1_max)) & (stats["ratio12"] <= float(cfg.empty_ratio12_max))]
     if cfg.empty_reads_max is not None:
         cand = cand[cand["n_reads"] <= int(cfg.empty_reads_max)]
-    if empty_like_bcs is not None:
-        cand = cand[cand.index.astype(str).isin(empty_like_bcs)]
-
     if cand.empty:
         cand = stats
 
@@ -829,24 +736,15 @@ def _refine_eta_seed_by_jsd_and_bic(
     tau = jsd_ser.quantile(float(cfg.empty_tau_quantile))
     return jsd_ser[jsd_ser <= tau].index.astype(str).tolist()
 
-def _learn_eta(
-    C_all: pd.DataFrame,
-    N_all: pd.DataFrame,
-    shard_root: Path,
-    all_genomes: Sequence[str],
-    cfg: MergeConfig,
-) -> Tuple[pd.Series, Dict[str, Any]]:
+def _learn_eta(C_all: pd.DataFrame, N_all: pd.DataFrame, shard_root: Path, all_genomes: Sequence[str], cfg: MergeConfig) -> Tuple[pd.Series, Dict[str, Any]]:
     meta: Dict[str, Any] = {"iters": int(cfg.eta_iters), "seed_sizes": []}
 
     seed = _pick_initial_eta_seed(C_all, N_all, cfg)
     meta["seed_sizes"].append(len(seed))
-
     eta = _compute_eta_from_shards(shard_root, seed, list(all_genomes), cfg)
 
-    # NOTE: we do not require BIC evidence here because BIC needs read-level blocks.
-    # If you want seed-by-BIC, you can add a pre-pass that computes empty-likeness per barcode and pass it in.
     for _ in range(int(cfg.eta_iters)):
-        seed = _refine_eta_seed_by_jsd_and_bic(C_all, N_all, eta, cfg, empty_like_bcs=None)
+        seed = _refine_eta_seed_by_jsd(C_all, N_all, eta, cfg)
         meta["seed_sizes"].append(len(seed))
         if not seed:
             break
@@ -856,7 +754,7 @@ def _learn_eta(
 
 
 # --------------------------------------------------------------------------------------
-# Calling: bulletproof per-shard file (call each barcode once)
+# Calling: per-shard file (call each barcode once)
 # --------------------------------------------------------------------------------------
 
 def _call_from_shard_file(
@@ -866,11 +764,6 @@ def _call_from_shard_file(
     cfg: MergeConfig,
     out_handle,
 ) -> int:
-    """
-    Bulletproof:
-    - Accumulate all rows per barcode across all read_csv chunks for this shard file.
-    - Call each barcode exactly once.
-    """
     buckets: Dict[str, List[pd.DataFrame]] = {}
 
     for chunk in pd.read_csv(
@@ -883,8 +776,7 @@ def _call_from_shard_file(
         if chunk.empty:
             continue
         for bc, sub in chunk.groupby("barcode", sort=False):
-            bc_s = str(bc)
-            buckets.setdefault(bc_s, []).append(sub[["read_id", "genome", "L"]].copy())
+            buckets.setdefault(str(bc), []).append(sub[["read_id", "genome", "L"]].copy())
 
     called = 0
     for bc_s, parts in buckets.items():
@@ -925,64 +817,57 @@ def _call_from_shard_file(
 
 
 # --------------------------------------------------------------------------------------
-# Main command (signature matches cli.py forwarded kwargs)
+# Core entrypoint (called by cli.py)
 # --------------------------------------------------------------------------------------
 
-@app.command()
-def genotyping(
-    # REQUIRED by pipeline wrapper
-    config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
-    # Optional overrides / inferred defaults
-    assign: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs. If omitted, inferred from config/workdir."),
-    cell_chunks_glob: Optional[str] = typer.Option(
-        None,
-        "--cell-chunks-glob",
-        help="Glob to cell_map_ref_chunk_*.txt files listing barcodes per chunk. If omitted, inferred from config/workdir. "
-             "Used to route shards deterministically by chunk id.",
-    ),
-    chunk_id_regex: str = typer.Option(r"chunk_(\d+)", "--chunk-id-regex", help="Regex to extract chunk id from chunk list filename."),
-    outdir: Optional[Path] = typer.Option(None, "--outdir", help="Override output dir (default: <workdir>/<sample>/final)."),
-    sample: Optional[str] = typer.Option(None, "--sample", help="Override sample name from config."),
+def _run_genotyping(
+    *,
+    config: Path,
+    assign: Optional[str] = None,
+    cell_chunks_glob: Optional[str] = None,
+    chunk_id_regex: str = r"chunk_(\d+)",
+    outdir: Optional[Path] = None,
+    sample: Optional[str] = None,
     # core
-    min_reads: Optional[int] = typer.Option(None, "--min-reads"),
-    single_mass_min: Optional[float] = typer.Option(None, "--single-mass-min"),
-    ratio_top1_top2_min: Optional[float] = typer.Option(None, "--ratio-top1-top2-min"),
-    threads: Optional[int] = typer.Option(None, "--threads"),
-    pass1_workers: Optional[int] = typer.Option(None, "--pass1-workers"),
-    shards: Optional[int] = typer.Option(None, "--shards"),
-    chunk_rows: Optional[int] = typer.Option(None, "--chunk-rows"),
-    pass2_chunksize: Optional[int] = typer.Option(None, "--pass2-chunksize"),
-    winner_only: Optional[bool] = typer.Option(None, "--winner-only/--no-winner-only"),
+    min_reads: Optional[int] = None,
+    single_mass_min: Optional[float] = None,
+    ratio_top1_top2_min: Optional[float] = None,
+    threads: Optional[int] = None,
+    pass1_workers: Optional[int] = None,
+    shards: Optional[int] = None,
+    chunk_rows: Optional[int] = None,
+    pass2_chunksize: Optional[int] = None,
+    winner_only: Optional[bool] = None,
     # optional read-filter
-    max_hits: Optional[int] = typer.Option(None, "--max-hits"),
-    hits_delta_mapq: Optional[float] = typer.Option(None, "--hits-delta-mapq"),
-    max_rows_per_read_guard: Optional[int] = typer.Option(None, "--max-rows-per-read-guard"),
+    max_hits: Optional[int] = None,
+    hits_delta_mapq: Optional[float] = None,
+    max_rows_per_read_guard: Optional[int] = None,
     # fusion
-    beta: Optional[float] = typer.Option(None, "--beta"),
-    w_as: Optional[float] = typer.Option(None, "--w-as"),
-    w_mapq: Optional[float] = typer.Option(None, "--w-mapq"),
-    w_nm: Optional[float] = typer.Option(None, "--w-nm"),
-    ambient_const: Optional[float] = typer.Option(None, "--ambient-const"),
+    beta: Optional[float] = None,
+    w_as: Optional[float] = None,
+    w_mapq: Optional[float] = None,
+    w_nm: Optional[float] = None,
+    ambient_const: Optional[float] = None,
     # empty gates
-    empty_bic_margin: Optional[float] = typer.Option(None, "--empty-bic-margin"),
-    empty_top1_max: Optional[float] = typer.Option(None, "--empty-top1-max"),
-    empty_ratio12_max: Optional[float] = typer.Option(None, "--empty-ratio12-max"),
-    empty_reads_max: Optional[int] = typer.Option(None, "--empty-reads-max"),
-    empty_seed_bic_min: Optional[float] = typer.Option(None, "--empty-seed-bic-min"),
-    empty_tau_quantile: Optional[float] = typer.Option(None, "--empty-tau-quantile"),
-    empty_jsd_max: Optional[float] = typer.Option(None, "--empty-jsd-max"),
-    jsd_normalize: Optional[bool] = typer.Option(None, "--jsd-normalize/--no-jsd-normalize"),
+    empty_bic_margin: Optional[float] = None,
+    empty_top1_max: Optional[float] = None,
+    empty_ratio12_max: Optional[float] = None,
+    empty_reads_max: Optional[int] = None,
+    empty_seed_bic_min: Optional[float] = None,
+    empty_tau_quantile: Optional[float] = None,
+    empty_jsd_max: Optional[float] = None,
+    jsd_normalize: Optional[bool] = None,
     # doublet gates
-    bic_margin: Optional[float] = typer.Option(None, "--bic-margin"),
-    doublet_minor_min: Optional[float] = typer.Option(None, "--doublet-minor-min"),
-    near_tie_margin: Optional[float] = typer.Option(None, "--near-tie-margin"),
+    bic_margin: Optional[float] = None,
+    doublet_minor_min: Optional[float] = None,
+    near_tie_margin: Optional[float] = None,
     # ambient iteration
-    eta_iters: Optional[int] = typer.Option(None, "--eta-iters"),
-    eta_seed_quantile: Optional[float] = typer.Option(None, "--eta-seed-quantile"),
-    topk_genomes: Optional[int] = typer.Option(None, "--topk-genomes"),
-    resume: bool = typer.Option(True, "--resume/--no-resume"),
+    eta_iters: Optional[int] = None,
+    eta_seed_quantile: Optional[float] = None,
+    topk_genomes: Optional[int] = None,
+    resume: bool = True,
 ) -> None:
-    cfg_json = _read_cfg_json(config)
+    cfg_json = _read_cfg_json(Path(config))
     sample_eff = _infer_sample(cfg_json, sample)
     d = _infer_paths(cfg_json, sample_eff)
 
@@ -992,85 +877,49 @@ def genotyping(
     assign_glob = assign if assign is not None else _infer_assign_glob(d)
     cell_chunks_pat = cell_chunks_glob if cell_chunks_glob is not None else _infer_cell_chunks_glob(d)
 
-    # resolve effective worker count
+    # worker policy: pass1 defaults to threads if not provided
     threads_eff = int(threads) if threads is not None else 1
     pass1_workers_eff = int(pass1_workers) if pass1_workers is not None else int(threads_eff)
 
-    # disable filter unless BOTH are provided and max_hits>0
-    max_hits_eff = None if (max_hits is None or int(max_hits) <= 0) else int(max_hits)
-    hits_delta_mapq_eff = None if (max_hits_eff is None or hits_delta_mapq is None) else float(hits_delta_mapq)
-
     # Build cfg from defaults then override with CLI where provided
-    cfg = MergeConfig(
-        sample=str(sample_eff),
-        pass1_workers=int(pass1_workers_eff),
-    )
+    cfg = MergeConfig(sample=str(sample_eff), pass1_workers=int(pass1_workers_eff))
 
-    # apply overrides
-    if shards is not None:
-        cfg.shards = int(shards)
-    if chunk_rows is not None:
-        cfg.chunk_rows = int(chunk_rows)
-    if pass2_chunksize is not None:
-        cfg.pass2_chunksize = int(pass2_chunksize)
-    if winner_only is not None:
-        cfg.winner_only = bool(winner_only)
+    if shards is not None: cfg.shards = int(shards)
+    if chunk_rows is not None: cfg.chunk_rows = int(chunk_rows)
+    if pass2_chunksize is not None: cfg.pass2_chunksize = int(pass2_chunksize)
+    if winner_only is not None: cfg.winner_only = bool(winner_only)
 
-    if max_rows_per_read_guard is not None:
-        cfg.max_rows_per_read_guard = int(max_rows_per_read_guard)
-    cfg.max_hits = max_hits_eff
-    cfg.hits_delta_mapq = hits_delta_mapq_eff
+    cfg.max_hits = None if (max_hits is None or int(max_hits) <= 0) else int(max_hits)
+    cfg.hits_delta_mapq = None if (cfg.max_hits is None or hits_delta_mapq is None) else float(hits_delta_mapq)
+    if max_rows_per_read_guard is not None: cfg.max_rows_per_read_guard = int(max_rows_per_read_guard)
 
-    if beta is not None:
-        cfg.beta = float(beta)
-    if w_as is not None:
-        cfg.w_as = float(w_as)
-    if w_mapq is not None:
-        cfg.w_mapq = float(w_mapq)
-    if w_nm is not None:
-        cfg.w_nm = float(w_nm)
-    if ambient_const is not None:
-        cfg.ambient_const = float(ambient_const)
+    if beta is not None: cfg.beta = float(beta)
+    if w_as is not None: cfg.w_as = float(w_as)
+    if w_mapq is not None: cfg.w_mapq = float(w_mapq)
+    if w_nm is not None: cfg.w_nm = float(w_nm)
+    if ambient_const is not None: cfg.ambient_const = float(ambient_const)
 
-    if min_reads is not None:
-        cfg.min_reads = int(min_reads)
-    if single_mass_min is not None:
-        cfg.single_mass_min = float(single_mass_min)
-    if ratio_top1_top2_min is not None:
-        cfg.ratio_top1_top2_min = float(ratio_top1_top2_min)
+    if min_reads is not None: cfg.min_reads = int(min_reads)
+    if single_mass_min is not None: cfg.single_mass_min = float(single_mass_min)
+    if ratio_top1_top2_min is not None: cfg.ratio_top1_top2_min = float(ratio_top1_top2_min)
 
-    if empty_bic_margin is not None:
-        cfg.empty_bic_margin = float(empty_bic_margin)
-    if empty_top1_max is not None:
-        cfg.empty_top1_max = float(empty_top1_max)
-    if empty_ratio12_max is not None:
-        cfg.empty_ratio12_max = float(empty_ratio12_max)
-    if empty_reads_max is not None:
-        cfg.empty_reads_max = int(empty_reads_max)
-    if empty_seed_bic_min is not None:
-        cfg.empty_seed_bic_min = float(empty_seed_bic_min)
-    if empty_tau_quantile is not None:
-        cfg.empty_tau_quantile = float(empty_tau_quantile)
-    if empty_jsd_max is not None:
-        cfg.empty_jsd_max = float(empty_jsd_max)
-    if jsd_normalize is not None:
-        cfg.jsd_normalize = bool(jsd_normalize)
+    if empty_bic_margin is not None: cfg.empty_bic_margin = float(empty_bic_margin)
+    if empty_top1_max is not None: cfg.empty_top1_max = float(empty_top1_max)
+    if empty_ratio12_max is not None: cfg.empty_ratio12_max = float(empty_ratio12_max)
+    if empty_reads_max is not None: cfg.empty_reads_max = int(empty_reads_max)
+    if empty_seed_bic_min is not None: cfg.empty_seed_bic_min = float(empty_seed_bic_min)
+    if empty_tau_quantile is not None: cfg.empty_tau_quantile = float(empty_tau_quantile)
+    if empty_jsd_max is not None: cfg.empty_jsd_max = float(empty_jsd_max)
+    if jsd_normalize is not None: cfg.jsd_normalize = bool(jsd_normalize)
 
-    if bic_margin is not None:
-        cfg.bic_margin = float(bic_margin)
-    if doublet_minor_min is not None:
-        cfg.doublet_minor_min = float(doublet_minor_min)
-    if near_tie_margin is not None:
-        cfg.near_tie_margin = float(near_tie_margin)
+    if bic_margin is not None: cfg.bic_margin = float(bic_margin)
+    if doublet_minor_min is not None: cfg.doublet_minor_min = float(doublet_minor_min)
+    if near_tie_margin is not None: cfg.near_tie_margin = float(near_tie_margin)
 
-    if eta_iters is not None:
-        cfg.eta_iters = int(eta_iters)
-    if eta_seed_quantile is not None:
-        cfg.eta_seed_quantile = float(eta_seed_quantile)
-    if topk_genomes is not None:
-        cfg.topk_genomes = int(topk_genomes)
+    if eta_iters is not None: cfg.eta_iters = int(eta_iters)
+    if eta_seed_quantile is not None: cfg.eta_seed_quantile = float(eta_seed_quantile)
+    if topk_genomes is not None: cfg.topk_genomes = int(topk_genomes)
 
-    # resolve input files
     files = [Path(f) for f in glob.glob(assign_glob, recursive=True)]
     if not files:
         raise typer.BadParameter(f"No files matched: {assign_glob}")
@@ -1079,25 +928,30 @@ def genotyping(
     shard_root = tmp_dir / "L_shards_workers"
     shard_root.mkdir(parents=True, exist_ok=True)
 
-    # load barcode->chunk_id mapping for new shard policy (best-effort)
     bc_to_chunk: Optional[Dict[str, int]] = None
     chunk_files = glob.glob(cell_chunks_pat)
     if chunk_files:
         bc_to_chunk = _load_barcode_to_chunk_id(cell_chunks_pat, chunk_id_regex)
-        typer.echo(f"[genotyping] shard policy: chunk-based ({len(bc_to_chunk):,} barcodes from {len(chunk_files)} chunk files)")
+        typer.echo(
+            f"[genotyping] shard policy: chunk-based ({len(bc_to_chunk):,} barcodes from {len(chunk_files)} chunk files)"
+        )
     else:
         typer.echo("[genotyping] shard policy: hash(barcode)%shards (no chunk list files found)")
 
     typer.echo(f"[genotyping] sample={sample_eff} files={len(files)} pass1_workers={pass1_workers_eff} shards={cfg.shards}")
     typer.echo(f"[genotyping] assign_glob={assign_glob}")
+    typer.echo(f"[genotyping] cell_chunks_glob={cell_chunks_pat}")
     typer.echo(f"[genotyping] filter: max_hits={cfg.max_hits} hits_delta_mapq={cfg.hits_delta_mapq} guard={cfg.max_rows_per_read_guard}")
     typer.echo(f"[genotyping] winner_only={cfg.winner_only} ambient_const={cfg.ambient_const}")
     typer.echo(f"[genotyping] gates: empty_bic_margin={cfg.empty_bic_margin} bic_margin={cfg.bic_margin} near_tie_margin={cfg.near_tie_margin}")
+    if cfg.empty_seed_bic_min is not None:
+        typer.echo("[genotyping] NOTE: empty_seed_bic_min is currently not used in eta learning in this implementation.")
 
     # -----------------------
     # Pass 1
     # -----------------------
     typer.echo("[1/4] Pass 1: streaming assign inputs → per-read posteriors + spill shards")
+
     C_list: List[pd.DataFrame] = []
     N_list: List[pd.DataFrame] = []
 
@@ -1128,15 +982,16 @@ def genotyping(
 
     all_genomes = C_all["genome"].astype(str).unique().tolist()
 
-    # top-k genomes per barcode
     topk: Dict[str, List[str]] = {}
     for bc, sub in C_all.groupby("barcode", sort=False):
         s = sub.sort_values("C", ascending=False)["genome"].astype(str).head(int(cfg.topk_genomes)).tolist()
         topk[str(bc)] = s
 
-    C_all.to_csv(outdir_eff / f"{sample_eff}_C_all.tsv.gz", sep="\t", index=False, compression="gzip")
-    N_all.to_csv(outdir_eff / f"{sample_eff}_N_all.tsv.gz", sep="\t", index=False, compression="gzip")
-    typer.echo(f"[1/4] wrote: {sample_eff}_C_all.tsv.gz, {sample_eff}_N_all.tsv.gz")
+    C_path = outdir_eff / f"{sample_eff}_C_all.tsv.gz"
+    N_path = outdir_eff / f"{sample_eff}_N_all.tsv.gz"
+    C_all.to_csv(C_path, sep="\t", index=False, compression="gzip")
+    N_all.to_csv(N_path, sep="\t", index=False, compression="gzip")
+    typer.echo(f"[1/4] wrote: {C_path.name}, {N_path.name}")
 
     # -----------------------
     # Pass 2
@@ -1191,11 +1046,104 @@ def genotyping(
     # Pass 4
     # -----------------------
     typer.echo("[4/4] Done.")
-    typer.echo(f"  - Mass table:   {outdir_eff / f'{sample_eff}_C_all.tsv.gz'}")
-    typer.echo(f"  - Reads table:  {outdir_eff / f'{sample_eff}_N_all.tsv.gz'}")
+    typer.echo(f"  - Mass table:   {C_path}")
+    typer.echo(f"  - Reads table:  {N_path}")
     typer.echo(f"  - Eta:          {eta_out}")
     typer.echo(f"  - Calls:        {calls_path}")
     typer.echo(f"  - Shards root:  {shard_root}")
+
+
+# --------------------------------------------------------------------------------------
+# Typer wrapper (CLI)
+# --------------------------------------------------------------------------------------
+
+@app.command("genotyping")
+def genotyping_cmd(
+    config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
+    assign: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs. If omitted, inferred."),
+    cell_chunks_glob: Optional[str] = typer.Option(None, "--cell-chunks-glob", help="Glob to cell chunk barcode lists. If omitted, inferred."),
+    chunk_id_regex: str = typer.Option(r"chunk_(\d+)", "--chunk-id-regex", help="Regex to extract chunk id from chunk list filename."),
+    outdir: Optional[Path] = typer.Option(None, "--outdir", help="Override output dir (default: <workdir>/<sample>/final)."),
+    sample: Optional[str] = typer.Option(None, "--sample", help="Override sample name from config."),
+    # core
+    min_reads: Optional[int] = typer.Option(None, "--min-reads"),
+    single_mass_min: Optional[float] = typer.Option(None, "--single-mass-min"),
+    ratio_top1_top2_min: Optional[float] = typer.Option(None, "--ratio-top1-top2-min"),
+    threads: Optional[int] = typer.Option(None, "--threads"),
+    pass1_workers: Optional[int] = typer.Option(None, "--pass1-workers"),
+    shards: Optional[int] = typer.Option(None, "--shards"),
+    chunk_rows: Optional[int] = typer.Option(None, "--chunk-rows"),
+    pass2_chunksize: Optional[int] = typer.Option(None, "--pass2-chunksize"),
+    winner_only: Optional[bool] = typer.Option(None, "--winner-only/--no-winner-only"),
+    # optional read-filter
+    max_hits: Optional[int] = typer.Option(None, "--max-hits"),
+    hits_delta_mapq: Optional[float] = typer.Option(None, "--hits-delta-mapq"),
+    max_rows_per_read_guard: Optional[int] = typer.Option(None, "--max-rows-per-read-guard"),
+    # fusion
+    beta: Optional[float] = typer.Option(None, "--beta"),
+    w_as: Optional[float] = typer.Option(None, "--w-as"),
+    w_mapq: Optional[float] = typer.Option(None, "--w-mapq"),
+    w_nm: Optional[float] = typer.Option(None, "--w-nm"),
+    ambient_const: Optional[float] = typer.Option(None, "--ambient-const"),
+    # empty gates
+    empty_bic_margin: Optional[float] = typer.Option(None, "--empty-bic-margin"),
+    empty_top1_max: Optional[float] = typer.Option(None, "--empty-top1-max"),
+    empty_ratio12_max: Optional[float] = typer.Option(None, "--empty-ratio12-max"),
+    empty_reads_max: Optional[int] = typer.Option(None, "--empty-reads-max"),
+    empty_seed_bic_min: Optional[float] = typer.Option(None, "--empty-seed-bic-min"),
+    empty_tau_quantile: Optional[float] = typer.Option(None, "--empty-tau-quantile"),
+    empty_jsd_max: Optional[float] = typer.Option(None, "--empty-jsd-max"),
+    jsd_normalize: Optional[bool] = typer.Option(None, "--jsd-normalize/--no-jsd-normalize"),
+    # doublet gates
+    bic_margin: Optional[float] = typer.Option(None, "--bic-margin"),
+    doublet_minor_min: Optional[float] = typer.Option(None, "--doublet-minor-min"),
+    near_tie_margin: Optional[float] = typer.Option(None, "--near-tie-margin"),
+    # ambient iteration
+    eta_iters: Optional[int] = typer.Option(None, "--eta-iters"),
+    eta_seed_quantile: Optional[float] = typer.Option(None, "--eta-seed-quantile"),
+    topk_genomes: Optional[int] = typer.Option(None, "--topk-genomes"),
+    resume: bool = typer.Option(True, "--resume/--no-resume"),
+) -> None:
+    _run_genotyping(
+        config=config,
+        assign=assign,
+        cell_chunks_glob=cell_chunks_glob,
+        chunk_id_regex=chunk_id_regex,
+        outdir=outdir,
+        sample=sample,
+        min_reads=min_reads,
+        single_mass_min=single_mass_min,
+        ratio_top1_top2_min=ratio_top1_top2_min,
+        threads=threads,
+        pass1_workers=pass1_workers,
+        shards=shards,
+        chunk_rows=chunk_rows,
+        pass2_chunksize=pass2_chunksize,
+        winner_only=winner_only,
+        max_hits=max_hits,
+        hits_delta_mapq=hits_delta_mapq,
+        max_rows_per_read_guard=max_rows_per_read_guard,
+        beta=beta,
+        w_as=w_as,
+        w_mapq=w_mapq,
+        w_nm=w_nm,
+        ambient_const=ambient_const,
+        empty_bic_margin=empty_bic_margin,
+        empty_top1_max=empty_top1_max,
+        empty_ratio12_max=empty_ratio12_max,
+        empty_reads_max=empty_reads_max,
+        empty_seed_bic_min=empty_seed_bic_min,
+        empty_tau_quantile=empty_tau_quantile,
+        empty_jsd_max=empty_jsd_max,
+        jsd_normalize=jsd_normalize,
+        bic_margin=bic_margin,
+        doublet_minor_min=doublet_minor_min,
+        near_tie_margin=near_tie_margin,
+        eta_iters=eta_iters,
+        eta_seed_quantile=eta_seed_quantile,
+        topk_genomes=topk_genomes,
+        resume=resume,
+    )
 
 
 if __name__ == "__main__":
