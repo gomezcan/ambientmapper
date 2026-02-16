@@ -937,7 +937,7 @@ def _call_from_file_streaming(
 def genotyping(
     # from cli
     config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
-    assign_glob: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs. If omitted, inferred."),
+    assign: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs. If omitted, inferred."),
     outdir: Optional[Path] = typer.Option(None, "--outdir", help="Override output dir (default: <workdir>/<sample>/final)."),
     sample: Optional[str] = typer.Option(None, "--sample", help="Override sample name from config."),
     # core
@@ -992,7 +992,7 @@ def genotyping(
     outdir_eff = Path(outdir) if outdir is not None else Path(d["final"])
     outdir_eff.mkdir(parents=True, exist_ok=True)
 
-    assign_eff = assign_glob if assign_glob is not None else _infer_assign_glob(d)
+    assign_eff = assign if assign is not None else _infer_assign_glob(d)
     files = [Path(f) for f in glob.glob(assign_eff, recursive=True)]
     if not files:
         raise typer.BadParameter(f"No files matched: {assign_eff}")
