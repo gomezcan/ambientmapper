@@ -645,10 +645,10 @@ def genotyping(
         "Enabled only if BOTH --max-hits and --hits-delta-as are provided. "
         "A read is dropped if >max-hits genomes fall within (best_AS - hits-delta-as).",
     ),
-    hits_delta_as: Optional[int] = typer.Option(
+    hits_delta_mapq: Optional[int] = typer.Option(
         None,
-        "--hits-delta-as",
-        help="(Optional) AS window for counting near-top hits for --max-hits filtering. "
+        "--hits-delta-mapq",
+        help="(Optional) MAPQ window for counting near-top hits for --max-hits filtering. "
         "Enabled only if BOTH --max-hits and --hits-delta-as are provided.",
     ),
     # fusion
@@ -736,8 +736,8 @@ def genotyping(
     # NEW: optional read-filter passthrough
     if max_hits is not None:
         kwargs["max_hits"] = int(max_hits)
-    if hits_delta_as is not None:
-        kwargs["hits_delta_as"] = int(hits_delta_as)
+    if hits_delta_mapq is not None:
+        kwargs["hits_delta_mapq"] = int(hits_delta_mapq)
 
     # fusion / gates
     if beta is not None:
@@ -884,7 +884,7 @@ def run(
     genotyping_jsd_normalize: Optional[bool] = typer.Option(None, "--genotyping-jsd-normalize/--no-genotyping-jsd-normalize"),
     # NEW: pass through max-hits filter to genotyping.py
     genotyping_max_hits: Optional[int] = typer.Option(None, "--genotyping-max-hits"),
-    genotyping_hits_delta_as: Optional[int] = typer.Option(None, "--genotyping-hits-delta-as"),
+    genotyping_hits_delta_mapq: Optional[int] = typer.Option(None, "--genotyping-hits-delta-mapq"),
 ) -> None:
     """Run the full pipeline."""
     inline_ready = all([sample, genome, bam, workdir])
@@ -930,7 +930,7 @@ def run(
         ("jsd_normalize", genotyping_jsd_normalize),
         # NEW
         ("max_hits", genotyping_max_hits),
-        ("hits_delta_as", genotyping_hits_delta_as),
+        ("hits_delta_mapq", genotyping_hits_delta_mapq),
     ]:
         if v2 is not None:
             genotyping_conf[k2] = v2
