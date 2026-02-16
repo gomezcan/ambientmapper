@@ -757,7 +757,12 @@ def genotyping(
     assign: str = typer.Option(..., help="Input glob for assign filtered tables (e.g. sample/cell_map_ref_chunks/*filtered.tsv.gz)"),
     outdir: Path = typer.Option(Path("merge_out"), help="Output directory"),
     sample: str = typer.Option("sample", help="Sample name"),
+    # Core
+    min_reads: int = typer.Option(5, "--min-reads"),
+    single_mass_min: float = typer.Option(0.6, "--single-mass-min"),
+    ratio_top1_top2_min: float = typer.Option(2.0, "--ratio-top1-top2-min"),
     threads: int = typer.Option(4, "--threads", "-t", min=1, help="Number of workers for Pass 1 (per-file parallelism)"),
+    pass1_workers: Optional[int] = typer.Option(None, "--pass1-workers", help="Override Pass 1 worker processes (if set, supersedes --threads).",),
     shards: int = typer.Option(32, "--shards", min=1, help="Number of shard files per worker"),
     chunk_rows: int = typer.Option(5_000_000, "--chunk-rows", help="Rows per pandas chunk when reading assign tables"),
     pass2_chunksize: int = typer.Option(200_000, "--pass2-chunksize", help="Chunksize when reading shard spill files"),
@@ -766,28 +771,28 @@ def genotyping(
     max_hits: Optional[int] = typer.Option(3, "--max-hits", help="Drop ambiguous groups with >max_hits near-top MAPQ alignments; set to 0 or omit to disable"),
     hits_delta_mapq: Optional[float] = typer.Option(2.0, "--hits-delta-mapq", help="Near-top MAPQ window (best_MAPQ - delta)"),
     max_rows_per_read_guard: Optional[int] = typer.Option(500, "--max-rows-per-read-guard", help="Guard: drop ambiguous groups with >this rows per (bc,read) early"),
-    # Ambient learning
-    eta_iters: int = typer.Option(2, "--eta-iters", help="Number of eta refinement iterations"),
-    eta_seed_quantile: float = typer.Option(0.02, "--eta-seed-quantile", help="Initial seed fraction by n_effective"),
-    empty_tau_quantile: float = typer.Option(0.95, "--empty-tau-quantile", help="Seed refinement by JSD quantile"),
-    empty_reads_max: Optional[int] = typer.Option(None, "--empty-reads-max", help="Optional: restrict empty-like candidates to <= this n_reads"),
-    empty_top1_max: float = typer.Option(0.6, "--empty-top1-max", help="Empty-like candidate gate: p_top1 <= this"),
-    empty_ratio12_max: float = typer.Option(1.5, "--empty-ratio12-max", help="Empty-like candidate gate: ratio12 <= this"),
-    # Grid / calling
+    # fusion, Score weights
     beta: float = typer.Option(1.0, "--beta"),
-    alpha_grid: float = typer.Option(0.02, "--alpha-grid"),
-    rho_grid: float = typer.Option(0.05, "--rho-grid"),
-    max_alpha: float = typer.Option(0.5, "--max-alpha"),
-    topk_genomes: int = typer.Option(3, "--topk-genomes"),
-    min_reads: int = typer.Option(5, "--min-reads"),
-    bic_margin: float = typer.Option(6.0, "--bic-margin"),
-    # Score weights
     w_as: float = typer.Option(1.0, "--w-as"),
     w_mapq: float = typer.Option(1.0, "--w-mapq"),
     w_nm: float = typer.Option(1.0, "--w-nm"),
-    ambient_const: float = typer.Option(1e-3, "--ambient-const"),    
-    single_mass_min: float = typer.Option(0.6, "--single-mass-min"),
-    ratio_top1_top2_min: float = typer.Option(2.0, "--ratio-top1-top2-min"),
+    ambient_const: float = typer.Option(1e-3, "--ambient-const"),
+    # empty gates
+    empty_bic_margin: float = typer.Option(10.0, "--empty-bic-margin"),
+    empty_top1_max: float = typer.Option(0.6, "--empty-top1-max"),
+    empty_ratio12_max: float = typer.Option(1.5, "--empty-ratio12-max"),
+    empty_reads_max: Optional[int] = typer.Option(None, "--empty-reads-max"),
+    empty_seed_bic_min: float = typer.Option(10.0, "--empty-seed-bic-min"),
+    empty_tau_quantile: float = typer.Option(0.95, "--empty-tau-quantile"),
+    empty_jsd_max: Optional[float] = typer.Option(None, "--empty-jsd-max"),
+    jsd_normalize: bool = typer.Option(True, "--jsd-normalize/--no-jsd-normalize"),
+    # doublet gates
+    bic_margin: float = typer.Option(6.0, "--bic-margin"),
+    doublet_minor_min: float = typer.Option(0.20, "--doublet-minor-min"),
+    # ambient iteration
+    eta_iters: int = typer.Option(2, "--eta-iters"),
+    eta_seed_quantile: float = typer.Option(0.02, "--eta-seed-quantile"),
+    topk_genomes: int = typer.Option(3, "--topk-genomes"),
 ):
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -796,41 +801,44 @@ def genotyping(
         max_hits = None
         hits_delta_mapq = None
 
-    cfg = MergeConfig(
-        sample=sample,
+    cfg = MergeConfig(        
+        # system
+        sample=str(sample),
         shards=int(shards),
         chunk_rows=int(chunk_rows),
         pass2_chunksize=int(pass2_chunksize),
         winner_only=bool(winner_only),
-        pass1_workers=int(threads),
+        pass1_workers=pass1_workers_eff,
         # filter
-        max_hits=max_hits,
-        hits_delta_mapq=hits_delta_mapq,
-        max_rows_per_read_guard=max_rows_per_read_guard,
-        # eta learning
-        eta_iters=int(eta_iters),
-        eta_seed_quantile=float(eta_seed_quantile),
-        empty_tau_quantile=float(empty_tau_quantile),
-        empty_reads_max=empty_reads_max,
-        empty_top1_max=float(empty_top1_max),
-        empty_ratio12_max=float(empty_ratio12_max),
-        # calling/grid
+        max_hits=max_hits_eff,
+        hits_delta_mapq=hits_delta_mapq_eff,
+        max_rows_per_read_guard=int(max_rows_per_read_guard),
+        # fusion / weights
         beta=float(beta),
-        alpha_grid=float(alpha_grid),
-        rho_grid=float(rho_grid),
-        max_alpha=float(max_alpha),
-        topk_genomes=int(topk_genomes),
-        min_reads=int(min_reads),
-        bic_margin=float(bic_margin),
-        # weights
         w_as=float(w_as),
         w_mapq=float(w_mapq),
         w_nm=float(w_nm),
         ambient_const=float(ambient_const),
+        # calling thresholds / gates
+        min_reads=int(min_reads),
         single_mass_min=float(single_mass_min),
         ratio_top1_top2_min=float(ratio_top1_top2_min),
+        bic_margin=float(bic_margin),
+        doublet_minor_min=float(doublet_minor_min),
+        # empty gates / discovery
+        empty_bic_margin=float(empty_bic_margin),
+        empty_top1_max=float(empty_top1_max),
+        empty_ratio12_max=float(empty_ratio12_max),
+        empty_reads_max=(int(empty_reads_max) if empty_reads_max is not None else None),
+        empty_seed_bic_min=float(empty_seed_bic_min),
+        empty_tau_quantile=float(empty_tau_quantile),
+        empty_jsd_max=(float(empty_jsd_max) if empty_jsd_max is not None else None),
+        jsd_normalize=bool(jsd_normalize),
+        # ambient iteration / candidates
+        eta_iters=int(eta_iters),
+        eta_seed_quantile=float(eta_seed_quantile),
+        topk_genomes=int(topk_genomes),
     )
-
     # resolve inputs
     files = [Path(f) for f in glob.glob(assign, recursive=True)]
     if not files:
