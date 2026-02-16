@@ -676,7 +676,7 @@ def genotyping(
     resume: bool = typer.Option(True, "--resume/--no-resume"),
 ) -> None:
     """Posterior-aware genotyping (merge → per-cell genotype calls)."""    
-    from .genotyping import run_genotyping as _run_genotyping
+    from .genotyping import genotyping as _run_genotyping
 
 
     cfg = _load_config(config)
