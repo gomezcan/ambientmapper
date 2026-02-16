@@ -786,6 +786,9 @@ def genotyping(
     w_mapq: float = typer.Option(1.0, "--w-mapq"),
     w_nm: float = typer.Option(1.0, "--w-nm"),
     ambient_const: float = typer.Option(1e-3, "--ambient-const"),
+    min_reads: int = typer.Option(5, "--min-reads"),
+    single_mass_min: float = typer.Option(0.6, "--single-mass-min"),
+    ratio_top1_top2_min: float = typer.Option(2.0, "--ratio-top1-top2-min"),
 ):
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -825,6 +828,9 @@ def genotyping(
         w_mapq=float(w_mapq),
         w_nm=float(w_nm),
         ambient_const=float(ambient_const),
+        min_reads=min_reads,
+        single_mass_min=single_mass_min,
+        ratio_top1_top2_min=ratio_top1_top2_min,
     )
 
     # resolve inputs
