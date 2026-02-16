@@ -827,9 +827,8 @@ def genotyping(
         w_mapq=float(w_mapq),
         w_nm=float(w_nm),
         ambient_const=float(ambient_const),
-        min_reads=min_reads,
-        single_mass_min=single_mass_min,
-        ratio_top1_top2_min=ratio_top1_top2_min,
+        single_mass_min=float(single_mass_min),
+        ratio_top1_top2_min=float(ratio_top1_top2_min),
     )
 
     # resolve inputs
