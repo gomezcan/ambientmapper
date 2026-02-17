@@ -20,6 +20,12 @@ IMPORTANT entrypoint separation:
 - genotyping_cmd(...) is the Typer CLI wrapper that parses flags and forwards them to _run_genotyping.
   This prevents OptionInfo leakage when called programmatically.
 
+Fixes included:
+- Pass2 now SKIPS empty gzip shard files (your 38-byte files) instead of crashing with
+  pandas.errors.EmptyDataError: No columns to parse from file.
+- Pass1 now opens shard gzip outputs lazily (only when writing first rows), avoiding creation of empty files.
+- Pass1 multiprocessing uses a picklable top-level worker function (_pass1_worker_job).
+
 Expected inputs:
 - assign "filtered" outputs: TSV(.gz) with columns like Read, BC, Genome, AS, MAPQ, NM, assigned_class, ...
 - cell chunk lists: one barcode per line, e.g. subset2000_Seedling_cell_map_ref_chunk_0001.txt
@@ -35,7 +41,7 @@ import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterator
 
 import numpy as np
 import pandas as pd
@@ -55,7 +61,7 @@ class MergeConfig(BaseModel):
 
     Notes:
     - empty_seed_bic_min is kept as a parameter (CLI-compatible), but is not currently used in eta learning
-      because BIC-empty evidence requires read-level blocks.
+      because BIC-empty evidence requires read-level blocks. Do not silently reinterpret it.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -157,7 +163,6 @@ def _infer_assign_glob(d: Dict[str, Path]) -> str:
     for pat in candidates:
         if glob.glob(pat):
             return pat
-    # allow deep fallback using **
     return str(d["root"] / "**" / "cell_map_ref_chunks" / "*_filtered.tsv.gz")
 
 
@@ -169,7 +174,6 @@ def _infer_cell_chunks_glob(d: Dict[str, Path]) -> str:
     for pat in candidates:
         if glob.glob(pat):
             return pat
-    # allow deep fallback using **
     return str(d["root"] / "**" / "cell_map_ref_chunks" / "*chunk_*.txt")
 
 
@@ -212,13 +216,12 @@ def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
 # Promiscuous ambiguous filter (NumPy)
 # --------------------------------------------------------------------------------------
 
-
 def _filter_promiscuous_ambiguous_reads(df: pd.DataFrame, cfg: MergeConfig) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     if cfg.max_hits is None or cfg.hits_delta_mapq is None:
         return df, {"enabled": False}
 
     assigned = df["assigned_class"].to_numpy()
-    is_amb = (assigned == "ambiguous")
+    is_amb = assigned == "ambiguous"
     if not is_amb.any():
         return df, {"enabled": True, "dropped_groups": 0, "dropped_rows": 0}
 
@@ -303,7 +306,7 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
     MQ = df["MAPQ"].to_numpy(np.float32, copy=False)
     NM = df["NM"].to_numpy(np.float32, copy=False)
 
-    rid = (df["barcode"].astype(str) + "::" + df["read_id"].astype(str))
+    rid = df["barcode"].astype(str) + "::" + df["read_id"].astype(str)
     codes = rid.astype("category").cat.codes.to_numpy(np.int32)
 
     score = (AS * float(cfg.w_as)) + (MQ * float(cfg.w_mapq)) - (NM * float(cfg.w_nm))
@@ -337,6 +340,7 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
 def _loglik_empty(L_block: pd.DataFrame, eta: pd.Series) -> float:
     eta_row = eta.reindex(L_block["genome"]).fillna(0.0).to_numpy(dtype=float)
     wL = eta_row * L_block["L"].to_numpy(dtype=float)
+
     s = (
         pd.DataFrame({"read_id": L_block["read_id"].values, "wL": wL})
         .groupby("read_id", sort=False)["wL"]
@@ -498,7 +502,7 @@ def _select_model_for_barcode(
 
     jsd_ok = True
     if cfg.empty_jsd_max is not None:
-        jsd_ok = (jsd <= float(cfg.empty_jsd_max))
+        jsd_ok = jsd <= float(cfg.empty_jsd_max)
 
     if empty_by_bic and structural_empty and jsd_ok:
         out.update(
@@ -533,7 +537,11 @@ def _select_model_for_barcode(
         bic_gap = abs(bic_s - bic_d)
     else:
         chosen = best_single if np.isfinite(bic_s) else best_doublet
-        call_core = "single" if (chosen and chosen["model"] == "single") else ("doublet" if chosen else "ambiguous")
+        call_core = (
+            "single"
+            if (chosen and chosen["model"] == "single")
+            else ("doublet" if (chosen and chosen["model"] == "doublet") else "ambiguous")
+        )
         bic_gap = float("inf")
 
     out["bic_gap_sd"] = float(bic_gap) if np.isfinite(bic_gap) else None
@@ -554,11 +562,11 @@ def _select_model_for_barcode(
     # Purity/strength sublabels
     # --------------------------
     if call_core == "single":
-        passes_mass = (p_top1 >= float(cfg.single_mass_min))
-        passes_ratio = (ratio12 >= float(cfg.ratio_top1_top2_min))
+        passes_mass = p_top1 >= float(cfg.single_mass_min)
+        passes_ratio = ratio12 >= float(cfg.ratio_top1_top2_min)
         out["call"] = "single_clean" if (passes_mass and passes_ratio and (not out["near_tie_sd"])) else "dirty_singlet"
     elif call_core == "doublet":
-        passes_minor = (minor_frac >= float(cfg.doublet_minor_min))
+        passes_minor = minor_frac >= float(cfg.doublet_minor_min)
         out["call"] = "doublet" if (passes_minor and (not out["near_tie_sd"])) else "weak_doublet"
     else:
         out["call"] = "ambiguous"
@@ -582,12 +590,8 @@ def _parse_chunk_id_from_path(p: Path, chunk_id_regex: str) -> Optional[int]:
 
 
 def _load_barcode_to_chunk_id(cell_chunks_glob: str, chunk_id_regex: str) -> Dict[str, int]:
-    """
-    Reads all chunk list files and returns barcode->chunk_id.
-    Supports globs with ** by using recursive=True.
-    """
     out: Dict[str, int] = {}
-    files = [Path(x) for x in glob.glob(cell_chunks_glob, recursive=True)]
+    files = [Path(x) for x in glob.glob(cell_chunks_glob)]
     for fp in sorted(files):
         cid = _parse_chunk_id_from_path(fp, chunk_id_regex)
         if cid is None:
@@ -610,7 +614,7 @@ def _route_shards_for_barcodes(barcodes: pd.Series, cfg: MergeConfig, bc_to_chun
         sid = np.empty(len(bcs), dtype=np.int32)
 
         cid = ser.fillna(-1).to_numpy(dtype=np.int64)
-        ok = (cid >= 0)
+        ok = cid >= 0
         sid[ok] = (cid[ok] % int(cfg.shards)).astype(np.int32)
 
         if miss.any():
@@ -620,6 +624,46 @@ def _route_shards_for_barcodes(barcodes: pd.Series, cfg: MergeConfig, bc_to_chun
 
     h = pd.util.hash_pandas_object(pd.Series(bcs, dtype="string"), index=False).to_numpy(np.uint64)
     return (h % np.uint64(cfg.shards)).astype(np.int32)
+
+
+# --------------------------------------------------------------------------------------
+# Robust shard reading (SKIP empty gz files)
+# --------------------------------------------------------------------------------------
+
+
+def _iter_shard_chunks(shard_path: Path, cfg: MergeConfig) -> Iterator[pd.DataFrame]:
+    """
+    Yield pandas chunks from a shard_*.tsv.gz file.
+    Skips empty gzip files (common when Pass1 created files but wrote no header/rows).
+    """
+    try:
+        sz = shard_path.stat().st_size
+    except FileNotFoundError:
+        return
+    # Your empty shards are ~38 bytes (gzip container only). Anything very small is not a valid TSV header.
+    if sz < 64:
+        return
+
+    try:
+        for chunk in pd.read_csv(
+            shard_path,
+            sep="\t",
+            compression="gzip",
+            chunksize=int(cfg.pass2_chunksize),
+            dtype={
+                "barcode": "string",
+                "read_id": "string",
+                "genome": "string",
+                "L": "float32",
+                "L_amb": "float32",
+            },
+        ):
+            if chunk is None or chunk.empty:
+                continue
+            yield chunk
+    except pd.errors.EmptyDataError:
+        # Header missing / no columns.
+        return
 
 
 # --------------------------------------------------------------------------------------
@@ -633,11 +677,35 @@ class Pass1Outputs:
     N: pd.DataFrame
 
 
+def _pass1_worker_job(args: Tuple[int, str, MergeConfig, str, Optional[Dict[str, int]]]) -> Pass1Outputs:
+    """
+    Top-level worker so it is picklable by multiprocessing.
+    args: (worker_index, filepath, cfg, shard_root, bc_to_chunk)
+    """
+    i, fp_str, cfg, shard_root_str, bc_to_chunk = args
+    fp = Path(fp_str)
+    shard_root = Path(shard_root_str)
+    wdir = shard_root / f"w{i:03d}"
+    return _pass1_process_one_file(fp, cfg, wdir, bc_to_chunk)
+
+
 def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path, bc_to_chunk: Optional[Dict[str, int]]) -> Pass1Outputs:
+    """
+    Writes per-read posterior rows to shard gzip files under shard_dir.
+    FIX: shard files are opened lazily (only if we actually write rows),
+         preventing creation of 38-byte empty gzip files.
+    """
     shard_dir.mkdir(parents=True, exist_ok=True)
 
-    handles = [gzip.open(shard_dir / f"shard_{i:02d}.tsv.gz", "at") for i in range(cfg.shards)]
+    handles: Dict[int, gzip.GzipFile] = {}
     header_written = np.zeros(cfg.shards, dtype=bool)
+
+    def _get_handle(sid: int) -> gzip.GzipFile:
+        if sid in handles:
+            return handles[sid]
+        h = gzip.open(shard_dir / f"shard_{sid:02d}.tsv.gz", "at")
+        handles[sid] = h
+        return h
 
     C_parts: List[pd.DataFrame] = []
     N_parts: List[pd.DataFrame] = []
@@ -661,33 +729,23 @@ def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path, bc_to_c
         sid = _route_shards_for_barcodes(Ldf["barcode"], cfg, bc_to_chunk)
         Ldf = Ldf.assign(_sid=sid)
 
+        # Write per shard (avoid creating files for shards with no rows)
         for i in range(cfg.shards):
             sub = Ldf[Ldf["_sid"] == i]
             if sub.empty:
                 continue
+            h = _get_handle(i)
             if not header_written[i]:
-                handles[i].write("barcode\tread_id\tgenome\tL\tL_amb\n")
+                h.write("barcode\tread_id\tgenome\tL\tL_amb\n")
                 header_written[i] = True
-            sub.drop(columns="_sid").to_csv(handles[i], sep="\t", header=False, index=False)
+            sub.drop(columns="_sid").to_csv(h, sep="\t", header=False, index=False)
 
-    for h in handles:
+    for h in handles.values():
         h.close()
 
     C_out = pd.concat(C_parts, ignore_index=True) if C_parts else pd.DataFrame(columns=["barcode", "genome", "C"])
     N_out = pd.concat(N_parts, ignore_index=True) if N_parts else pd.DataFrame(columns=["barcode", "n_reads"])
     return Pass1Outputs(C=C_out, N=N_out)
-
-
-def _pass1_worker_job(args: Tuple[int, str, MergeConfig, str, Optional[Dict[str, int]]]) -> Pass1Outputs:
-    """
-    Top-level worker so it is picklable by multiprocessing.
-    args: (worker_index, filepath, cfg, shard_root, bc_to_chunk)
-    """
-    i, fp_str, cfg, shard_root_str, bc_to_chunk = args
-    fp = Path(fp_str)
-    shard_root = Path(shard_root_str)
-    wdir = shard_root / f"w{i:03d}"
-    return _pass1_process_one_file(fp, cfg, wdir, bc_to_chunk)
 
 
 # --------------------------------------------------------------------------------------
@@ -704,13 +762,7 @@ def _compute_eta_from_shards(shard_root: Path, target_bcs: Sequence[str], all_ge
         return eta / eta.sum()
 
     for shard in shard_root.rglob("shard_*.tsv.gz"):
-        for chunk in pd.read_csv(
-            shard,
-            sep="\t",
-            compression="gzip",
-            chunksize=int(cfg.pass2_chunksize),
-            dtype={"barcode": "string", "read_id": "string", "genome": "string", "L": "float32", "L_amb": "float32"},
-        ):
+        for chunk in _iter_shard_chunks(shard, cfg):
             sub = chunk[chunk["barcode"].isin(target_set)]
             if sub.empty:
                 continue
@@ -770,10 +822,10 @@ def _refine_eta_seed_by_jsd(C_all: pd.DataFrame, N_all: pd.DataFrame, eta: pd.Se
         cand = stats
 
     jsd_vals: Dict[str, float] = {}
-    cand_index = set(map(str, cand.index.tolist()))
+    cand_set = set(cand.index.astype(str).tolist())
     for bc, sub in mass.groupby("barcode", sort=False):
         bc_s = str(bc)
-        if bc_s not in cand_index:
+        if bc_s not in cand_set:
             continue
         s = sub.set_index("genome")["C"]
         jsd_vals[bc_s] = _barcode_jsd_from_mass(s, eta, normalize=bool(cfg.jsd_normalize))
@@ -786,7 +838,13 @@ def _refine_eta_seed_by_jsd(C_all: pd.DataFrame, N_all: pd.DataFrame, eta: pd.Se
     return jsd_ser[jsd_ser <= tau].index.astype(str).tolist()
 
 
-def _learn_eta(C_all: pd.DataFrame, N_all: pd.DataFrame, shard_root: Path, all_genomes: Sequence[str], cfg: MergeConfig) -> Tuple[pd.Series, Dict[str, Any]]:
+def _learn_eta(
+    C_all: pd.DataFrame,
+    N_all: pd.DataFrame,
+    shard_root: Path,
+    all_genomes: Sequence[str],
+    cfg: MergeConfig,
+) -> Tuple[pd.Series, Dict[str, Any]]:
     meta: Dict[str, Any] = {"iters": int(cfg.eta_iters), "seed_sizes": []}
 
     seed = _pick_initial_eta_seed(C_all, N_all, cfg)
@@ -817,15 +875,7 @@ def _call_from_shard_file(
 ) -> int:
     buckets: Dict[str, List[pd.DataFrame]] = {}
 
-    for chunk in pd.read_csv(
-        shard_path,
-        sep="\t",
-        compression="gzip",
-        chunksize=int(cfg.pass2_chunksize),
-        dtype={"barcode": "string", "read_id": "string", "genome": "string", "L": "float32", "L_amb": "float32"},
-    ):
-        if chunk.empty:
-            continue
+    for chunk in _iter_shard_chunks(shard_path, cfg):
         for bc, sub in chunk.groupby("barcode", sort=False):
             buckets.setdefault(str(bc), []).append(sub[["read_id", "genome", "L"]].copy())
 
@@ -917,7 +967,7 @@ def _run_genotyping(
     eta_iters: Optional[int] = None,
     eta_seed_quantile: Optional[float] = None,
     topk_genomes: Optional[int] = None,
-    resume: bool = True,  # kept for CLI compatibility; not used here
+    resume: bool = True,
 ) -> None:
     cfg_json = _read_cfg_json(Path(config))
     sample_eff = _infer_sample(cfg_json, sample)
@@ -929,6 +979,7 @@ def _run_genotyping(
     assign_glob = assign if assign is not None else _infer_assign_glob(d)
     cell_chunks_pat = cell_chunks_glob if cell_chunks_glob is not None else _infer_cell_chunks_glob(d)
 
+    # worker policy: pass1 defaults to threads if not provided
     threads_eff = int(threads) if threads is not None else 1
     pass1_workers_eff = int(pass1_workers) if pass1_workers is not None else int(threads_eff)
 
@@ -999,15 +1050,14 @@ def _run_genotyping(
 
     files = [Path(f) for f in glob.glob(assign_glob, recursive=True)]
     if not files:
-        raise ValueError(f"No files matched: {assign_glob}")
+        raise typer.BadParameter(f"No files matched: {assign_glob}")
 
     tmp_dir = outdir_eff / f"tmp_{sample_eff}"
     shard_root = tmp_dir / "L_shards_workers"
     shard_root.mkdir(parents=True, exist_ok=True)
 
-    # chunk list discovery must support **
-    chunk_files = glob.glob(cell_chunks_pat, recursive=True)
     bc_to_chunk: Optional[Dict[str, int]] = None
+    chunk_files = glob.glob(cell_chunks_pat)
     if chunk_files:
         bc_to_chunk = _load_barcode_to_chunk_id(cell_chunks_pat, chunk_id_regex)
         typer.echo(
@@ -1023,47 +1073,55 @@ def _run_genotyping(
         f"[genotyping] filter: max_hits={cfg.max_hits} hits_delta_mapq={cfg.hits_delta_mapq} guard={cfg.max_rows_per_read_guard}"
     )
     typer.echo(f"[genotyping] winner_only={cfg.winner_only} ambient_const={cfg.ambient_const}")
-    typer.echo(
-        f"[genotyping] gates: empty_bic_margin={cfg.empty_bic_margin} bic_margin={cfg.bic_margin} near_tie_margin={cfg.near_tie_margin}"
-    )
+    typer.echo(f"[genotyping] gates: empty_bic_margin={cfg.empty_bic_margin} bic_margin={cfg.bic_margin} near_tie_margin={cfg.near_tie_margin}")
     if cfg.empty_seed_bic_min is not None:
         typer.echo("[genotyping] NOTE: empty_seed_bic_min is currently not used in eta learning in this implementation.")
+
+    C_path = outdir_eff / f"{sample_eff}_C_all.tsv.gz"
+    N_path = outdir_eff / f"{sample_eff}_N_all.tsv.gz"
+    eta_out = outdir_eff / f"{sample_eff}_eta.tsv.gz"
+    calls_path = outdir_eff / f"{sample_eff}_genotype_calls.tsv.gz"
 
     # -----------------------
     # Pass 1
     # -----------------------
-    typer.echo("[1/4] Pass 1: streaming assign inputs → per-read posteriors + spill shards")
+    if resume and C_path.exists() and N_path.exists() and any(shard_root.rglob("shard_*.tsv.gz")):
+        typer.echo("[1/4] Pass 1: resume (found C/N + shard spill)")
+        C_all = pd.read_csv(C_path, sep="\t", compression="gzip", dtype={"barcode": "string", "genome": "string", "C": "float64"})
+        N_all = pd.read_csv(N_path, sep="\t", compression="gzip", dtype={"barcode": "string", "n_reads": "int64"})
+    else:
+        typer.echo("[1/4] Pass 1: streaming assign inputs → per-read posteriors + spill shards")
 
-    C_list: List[pd.DataFrame] = []
-    N_list: List[pd.DataFrame] = []
+        C_list: List[pd.DataFrame] = []
+        N_list: List[pd.DataFrame] = []
 
-    # IMPORTANT: do not submit nested functions (not picklable). Use _pass1_worker_job.
-    job_args: List[Tuple[int, str, MergeConfig, str, Optional[Dict[str, int]]]] = [
-        (i, str(f), cfg, str(shard_root), bc_to_chunk) for i, f in enumerate(files)
-    ]
+        args = [(i, str(f), cfg, str(shard_root), bc_to_chunk) for i, f in enumerate(files)]
+        with ProcessPoolExecutor(max_workers=int(pass1_workers_eff)) as ex:
+            futs = [ex.submit(_pass1_worker_job, a) for a in args]
+            for fut in as_completed(futs):
+                out = fut.result()
+                if not out.C.empty:
+                    C_list.append(out.C)
+                if not out.N.empty:
+                    N_list.append(out.N)
 
-    with ProcessPoolExecutor(max_workers=int(pass1_workers_eff)) as ex:
-        futs = [ex.submit(_pass1_worker_job, a) for a in job_args]
-        for fut in as_completed(futs):
-            out = fut.result()
-            if not out.C.empty:
-                C_list.append(out.C)
-            if not out.N.empty:
-                N_list.append(out.N)
+        C_all = (
+            pd.concat(C_list, ignore_index=True).groupby(["barcode", "genome"], sort=False)["C"].sum().reset_index()
+            if C_list
+            else pd.DataFrame(columns=["barcode", "genome", "C"])
+        )
+        N_all = (
+            pd.concat(N_list, ignore_index=True).groupby("barcode", sort=False)["n_reads"].sum().reset_index()
+            if N_list
+            else pd.DataFrame(columns=["barcode", "n_reads"])
+        )
 
-    C_all = (
-        pd.concat(C_list, ignore_index=True).groupby(["barcode", "genome"], sort=False)["C"].sum().reset_index()
-        if C_list
-        else pd.DataFrame(columns=["barcode", "genome", "C"])
-    )
-    N_all = (
-        pd.concat(N_list, ignore_index=True).groupby("barcode", sort=False)["n_reads"].sum().reset_index()
-        if N_list
-        else pd.DataFrame(columns=["barcode", "n_reads"])
-    )
+        if C_all.empty:
+            raise RuntimeError("Pass 1 produced no mass (C_all empty). Check input tables and schema.")
 
-    if C_all.empty:
-        raise RuntimeError("Pass 1 produced no mass (C_all empty). Check input tables and schema.")
+        C_all.to_csv(C_path, sep="\t", index=False, compression="gzip")
+        N_all.to_csv(N_path, sep="\t", index=False, compression="gzip")
+        typer.echo(f"[1/4] wrote: {C_path.name}, {N_path.name}")
 
     all_genomes = C_all["genome"].astype(str).unique().tolist()
 
@@ -1072,60 +1130,62 @@ def _run_genotyping(
         s = sub.sort_values("C", ascending=False)["genome"].astype(str).head(int(cfg.topk_genomes)).tolist()
         topk[str(bc)] = s
 
-    C_path = outdir_eff / f"{sample_eff}_C_all.tsv.gz"
-    N_path = outdir_eff / f"{sample_eff}_N_all.tsv.gz"
-    C_all.to_csv(C_path, sep="\t", index=False, compression="gzip")
-    N_all.to_csv(N_path, sep="\t", index=False, compression="gzip")
-    typer.echo(f"[1/4] wrote: {C_path.name}, {N_path.name}")
-
     # -----------------------
     # Pass 2
     # -----------------------
-    typer.echo("[2/4] Pass 2: ambient learning (eta) from shard spill")
-    eta, eta_meta = _learn_eta(C_all, N_all, shard_root, all_genomes, cfg)
-    eta_out = outdir_eff / f"{sample_eff}_eta.tsv.gz"
-    eta.to_frame("eta").to_csv(eta_out, sep="\t", compression="gzip")
-    typer.echo(f"[2/4] eta saved: {eta_out.name}  seed_sizes={eta_meta.get('seed_sizes')}")
+    if resume and eta_out.exists():
+        typer.echo("[2/4] Pass 2: resume (found eta)")
+        eta = pd.read_csv(eta_out, sep="\t", compression="gzip").set_index("Unnamed: 0")["eta"]
+        eta.index = eta.index.astype(str)
+        eta = eta.astype(float)
+        eta = eta / (eta.sum() + 1e-12)
+    else:
+        typer.echo("[2/4] Pass 2: ambient learning (eta) from shard spill")
+        eta, eta_meta = _learn_eta(C_all, N_all, shard_root, all_genomes, cfg)
+        eta.to_frame("eta").to_csv(eta_out, sep="\t", compression="gzip")
+        typer.echo(f"[2/4] eta saved: {eta_out.name}  seed_sizes={eta_meta.get('seed_sizes')}")
 
     # -----------------------
     # Pass 3
     # -----------------------
-    typer.echo("[3/4] Pass 3: model selection / calls from shards")
-    calls_path = outdir_eff / f"{sample_eff}_genotype_calls.tsv.gz"
-    with gzip.open(calls_path, "wt") as oh:
-        oh.write(
-            "\t".join(
-                [
-                    "barcode",
-                    "call",
-                    "model",
-                    "genome_1",
-                    "genome_2",
-                    "alpha",
-                    "rho",
-                    "n_reads",
-                    "n_effective",
-                    "p_top1",
-                    "p_top2",
-                    "ratio12",
-                    "jsd_to_eta",
-                    "bic_empty",
-                    "bic_best",
-                    "bic_single",
-                    "bic_doublet",
-                    "bic_gap_sd",
-                    "near_tie_sd",
-                    "doublet_minor_frac",
-                ]
+    if resume and calls_path.exists():
+        typer.echo("[3/4] Pass 3: resume (found calls)")
+    else:
+        typer.echo("[3/4] Pass 3: model selection / calls from shards")
+        with gzip.open(calls_path, "wt") as oh:
+            oh.write(
+                "\t".join(
+                    [
+                        "barcode",
+                        "call",
+                        "model",
+                        "genome_1",
+                        "genome_2",
+                        "alpha",
+                        "rho",
+                        "n_reads",
+                        "n_effective",
+                        "p_top1",
+                        "p_top2",
+                        "ratio12",
+                        "jsd_to_eta",
+                        "bic_empty",
+                        "bic_best",
+                        "bic_single",
+                        "bic_doublet",
+                        "bic_gap_sd",
+                        "near_tie_sd",
+                        "doublet_minor_frac",
+                    ]
+                )
+                + "\n"
             )
-            + "\n"
-        )
 
-        called_total = 0
-        for shard in sorted(shard_root.rglob("shard_*.tsv.gz")):
-            called_total += _call_from_shard_file(shard, eta, topk, cfg, oh)
+            called_total = 0
+            for shard in sorted(shard_root.rglob("shard_*.tsv.gz")):
+                called_total += _call_from_shard_file(shard, eta, topk, cfg, oh)
 
-    typer.echo(f"[3/4] calls written: {calls_path.name} (emitted rows={called_total})")
+        typer.echo(f"[3/4] calls written: {calls_path.name} (emitted rows={called_total})")
 
     # -----------------------
     # Pass 4
@@ -1147,7 +1207,9 @@ def _run_genotyping(
 def genotyping_cmd(
     config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
     assign: Optional[str] = typer.Option(None, "--assign", help="Glob to assign outputs. If omitted, inferred."),
-    cell_chunks_glob: Optional[str] = typer.Option(None, "--cell-chunks-glob", help="Glob to cell chunk barcode lists. If omitted, inferred."),
+    cell_chunks_glob: Optional[str] = typer.Option(
+        None, "--cell-chunks-glob", help="Glob to cell chunk barcode lists. If omitted, inferred."
+    ),
     chunk_id_regex: str = typer.Option(r"chunk_(\d+)", "--chunk-id-regex", help="Regex to extract chunk id from chunk list filename."),
     outdir: Optional[Path] = typer.Option(None, "--outdir", help="Override output dir (default: <workdir>/<sample>/final)."),
     sample: Optional[str] = typer.Option(None, "--sample", help="Override sample name from config."),
@@ -1231,6 +1293,7 @@ def genotyping_cmd(
         resume=resume,
     )
 
-
 if __name__ == "__main__":
     app()
+
+  app()
