@@ -20,7 +20,7 @@ IMPORTANT entrypoint separation:
 - genotyping_cmd(...) is the Typer CLI wrapper that parses flags and forwards them to _run_genotyping.
   This prevents OptionInfo leakage when called programmatically.
 
-Fixes included:
+Fixes included (based on your traceback):
 - Pass2 now SKIPS empty gzip shard files (your 38-byte files) instead of crashing with
   pandas.errors.EmptyDataError: No columns to parse from file.
 - Pass1 now opens shard gzip outputs lazily (only when writing first rows), avoiding creation of empty files.
@@ -215,6 +215,7 @@ def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------------------
 # Promiscuous ambiguous filter (NumPy)
 # --------------------------------------------------------------------------------------
+
 
 def _filter_promiscuous_ambiguous_reads(df: pd.DataFrame, cfg: MergeConfig) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     if cfg.max_hits is None or cfg.hits_delta_mapq is None:
@@ -1293,7 +1294,6 @@ def genotyping_cmd(
         resume=resume,
     )
 
+
 if __name__ == "__main__":
     app()
-
-  app()
