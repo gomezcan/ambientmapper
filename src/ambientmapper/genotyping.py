@@ -18,7 +18,7 @@ Shard policy (requested):
 IMPORTANT entrypoint separation:
 - _run_genotyping(...) is a plain Python function and is the only function that cli.py should call.
 - genotyping_cmd(...) is the Typer CLI wrapper that parses flags and forwards them to _run_genotyping.
-  This prevents OptionInfo leakage when called programmatically (your previous crash).
+  This prevents OptionInfo leakage when called programmatically.
 
 Expected inputs:
 - assign "filtered" outputs: TSV(.gz) with columns like Read, BC, Genome, AS, MAPQ, NM, assigned_class, ...
@@ -42,13 +42,12 @@ import pandas as pd
 import typer
 from pydantic import BaseModel, ConfigDict
 
-
 app = typer.Typer(add_completion=False, no_args_is_help=True)
-
 
 # --------------------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------------------
+
 
 class MergeConfig(BaseModel):
     """
@@ -56,8 +55,9 @@ class MergeConfig(BaseModel):
 
     Notes:
     - empty_seed_bic_min is kept as a parameter (CLI-compatible), but is not currently used in eta learning
-      because BIC-empty evidence requires read-level blocks. Do not silently reinterpret it.
+      because BIC-empty evidence requires read-level blocks.
     """
+
     model_config = ConfigDict(extra="forbid")
 
     # Fusion / scoring -> posteriors
@@ -74,9 +74,9 @@ class MergeConfig(BaseModel):
     doublet_minor_min: float = 0.20
 
     # BIC gates (match figure)
-    empty_bic_margin: float = 10.0      # Decision 1: empty vs non-empty
-    bic_margin: float = 6.0             # Decision 2: singlet vs doublet (ΔBIC gate)
-    near_tie_margin: float = 2.0        # sub-gate for dirty/weak labeling only
+    empty_bic_margin: float = 10.0  # Decision 1: empty vs non-empty
+    bic_margin: float = 6.0  # Decision 2: singlet vs doublet (ΔBIC gate)
+    near_tie_margin: float = 2.0  # sub-gate for dirty/weak labeling only
 
     # Empty structural gates (used for optional empty call constraints + eta seed refinement)
     empty_top1_max: float = 0.6
@@ -116,12 +116,14 @@ class MergeConfig(BaseModel):
 
 
 # --------------------------------------------------------------------------------------
-# Config JSON helpers (minimal; matches your pipeline conventions)
+# Config JSON helpers
 # --------------------------------------------------------------------------------------
+
 
 def _read_cfg_json(config_path: Path) -> Dict[str, Any]:
     with open(config_path, "rt") as f:
         return json.load(f)
+
 
 def _infer_sample(cfg_json: Dict[str, Any], sample_override: Optional[str]) -> str:
     if sample_override:
@@ -129,6 +131,7 @@ def _infer_sample(cfg_json: Dict[str, Any], sample_override: Optional[str]) -> s
     if cfg_json.get("sample"):
         return str(cfg_json["sample"])
     return "sample"
+
 
 def _infer_paths(cfg_json: Dict[str, Any], sample: str) -> Dict[str, Path]:
     workdir = cfg_json.get("workdir")
@@ -143,6 +146,7 @@ def _infer_paths(cfg_json: Dict[str, Any], sample: str) -> Dict[str, Path]:
         "final": root / "final",
     }
 
+
 def _infer_assign_glob(d: Dict[str, Path]) -> str:
     candidates = [
         str(d["chunks"] / "cell_map_ref_chunks" / "*_filtered.tsv.gz"),
@@ -153,7 +157,9 @@ def _infer_assign_glob(d: Dict[str, Path]) -> str:
     for pat in candidates:
         if glob.glob(pat):
             return pat
+    # allow deep fallback using **
     return str(d["root"] / "**" / "cell_map_ref_chunks" / "*_filtered.tsv.gz")
+
 
 def _infer_cell_chunks_glob(d: Dict[str, Path]) -> str:
     candidates = [
@@ -163,12 +169,14 @@ def _infer_cell_chunks_glob(d: Dict[str, Path]) -> str:
     for pat in candidates:
         if glob.glob(pat):
             return pat
+    # allow deep fallback using **
     return str(d["root"] / "**" / "cell_map_ref_chunks" / "*chunk_*.txt")
 
 
 # --------------------------------------------------------------------------------------
 # Helpers: schema and coercion
 # --------------------------------------------------------------------------------------
+
 
 def _coerce_assign_schema(df: pd.DataFrame) -> pd.DataFrame:
     m = {"BC": "barcode", "Read": "read_id", "Genome": "genome"}
@@ -193,6 +201,7 @@ def _coerce_assign_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
+
 def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
     keys = ["barcode", "read_id", "genome"]
     agg = {"AS": "max", "MAPQ": "max", "NM": "min", "assigned_class": "first"}
@@ -202,6 +211,7 @@ def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------------------
 # Promiscuous ambiguous filter (NumPy)
 # --------------------------------------------------------------------------------------
+
 
 def _filter_promiscuous_ambiguous_reads(df: pd.DataFrame, cfg: MergeConfig) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     if cfg.max_hits is None or cfg.hits_delta_mapq is None:
@@ -284,6 +294,7 @@ def _filter_promiscuous_ambiguous_reads(df: pd.DataFrame, cfg: MergeConfig) -> T
 # Core: posterior computation
 # --------------------------------------------------------------------------------------
 
+
 def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame:
     df = df[["barcode", "read_id", "genome", "AS", "MAPQ", "NM"]].copy()
     df = df.dropna(subset=["barcode", "read_id", "genome"])
@@ -322,10 +333,10 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
 # Likelihood / BIC / JSD
 # --------------------------------------------------------------------------------------
 
+
 def _loglik_empty(L_block: pd.DataFrame, eta: pd.Series) -> float:
     eta_row = eta.reindex(L_block["genome"]).fillna(0.0).to_numpy(dtype=float)
     wL = eta_row * L_block["L"].to_numpy(dtype=float)
-
     s = (
         pd.DataFrame({"read_id": L_block["read_id"].values, "wL": wL})
         .groupby("read_id", sort=False)["wL"]
@@ -333,6 +344,7 @@ def _loglik_empty(L_block: pd.DataFrame, eta: pd.Series) -> float:
         .to_numpy()
     )
     return float(np.log(np.clip(s, 1e-12, None)).sum())
+
 
 def _loglik_for_params(
     L_block: pd.DataFrame,
@@ -347,11 +359,9 @@ def _loglik_for_params(
     eta_row = eta.reindex(L_block["genome"]).fillna(0.0).to_numpy(dtype=float)
 
     if model == "single":
-        # P(r|single) = (1-alpha)*delta_g1 + alpha*eta
         w = np.where(gn == g1, (1.0 - alpha) + alpha * float(eta.get(g1, 0.0)), alpha * eta_row)
     else:
         assert g2 is not None
-        # P(r|doublet) = (1-alpha)*(rho*delta_g1 + (1-rho)*delta_g2) + alpha*eta
         mix = np.where(gn == g1, rho, np.where(gn == g2, 1.0 - rho, 0.0))
         w = (1.0 - alpha) * mix + alpha * eta_row
 
@@ -364,8 +374,10 @@ def _loglik_for_params(
     )
     return float(np.log(np.clip(s, 1e-12, None)).sum())
 
+
 def _bic(loglik: float, n_params: int, n_reads: int) -> float:
     return -2.0 * loglik + n_params * math.log(max(n_reads, 1))
+
 
 def _barcode_jsd_from_mass(mass: pd.Series, eta: pd.Series, normalize: bool = True) -> float:
     idx = sorted(set(mass.index) | set(eta.index))
@@ -386,6 +398,7 @@ def _barcode_jsd_from_mass(mass: pd.Series, eta: pd.Series, normalize: bool = Tr
 # --------------------------------------------------------------------------------------
 # Model selection (gate design preserved)
 # --------------------------------------------------------------------------------------
+
 
 def _select_model_for_barcode(
     L_block: pd.DataFrame,
@@ -453,9 +466,20 @@ def _select_model_for_barcode(
                 g1, g2 = candidate_genomes[i], candidate_genomes[j]
                 for a in alphas:
                     for r in rhos:
-                        bic = _bic(_loglik_for_params(L_block, eta, "doublet", g1, g2, float(a), float(r)), 2, read_count)
+                        bic = _bic(
+                            _loglik_for_params(L_block, eta, "doublet", g1, g2, float(a), float(r)),
+                            2,
+                            read_count,
+                        )
                         if best_doublet is None or bic < best_doublet["bic"]:
-                            best_doublet = {"model": "doublet", "g1": g1, "g2": g2, "alpha": float(a), "rho": float(r), "bic": float(bic)}
+                            best_doublet = {
+                                "model": "doublet",
+                                "g1": g1,
+                                "g2": g2,
+                                "alpha": float(a),
+                                "rho": float(r),
+                                "bic": float(bic),
+                            }
 
     bic_s = float(best_single["bic"]) if best_single else float("inf")
     bic_d = float(best_doublet["bic"]) if best_doublet else float("inf")
@@ -546,6 +570,7 @@ def _select_model_for_barcode(
 # Cell chunk parsing for shard routing
 # --------------------------------------------------------------------------------------
 
+
 def _parse_chunk_id_from_path(p: Path, chunk_id_regex: str) -> Optional[int]:
     m = re.search(chunk_id_regex, p.name)
     if not m:
@@ -555,9 +580,14 @@ def _parse_chunk_id_from_path(p: Path, chunk_id_regex: str) -> Optional[int]:
     except Exception:
         return None
 
+
 def _load_barcode_to_chunk_id(cell_chunks_glob: str, chunk_id_regex: str) -> Dict[str, int]:
+    """
+    Reads all chunk list files and returns barcode->chunk_id.
+    Supports globs with ** by using recursive=True.
+    """
     out: Dict[str, int] = {}
-    files = [Path(x) for x in glob.glob(cell_chunks_glob)]
+    files = [Path(x) for x in glob.glob(cell_chunks_glob, recursive=True)]
     for fp in sorted(files):
         cid = _parse_chunk_id_from_path(fp, chunk_id_regex)
         if cid is None:
@@ -570,6 +600,7 @@ def _load_barcode_to_chunk_id(cell_chunks_glob: str, chunk_id_regex: str) -> Dic
                 if bc not in out:
                     out[bc] = cid
     return out
+
 
 def _route_shards_for_barcodes(barcodes: pd.Series, cfg: MergeConfig, bc_to_chunk: Optional[Dict[str, int]]) -> np.ndarray:
     bcs = barcodes.astype(str).to_numpy()
@@ -595,10 +626,12 @@ def _route_shards_for_barcodes(barcodes: pd.Series, cfg: MergeConfig, bc_to_chun
 # Pass 1: stream assign files -> (C_all, N_all) + shard spill
 # --------------------------------------------------------------------------------------
 
+
 @dataclass
 class Pass1Outputs:
     C: pd.DataFrame
     N: pd.DataFrame
+
 
 def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path, bc_to_chunk: Optional[Dict[str, int]]) -> Pass1Outputs:
     shard_dir.mkdir(parents=True, exist_ok=True)
@@ -645,9 +678,22 @@ def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path, bc_to_c
     return Pass1Outputs(C=C_out, N=N_out)
 
 
+def _pass1_worker_job(args: Tuple[int, str, MergeConfig, str, Optional[Dict[str, int]]]) -> Pass1Outputs:
+    """
+    Top-level worker so it is picklable by multiprocessing.
+    args: (worker_index, filepath, cfg, shard_root, bc_to_chunk)
+    """
+    i, fp_str, cfg, shard_root_str, bc_to_chunk = args
+    fp = Path(fp_str)
+    shard_root = Path(shard_root_str)
+    wdir = shard_root / f"w{i:03d}"
+    return _pass1_process_one_file(fp, cfg, wdir, bc_to_chunk)
+
+
 # --------------------------------------------------------------------------------------
 # Ambient learning (eta)
 # --------------------------------------------------------------------------------------
+
 
 def _compute_eta_from_shards(shard_root: Path, target_bcs: Sequence[str], all_genomes: Sequence[str], cfg: MergeConfig) -> pd.Series:
     target_set = set(map(str, target_bcs))
@@ -676,6 +722,7 @@ def _compute_eta_from_shards(shard_root: Path, target_bcs: Sequence[str], all_ge
     eta = pd.Series(mix, dtype=float) + 1e-12
     return eta / eta.sum()
 
+
 def _pick_initial_eta_seed(C_all: pd.DataFrame, N_all: pd.DataFrame, cfg: MergeConfig) -> List[str]:
     if C_all.empty:
         return []
@@ -691,6 +738,7 @@ def _pick_initial_eta_seed(C_all: pd.DataFrame, N_all: pd.DataFrame, cfg: MergeC
     q = min(max(float(cfg.eta_seed_quantile), 1e-6), 1.0)
     n = max(1, int(math.ceil(q * len(df))))
     return df.sort_values("n_effective", ascending=True)["barcode"].head(n).astype(str).tolist()
+
 
 def _refine_eta_seed_by_jsd(C_all: pd.DataFrame, N_all: pd.DataFrame, eta: pd.Series, cfg: MergeConfig) -> List[str]:
     if C_all.empty:
@@ -722,9 +770,10 @@ def _refine_eta_seed_by_jsd(C_all: pd.DataFrame, N_all: pd.DataFrame, eta: pd.Se
         cand = stats
 
     jsd_vals: Dict[str, float] = {}
+    cand_index = set(map(str, cand.index.tolist()))
     for bc, sub in mass.groupby("barcode", sort=False):
         bc_s = str(bc)
-        if bc_s not in cand.index.astype(str):
+        if bc_s not in cand_index:
             continue
         s = sub.set_index("genome")["C"]
         jsd_vals[bc_s] = _barcode_jsd_from_mass(s, eta, normalize=bool(cfg.jsd_normalize))
@@ -735,6 +784,7 @@ def _refine_eta_seed_by_jsd(C_all: pd.DataFrame, N_all: pd.DataFrame, eta: pd.Se
     jsd_ser = pd.Series(jsd_vals, dtype=float)
     tau = jsd_ser.quantile(float(cfg.empty_tau_quantile))
     return jsd_ser[jsd_ser <= tau].index.astype(str).tolist()
+
 
 def _learn_eta(C_all: pd.DataFrame, N_all: pd.DataFrame, shard_root: Path, all_genomes: Sequence[str], cfg: MergeConfig) -> Tuple[pd.Series, Dict[str, Any]]:
     meta: Dict[str, Any] = {"iters": int(cfg.eta_iters), "seed_sizes": []}
@@ -756,6 +806,7 @@ def _learn_eta(C_all: pd.DataFrame, N_all: pd.DataFrame, shard_root: Path, all_g
 # --------------------------------------------------------------------------------------
 # Calling: per-shard file (call each barcode once)
 # --------------------------------------------------------------------------------------
+
 
 def _call_from_shard_file(
     shard_path: Path,
@@ -820,6 +871,7 @@ def _call_from_shard_file(
 # Core entrypoint (called by cli.py)
 # --------------------------------------------------------------------------------------
 
+
 def _run_genotyping(
     *,
     config: Path,
@@ -865,7 +917,7 @@ def _run_genotyping(
     eta_iters: Optional[int] = None,
     eta_seed_quantile: Optional[float] = None,
     topk_genomes: Optional[int] = None,
-    resume: bool = True,
+    resume: bool = True,  # kept for CLI compatibility; not used here
 ) -> None:
     cfg_json = _read_cfg_json(Path(config))
     sample_eff = _infer_sample(cfg_json, sample)
@@ -877,59 +929,85 @@ def _run_genotyping(
     assign_glob = assign if assign is not None else _infer_assign_glob(d)
     cell_chunks_pat = cell_chunks_glob if cell_chunks_glob is not None else _infer_cell_chunks_glob(d)
 
-    # worker policy: pass1 defaults to threads if not provided
     threads_eff = int(threads) if threads is not None else 1
     pass1_workers_eff = int(pass1_workers) if pass1_workers is not None else int(threads_eff)
 
-    # Build cfg from defaults then override with CLI where provided
     cfg = MergeConfig(sample=str(sample_eff), pass1_workers=int(pass1_workers_eff))
 
-    if shards is not None: cfg.shards = int(shards)
-    if chunk_rows is not None: cfg.chunk_rows = int(chunk_rows)
-    if pass2_chunksize is not None: cfg.pass2_chunksize = int(pass2_chunksize)
-    if winner_only is not None: cfg.winner_only = bool(winner_only)
+    if shards is not None:
+        cfg.shards = int(shards)
+    if chunk_rows is not None:
+        cfg.chunk_rows = int(chunk_rows)
+    if pass2_chunksize is not None:
+        cfg.pass2_chunksize = int(pass2_chunksize)
+    if winner_only is not None:
+        cfg.winner_only = bool(winner_only)
 
     cfg.max_hits = None if (max_hits is None or int(max_hits) <= 0) else int(max_hits)
     cfg.hits_delta_mapq = None if (cfg.max_hits is None or hits_delta_mapq is None) else float(hits_delta_mapq)
-    if max_rows_per_read_guard is not None: cfg.max_rows_per_read_guard = int(max_rows_per_read_guard)
+    if max_rows_per_read_guard is not None:
+        cfg.max_rows_per_read_guard = int(max_rows_per_read_guard)
 
-    if beta is not None: cfg.beta = float(beta)
-    if w_as is not None: cfg.w_as = float(w_as)
-    if w_mapq is not None: cfg.w_mapq = float(w_mapq)
-    if w_nm is not None: cfg.w_nm = float(w_nm)
-    if ambient_const is not None: cfg.ambient_const = float(ambient_const)
+    if beta is not None:
+        cfg.beta = float(beta)
+    if w_as is not None:
+        cfg.w_as = float(w_as)
+    if w_mapq is not None:
+        cfg.w_mapq = float(w_mapq)
+    if w_nm is not None:
+        cfg.w_nm = float(w_nm)
+    if ambient_const is not None:
+        cfg.ambient_const = float(ambient_const)
 
-    if min_reads is not None: cfg.min_reads = int(min_reads)
-    if single_mass_min is not None: cfg.single_mass_min = float(single_mass_min)
-    if ratio_top1_top2_min is not None: cfg.ratio_top1_top2_min = float(ratio_top1_top2_min)
+    if min_reads is not None:
+        cfg.min_reads = int(min_reads)
+    if single_mass_min is not None:
+        cfg.single_mass_min = float(single_mass_min)
+    if ratio_top1_top2_min is not None:
+        cfg.ratio_top1_top2_min = float(ratio_top1_top2_min)
 
-    if empty_bic_margin is not None: cfg.empty_bic_margin = float(empty_bic_margin)
-    if empty_top1_max is not None: cfg.empty_top1_max = float(empty_top1_max)
-    if empty_ratio12_max is not None: cfg.empty_ratio12_max = float(empty_ratio12_max)
-    if empty_reads_max is not None: cfg.empty_reads_max = int(empty_reads_max)
-    if empty_seed_bic_min is not None: cfg.empty_seed_bic_min = float(empty_seed_bic_min)
-    if empty_tau_quantile is not None: cfg.empty_tau_quantile = float(empty_tau_quantile)
-    if empty_jsd_max is not None: cfg.empty_jsd_max = float(empty_jsd_max)
-    if jsd_normalize is not None: cfg.jsd_normalize = bool(jsd_normalize)
+    if empty_bic_margin is not None:
+        cfg.empty_bic_margin = float(empty_bic_margin)
+    if empty_top1_max is not None:
+        cfg.empty_top1_max = float(empty_top1_max)
+    if empty_ratio12_max is not None:
+        cfg.empty_ratio12_max = float(empty_ratio12_max)
+    if empty_reads_max is not None:
+        cfg.empty_reads_max = int(empty_reads_max)
+    if empty_seed_bic_min is not None:
+        cfg.empty_seed_bic_min = float(empty_seed_bic_min)
+    if empty_tau_quantile is not None:
+        cfg.empty_tau_quantile = float(empty_tau_quantile)
+    if empty_jsd_max is not None:
+        cfg.empty_jsd_max = float(empty_jsd_max)
+    if jsd_normalize is not None:
+        cfg.jsd_normalize = bool(jsd_normalize)
 
-    if bic_margin is not None: cfg.bic_margin = float(bic_margin)
-    if doublet_minor_min is not None: cfg.doublet_minor_min = float(doublet_minor_min)
-    if near_tie_margin is not None: cfg.near_tie_margin = float(near_tie_margin)
+    if bic_margin is not None:
+        cfg.bic_margin = float(bic_margin)
+    if doublet_minor_min is not None:
+        cfg.doublet_minor_min = float(doublet_minor_min)
+    if near_tie_margin is not None:
+        cfg.near_tie_margin = float(near_tie_margin)
 
-    if eta_iters is not None: cfg.eta_iters = int(eta_iters)
-    if eta_seed_quantile is not None: cfg.eta_seed_quantile = float(eta_seed_quantile)
-    if topk_genomes is not None: cfg.topk_genomes = int(topk_genomes)
+    if eta_iters is not None:
+        cfg.eta_iters = int(eta_iters)
+    if eta_seed_quantile is not None:
+        cfg.eta_seed_quantile = float(eta_seed_quantile)
+    if topk_genomes is not None:
+        cfg.topk_genomes = int(topk_genomes)
 
     files = [Path(f) for f in glob.glob(assign_glob, recursive=True)]
     if not files:
-        raise typer.BadParameter(f"No files matched: {assign_glob}")
+        raise ValueError(f"No files matched: {assign_glob}")
 
     tmp_dir = outdir_eff / f"tmp_{sample_eff}"
     shard_root = tmp_dir / "L_shards_workers"
     shard_root.mkdir(parents=True, exist_ok=True)
 
+    # chunk list discovery must support **
+    chunk_files = glob.glob(cell_chunks_pat, recursive=True)
     bc_to_chunk: Optional[Dict[str, int]] = None
-    chunk_files = glob.glob(cell_chunks_pat)
     if chunk_files:
         bc_to_chunk = _load_barcode_to_chunk_id(cell_chunks_pat, chunk_id_regex)
         typer.echo(
@@ -941,9 +1019,13 @@ def _run_genotyping(
     typer.echo(f"[genotyping] sample={sample_eff} files={len(files)} pass1_workers={pass1_workers_eff} shards={cfg.shards}")
     typer.echo(f"[genotyping] assign_glob={assign_glob}")
     typer.echo(f"[genotyping] cell_chunks_glob={cell_chunks_pat}")
-    typer.echo(f"[genotyping] filter: max_hits={cfg.max_hits} hits_delta_mapq={cfg.hits_delta_mapq} guard={cfg.max_rows_per_read_guard}")
+    typer.echo(
+        f"[genotyping] filter: max_hits={cfg.max_hits} hits_delta_mapq={cfg.hits_delta_mapq} guard={cfg.max_rows_per_read_guard}"
+    )
     typer.echo(f"[genotyping] winner_only={cfg.winner_only} ambient_const={cfg.ambient_const}")
-    typer.echo(f"[genotyping] gates: empty_bic_margin={cfg.empty_bic_margin} bic_margin={cfg.bic_margin} near_tie_margin={cfg.near_tie_margin}")
+    typer.echo(
+        f"[genotyping] gates: empty_bic_margin={cfg.empty_bic_margin} bic_margin={cfg.bic_margin} near_tie_margin={cfg.near_tie_margin}"
+    )
     if cfg.empty_seed_bic_min is not None:
         typer.echo("[genotyping] NOTE: empty_seed_bic_min is currently not used in eta learning in this implementation.")
 
@@ -955,12 +1037,13 @@ def _run_genotyping(
     C_list: List[pd.DataFrame] = []
     N_list: List[pd.DataFrame] = []
 
-    def _job(i: int, f: Path) -> Pass1Outputs:
-        wdir = shard_root / f"w{i:03d}"
-        return _pass1_process_one_file(f, cfg, wdir, bc_to_chunk)
+    # IMPORTANT: do not submit nested functions (not picklable). Use _pass1_worker_job.
+    job_args: List[Tuple[int, str, MergeConfig, str, Optional[Dict[str, int]]]] = [
+        (i, str(f), cfg, str(shard_root), bc_to_chunk) for i, f in enumerate(files)
+    ]
 
     with ProcessPoolExecutor(max_workers=int(pass1_workers_eff)) as ex:
-        futs = [ex.submit(_job, i, f) for i, f in enumerate(files)]
+        futs = [ex.submit(_pass1_worker_job, a) for a in job_args]
         for fut in as_completed(futs):
             out = fut.result()
             if not out.C.empty:
@@ -970,11 +1053,13 @@ def _run_genotyping(
 
     C_all = (
         pd.concat(C_list, ignore_index=True).groupby(["barcode", "genome"], sort=False)["C"].sum().reset_index()
-        if C_list else pd.DataFrame(columns=["barcode", "genome", "C"])
+        if C_list
+        else pd.DataFrame(columns=["barcode", "genome", "C"])
     )
     N_all = (
         pd.concat(N_list, ignore_index=True).groupby("barcode", sort=False)["n_reads"].sum().reset_index()
-        if N_list else pd.DataFrame(columns=["barcode", "n_reads"])
+        if N_list
+        else pd.DataFrame(columns=["barcode", "n_reads"])
     )
 
     if C_all.empty:
@@ -1056,6 +1141,7 @@ def _run_genotyping(
 # --------------------------------------------------------------------------------------
 # Typer wrapper (CLI)
 # --------------------------------------------------------------------------------------
+
 
 @app.command("genotyping")
 def genotyping_cmd(
