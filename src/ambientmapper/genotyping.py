@@ -42,6 +42,9 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterator
+import os
+import shutil
+import subprocess
 
 import numpy as np
 import pandas as pd
@@ -72,6 +75,11 @@ class MergeConfig(BaseModel):
     w_mapq: float = 1.0
     w_nm: float = 1.0
     ambient_const: float = 1e-3  # ambient pseudocount in posterior denominator
+
+    # Pass 1.5 merge control
+    pass15_use_external_sort: bool = True
+    pass15_sort_mem: str = "4G"       # passed to sort -S
+    pass15_tmpdir: Optional[str] = None  # passed to sort -T (defaults to merged_root)
 
     # Calling thresholds
     min_reads: int = 5
@@ -181,7 +189,6 @@ def _infer_cell_chunks_glob(d: Dict[str, Path]) -> str:
 # Helpers: schema and coercion
 # --------------------------------------------------------------------------------------
 
-
 def _coerce_assign_schema(df: pd.DataFrame) -> pd.DataFrame:
     m = {"BC": "barcode", "Read": "read_id", "Genome": "genome"}
     out = df.rename(columns=m)
@@ -212,16 +219,136 @@ def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
     return df.groupby(keys, observed=True, sort=False).agg(agg).reset_index()
 
 
+def _merge_worker_shards_pass15(
+    shard_root: Path,
+    shards: int,
+    *,
+    force: bool = False,
+    sort_mem: str = "4G",
+    tmpdir: Optional[Path] = None,
+) -> Path:
+    """
+    Merge worker shards (w*/shard_XX.tsv.gz) -> merged/shard_XX.tsv.gz, globally sorted.
+
+    Sorting key: barcode (col1), read_id (col2), genome (col3).
+    Assumes every worker shard has a header line (written lazily only if rows exist).
+    Output shard has a single header, followed by globally sorted rows.
+
+    Returns merged_root path.
+    """
+    merged_root = shard_root / "merged"
+    merged_root.mkdir(parents=True, exist_ok=True)
+    marker = merged_root / "_MERGED_SORTED_v1.txt"
+
+    # --- RECOVERY / RESUME LOGIC ---
+    # 1. If worker shards are missing, see if we can salvage existing merged data
+    if not any(shard_root.glob("w*/shard_*.tsv.gz")):
+        if any(p.stat().st_size >= 64 for p in merged_root.glob("shard_*.tsv.gz")):
+            # Merged shards exist but worker folders are gone: 
+            # Recreate marker if missing and return existing directory.
+            if not marker.exists():
+                marker.write_text("v1\n")
+            return merged_root
+        raise RuntimeError("Pass 1.5: No worker shards and no valid merged shards found.")
+      
+    if marker.exists() and not force:
+        if any(p.stat().st_size >= 64 for p in merged_root.glob("shard_*.tsv.gz")):
+            return merged_root
+    
+    # Tool availability checks
+    sort_bin = shutil.which("sort")
+    gzip_bin = shutil.which("gzip")
+    zcat_bin = shutil.which("zcat") or shutil.which("gzcat")
+    if sort_bin is None or gzip_bin is None or zcat_bin is None:
+        raise RuntimeError("External tools (sort, gzip, zcat/gzcat) not found in PATH.")
+
+    tmpdir_eff = Path(tmpdir) if tmpdir is not None else merged_root
+    tmpdir_eff.mkdir(parents=True, exist_ok=True)
+
+    bash = shutil.which("bash") or "/bin/bash"
+    
+    # Merge each shard id independently
+    for sid in range(int(shards)):
+        inputs = sorted(shard_root.glob(f"w*/shard_{sid:02d}.tsv.gz"))
+        if not inputs:
+            continue
+
+        out_path = merged_root / f"shard_{sid:02d}.tsv.gz"
+        if out_path.exists() and not force:
+            continue
+        
+        # Filter out trivially empty gzip containers (your ~38-byte case)
+        inputs_eff = [p for p in inputs if p.exists() and p.stat().st_size >= 64]
+        if not inputs_eff:
+            # do not create an output shard if no data
+            if out_path.exists():
+                out_path.unlink()
+            continue
+
+        in_list = " ".join([shlex_quote(str(p)) for p in inputs_eff])
+
+        # Read header from first non-empty input, then stream rows from all files minus headers.
+        cmd = f"""
+set -euo pipefail
+first={shlex_quote(str(inputs_eff[0]))}
+{zcat_bin} "$first" | head -n 1
+for f in {in_list}; do
+  {zcat_bin} "$f" | tail -n +2
+done
+""".strip()
+
+        sort_cmd = [
+            sort_bin,
+            "export LC_ALL=C",
+            "-t", "\t",
+            "-k1,1",
+            "-k2,2",
+            "-k3,3",
+            "-S", str(sort_mem),
+            "-T", str(tmpdir_eff),
+        ]
+
+        # Execute pipeline: bash -c cmd | sort ... | gzip -c > out_path
+        with open(out_path, "wb") as out_fh:
+            p1 = subprocess.Popen([bash, "-lc", cmd], stdout=subprocess.PIPE)
+            p2 = subprocess.Popen(sort_cmd, stdin=p1.stdout, stdout=subprocess.PIPE)
+            p3 = subprocess.Popen([gzip_bin, "-c"], stdin=p2.stdout, stdout=out_fh)
+
+            assert p1.stdout is not None
+            assert p2.stdout is not None
+
+            p1.stdout.close()
+            p2.stdout.close()
+
+            rc3 = p3.wait()
+            rc2 = p2.wait()
+            rc1 = p1.wait()
+
+        if rc1 != 0 or rc2 != 0 or rc3 != 0:
+            # cleanup partial output
+            if out_path.exists():
+                out_path.unlink()
+            raise RuntimeError(
+                f"Pass 1.5 failed for shard_{sid:02d}: rc1={rc1} rc2={rc2} rc3={rc3}"
+            )
+
+    marker.write_text("v1\n")
+    return merged_root
+
+
+def shlex_quote(s: str) -> str:
+    import shlex
+    return shlex.quote(s)
+
 # --------------------------------------------------------------------------------------
 # Promiscuous ambiguous filter (NumPy)
 # --------------------------------------------------------------------------------------
-
 
 def _filter_promiscuous_ambiguous_reads(df: pd.DataFrame, cfg: MergeConfig) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     if cfg.max_hits is None or cfg.hits_delta_mapq is None:
         return df, {"enabled": False}
 
-    assigned = df["assigned_class"].to_numpy()
+    ssigned = df["assigned_class"].fillna("").astype(str).to_numpy()
     is_amb = assigned == "ambiguous"
     if not is_amb.any():
         return df, {"enabled": True, "dropped_groups": 0, "dropped_rows": 0}
@@ -298,7 +425,6 @@ def _filter_promiscuous_ambiguous_reads(df: pd.DataFrame, cfg: MergeConfig) -> T
 # Core: posterior computation
 # --------------------------------------------------------------------------------------
 
-
 def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame:
     df = df[["barcode", "read_id", "genome", "AS", "MAPQ", "NM"]].copy()
     df = df.dropna(subset=["barcode", "read_id", "genome"])
@@ -337,52 +463,8 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
 # Likelihood / BIC / JSD
 # --------------------------------------------------------------------------------------
 
-
-def _loglik_empty(L_block: pd.DataFrame, eta: pd.Series) -> float:
-    eta_row = eta.reindex(L_block["genome"]).fillna(0.0).to_numpy(dtype=float)
-    wL = eta_row * L_block["L"].to_numpy(dtype=float)
-
-    s = (
-        pd.DataFrame({"read_id": L_block["read_id"].values, "wL": wL})
-        .groupby("read_id", sort=False)["wL"]
-        .sum()
-        .to_numpy()
-    )
-    return float(np.log(np.clip(s, 1e-12, None)).sum())
-
-
-def _loglik_for_params(
-    L_block: pd.DataFrame,
-    eta: pd.Series,
-    model: str,
-    g1: str,
-    g2: Optional[str],
-    alpha: float,
-    rho: float = 0.5,
-) -> float:
-    gn = L_block["genome"].to_numpy()
-    eta_row = eta.reindex(L_block["genome"]).fillna(0.0).to_numpy(dtype=float)
-
-    if model == "single":
-        w = np.where(gn == g1, (1.0 - alpha) + alpha * float(eta.get(g1, 0.0)), alpha * eta_row)
-    else:
-        assert g2 is not None
-        mix = np.where(gn == g1, rho, np.where(gn == g2, 1.0 - rho, 0.0))
-        w = (1.0 - alpha) * mix + alpha * eta_row
-
-    wL = w * L_block["L"].to_numpy(dtype=float)
-    s = (
-        pd.DataFrame({"read_id": L_block["read_id"].values, "wL": wL})
-        .groupby("read_id", sort=False)["wL"]
-        .sum()
-        .to_numpy()
-    )
-    return float(np.log(np.clip(s, 1e-12, None)).sum())
-
-
 def _bic(loglik: float, n_params: int, n_reads: int) -> float:
     return -2.0 * loglik + n_params * math.log(max(n_reads, 1))
-
 
 def _barcode_jsd_from_mass(mass: pd.Series, eta: pd.Series, normalize: bool = True) -> float:
     idx = sorted(set(mass.index) | set(eta.index))
@@ -400,10 +482,127 @@ def _barcode_jsd_from_mass(mass: pd.Series, eta: pd.Series, normalize: bool = Tr
     return js / math.log(2.0) if normalize else js
 
 
+def _precompute_per_read_arrays(
+    L_block: pd.DataFrame,
+    eta: pd.Series,
+    candidate_genomes: Sequence[str],
+) -> Tuple[int, np.ndarray, Dict[str, np.ndarray]]:
+    """
+    Precompute exact per-read aggregates used by the current likelihood functions.
+
+    Returns:
+      n_reads: number of unique read_id in this barcode
+      E: shape (n_reads,) where E[r] = sum_g eta[g] * L_{r,g}
+      Lg: dict genome->array shape (n_reads,) where Lg[g][r] = sum_{rows with genome==g, read_id==r} L
+    """
+    # Factorize read_id once (stable order within this L_block)
+    read_codes, _ = pd.factorize(L_block["read_id"], sort=False)
+    n_reads = int(read_codes.max()) + 1 if len(read_codes) else 0
+    if n_reads == 0:
+        return 0, np.zeros(0, dtype=np.float64), {g: np.zeros(0, dtype=np.float64) for g in candidate_genomes}
+
+    # Base arrays
+    L = L_block["L"].to_numpy(dtype=np.float64, copy=False)
+    gn = L_block["genome"].astype(str).to_numpy()
+
+    # E_r = sum eta_g * L_{r,g} (exactly what _loglik_empty_from_E computes)
+    eta_row = eta.reindex(pd.Index(gn)).fillna(0.0).to_numpy(dtype=np.float64, copy=False)
+    E = np.bincount(read_codes, weights=L * eta_row, minlength=n_reads).astype(np.float64, copy=False)
+
+    # Lg_r for the candidate genomes only (top-k)
+    Lg: Dict[str, np.ndarray] = {}
+    for g in candidate_genomes:
+        m = (gn == g)
+        if not np.any(m):
+            Lg[g] = np.zeros(n_reads, dtype=np.float64)
+        else:
+            Lg[g] = np.bincount(read_codes[m], weights=L[m], minlength=n_reads).astype(np.float64, copy=False)
+
+    return n_reads, E, Lg
+
+
+def _loglik_empty_from_E(E: np.ndarray) -> float:
+    # loglik_empty = sum_r log(E_r)
+    return float(np.log(np.clip(E, 1e-12, None)).sum())
+
+
+def _best_single_from_arrays(
+    n_reads: int,
+    E: np.ndarray,
+    Lg: Dict[str, np.ndarray],
+    cfg: MergeConfig,
+    candidate_genomes: Sequence[str],
+) -> Optional[Dict[str, Any]]:
+    if n_reads <= 0 or not candidate_genomes:
+        return None
+
+    alphas = np.arange(0.0, float(cfg.max_alpha) + 1e-9, float(cfg.alpha_grid), dtype=np.float64)
+    logn = math.log(max(n_reads, 1))
+
+    best: Optional[Dict[str, Any]] = None
+    for g1 in candidate_genomes:
+        L1 = Lg[g1]
+        # Vectorized over alpha: s[a, r] = (1-a)*L1[r] + a*E[r]
+        # This matches the current single model exactly.
+        s = (1.0 - alphas)[:, None] * L1[None, :] + alphas[:, None] * E[None, :]
+        ll = np.log(np.clip(s, 1e-12, None)).sum(axis=1)  # shape (n_alpha,)
+        bic = (-2.0 * ll) + (1.0 * logn)                  # 1 parameter for single
+
+        k = int(np.argmin(bic))
+        bic_k = float(bic[k])
+        if best is None or bic_k < best["bic"]:
+            best = {"model": "single", "g1": g1, "alpha": float(alphas[k]), "bic": bic_k}
+
+    return best
+
+
+def _best_doublet_from_arrays(
+    n_reads: int,
+    E: np.ndarray,
+    Lg: Dict[str, np.ndarray],
+    cfg: MergeConfig,
+    candidate_genomes: Sequence[str],
+) -> Optional[Dict[str, Any]]:
+    if n_reads <= 0 or len(candidate_genomes) < 2:
+        return None
+
+    alphas = np.arange(0.0, float(cfg.max_alpha) + 1e-9, float(cfg.alpha_grid), dtype=np.float64)
+    rhos = np.arange(0.1, 0.9 + 1e-9, float(cfg.rho_grid), dtype=np.float64)
+    logn = math.log(max(n_reads, 1))
+
+    best: Optional[Dict[str, Any]] = None
+    for i in range(len(candidate_genomes)):
+        for j in range(i + 1, len(candidate_genomes)):
+            g1, g2 = candidate_genomes[i], candidate_genomes[j]
+            L1 = Lg[g1]
+            L2 = Lg[g2]
+
+            # base_mix[rho, r] = rho*L1[r] + (1-rho)*L2[r]
+            base_mix = rhos[:, None] * L1[None, :] + (1.0 - rhos)[:, None] * L2[None, :]
+
+            # Loop over alpha (small, e.g. 26), vectorize over rho (e.g. 17) and reads
+            for a in alphas:
+                s = (1.0 - a) * base_mix + a * E[None, :]
+                ll_rho = np.log(np.clip(s, 1e-12, None)).sum(axis=1)  # per-rho loglik
+                bic_rho = (-2.0 * ll_rho) + (2.0 * logn)              # 2 params for doublet
+
+                k = int(np.argmin(bic_rho))
+                bic_k = float(bic_rho[k])
+                if best is None or bic_k < best["bic"]:
+                    best = {
+                        "model": "doublet",
+                        "g1": g1,
+                        "g2": g2,
+                        "alpha": float(a),
+                        "rho": float(rhos[k]),
+                        "bic": bic_k,
+                    }
+
+    return best
+
 # --------------------------------------------------------------------------------------
 # Model selection (gate design preserved)
 # --------------------------------------------------------------------------------------
-
 
 def _select_model_for_barcode(
     L_block: pd.DataFrame,
@@ -411,7 +610,9 @@ def _select_model_for_barcode(
     cfg: MergeConfig,
     candidate_genomes: Sequence[str],
 ) -> Dict[str, Any]:
-    read_count = int(L_block["read_id"].nunique())
+    # Precompute per-read arrays (exactly preserves loglik math)
+    n_reads, E, Lg = _precompute_per_read_arrays(L_block, eta, candidate_genomes)
+    read_count = int(n_reads)
 
     mass = L_block.groupby("genome", sort=False)["L"].sum().sort_values(ascending=False)
     tot = float(mass.sum())
@@ -434,8 +635,8 @@ def _select_model_for_barcode(
         "jsd_to_eta": jsd,
         "doublet_minor_frac": minor_frac,
     }
-
-    bic_empty = _bic(_loglik_empty(L_block, eta), 0, read_count)
+    # Empty BIC from precomputed E    
+    bic_empty = _bic(_loglik_empty_from_E(E), 0, read_count)
     out["bic_empty"] = float(bic_empty)
 
     if read_count < int(cfg.min_reads) or not candidate_genomes:
@@ -453,44 +654,16 @@ def _select_model_for_barcode(
             near_tie_sd=None,
         )
         return out
-
-    alphas = np.arange(0.0, float(cfg.max_alpha) + 1e-9, float(cfg.alpha_grid))
-
-    best_single: Optional[Dict[str, Any]] = None
-    for g1 in candidate_genomes:
-        for a in alphas:
-            bic = _bic(_loglik_for_params(L_block, eta, "single", g1, None, float(a)), 1, read_count)
-            if best_single is None or bic < best_single["bic"]:
-                best_single = {"model": "single", "g1": g1, "alpha": float(a), "bic": float(bic)}
-
-    best_doublet: Optional[Dict[str, Any]] = None
-    if len(candidate_genomes) >= 2:
-        rhos = np.arange(0.1, 0.9 + 1e-9, float(cfg.rho_grid))
-        for i in range(len(candidate_genomes)):
-            for j in range(i + 1, len(candidate_genomes)):
-                g1, g2 = candidate_genomes[i], candidate_genomes[j]
-                for a in alphas:
-                    for r in rhos:
-                        bic = _bic(
-                            _loglik_for_params(L_block, eta, "doublet", g1, g2, float(a), float(r)),
-                            2,
-                            read_count,
-                        )
-                        if best_doublet is None or bic < best_doublet["bic"]:
-                            best_doublet = {
-                                "model": "doublet",
-                                "g1": g1,
-                                "g2": g2,
-                                "alpha": float(a),
-                                "rho": float(r),
-                                "bic": float(bic),
-                            }
-
+      
+    # Best single/doublet using vectorized NumPy grids (same grid, same BIC)
+    best_single = _best_single_from_arrays(read_count, E, Lg, cfg, candidate_genomes)
+    best_doublet = _best_doublet_from_arrays(read_count, E, Lg, cfg, candidate_genomes)
+      
     bic_s = float(best_single["bic"]) if best_single else float("inf")
     bic_d = float(best_doublet["bic"]) if best_doublet else float("inf")
     out["bic_single"] = bic_s if np.isfinite(bic_s) else None
     out["bic_doublet"] = bic_d if np.isfinite(bic_d) else None
-
+  
     # --------------------------
     # Decision 1: Empty/Noise
     # --------------------------
@@ -671,7 +844,6 @@ def _iter_shard_chunks(shard_path: Path, cfg: MergeConfig) -> Iterator[pd.DataFr
 # Pass 1: stream assign files -> (C_all, N_all) + shard spill
 # --------------------------------------------------------------------------------------
 
-
 @dataclass
 class Pass1Outputs:
     C: pd.DataFrame
@@ -687,6 +859,7 @@ def _pass1_worker_job(args: Tuple[int, str, MergeConfig, str, Optional[Dict[str,
     fp = Path(fp_str)
     shard_root = Path(shard_root_str)
     wdir = shard_root / f"w{i:03d}"
+    cfg = MergeConfig(**cfg_dict)
     return _pass1_process_one_file(fp, cfg, wdir, bc_to_chunk)
 
 
@@ -739,7 +912,11 @@ def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path, bc_to_c
             if not header_written[i]:
                 h.write("barcode\tread_id\tgenome\tL\tL_amb\n")
                 header_written[i] = True
-            sub.drop(columns="_sid").to_csv(h, sep="\t", header=False, index=False)
+            #sub.drop(columns="_sid").to_csv(h, sep="\t", header=False, index=False)
+            sub2 = sub.drop(columns="_sid")
+            sub2 = sub2.sort_values(["barcode", "read_id", "genome"], kind="mergesort")
+            sub2.to_csv(h, sep="\t", header=False, index=False)
+
 
     for h in handles.values():
         h.close()
@@ -750,9 +927,92 @@ def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path, bc_to_c
 
 
 # --------------------------------------------------------------------------------------
-# Ambient learning (eta)
+# Pass 3 parallelism support (globals per worker process)
 # --------------------------------------------------------------------------------------
 
+_PASS3_ETA: Optional[pd.Series] = None
+_PASS3_TOPK: Optional[Dict[str, List[str]]] = None
+_PASS3_CFG: Optional[MergeConfig] = None
+
+def _write_topk_tsv(topk: Dict[str, List[str]], path: Path) -> None:
+    """
+    Write topk mapping once so worker processes can load it from disk
+    without pickling a huge dict to every process.
+    Format: barcode \t genome1 \t genome2 \t ... (variable columns)
+    """
+    with gzip.open(path, "wt") if str(path).endswith(".gz") else open(path, "wt") as oh:
+        for bc, gs in topk.items():
+            oh.write(str(bc))
+            for g in gs:
+                oh.write("\t")
+                oh.write(str(g))
+            oh.write("\n")
+
+
+def _load_topk_tsv(path: Path) -> Dict[str, List[str]]:
+    topk: Dict[str, List[str]] = {}
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            bc = parts[0]
+            gs = [p for p in parts[1:] if p]
+            topk[bc] = gs
+    return topk
+
+
+def _pass3_init_worker(eta_path: str, topk_path: str, cfg_dict: Dict[str, Any]) -> None:
+    """
+    Initializer run once per worker process.
+    Loads eta + topk into process globals to avoid reloading for every shard.
+    """
+    global _PASS3_ETA, _PASS3_TOPK, _PASS3_CFG
+
+    # eta
+    eta_df = pd.read_csv(eta_path, sep="\t", compression="gzip")
+    # eta saved by: eta.to_frame("eta").to_csv(...)
+    # so first column is index-like; handle robustly
+    idx_col = eta_df.columns[0]
+    _PASS3_ETA = eta_df.set_index(idx_col)["eta"].astype(float)
+    _PASS3_ETA.index = _PASS3_ETA.index.astype(str)
+    _PASS3_ETA = _PASS3_ETA / (_PASS3_ETA.sum() + 1e-12)
+
+    # topk
+    _PASS3_TOPK = _load_topk_tsv(Path(topk_path))
+
+    # cfg
+    _PASS3_CFG = MergeConfig(**cfg_dict)
+
+
+def _pass3_process_one_shard(shard_path_str: str, out_part_path_str: str) -> Tuple[str, int]:
+    """
+    Worker job: process one shard file and write a part file (no header).
+    Returns (shard_path, called_count).
+    """
+    global _PASS3_ETA, _PASS3_TOPK, _PASS3_CFG
+    assert _PASS3_ETA is not None and _PASS3_TOPK is not None and _PASS3_CFG is not None
+
+    shard_path = Path(shard_path_str)
+    out_part = Path(out_part_path_str)
+
+    called = 0
+    with gzip.open(out_part, "wt") as oh:
+        called += _call_from_shard_file(
+            shard_path=shard_path,
+            eta=_PASS3_ETA,
+            topk=_PASS3_TOPK,
+            cfg=_PASS3_CFG,
+            out_handle=oh,
+        )
+    return (shard_path.name, int(called))
+
+
+# --------------------------------------------------------------------------------------
+# Ambient learning (eta)
+# --------------------------------------------------------------------------------------
 
 def _compute_eta_from_shards(shard_root: Path, target_bcs: Sequence[str], all_genomes: Sequence[str], cfg: MergeConfig) -> pd.Series:
     target_set = set(map(str, target_bcs))
@@ -762,7 +1022,8 @@ def _compute_eta_from_shards(shard_root: Path, target_bcs: Sequence[str], all_ge
         eta = pd.Series({g: 1.0 for g in all_genomes}, dtype=float)
         return eta / eta.sum()
 
-    for shard in shard_root.rglob("shard_*.tsv.gz"):
+    #for shard in shard_root.rglob("shard_*.tsv.gz"):
+    for shard in (shard_root / "merged").glob("shard_*.tsv.gz"):
         for chunk in _iter_shard_chunks(shard, cfg):
             sub = chunk[chunk["barcode"].isin(target_set)]
             if sub.empty:
@@ -866,7 +1127,6 @@ def _learn_eta(
 # Calling: per-shard file (call each barcode once)
 # --------------------------------------------------------------------------------------
 
-
 def _call_from_shard_file(
     shard_path: Path,
     eta: pd.Series,
@@ -874,22 +1134,29 @@ def _call_from_shard_file(
     cfg: MergeConfig,
     out_handle,
 ) -> int:
-    buckets: Dict[str, List[pd.DataFrame]] = {}
+    """
+    Stream calls from a shard file without materializing all barcodes in memory.
 
-    for chunk in _iter_shard_chunks(shard_path, cfg):
-        for bc, sub in chunk.groupby("barcode", sort=False):
-            buckets.setdefault(str(bc), []).append(sub[["read_id", "genome", "L"]].copy())
-
+    Requires shard rows to be grouped by barcode. This is satisfied if Pass 1 writes
+    each shard with rows sorted by ["barcode","read_id","genome"].
+    """
     called = 0
-    for bc_s, parts in buckets.items():
+
+    cur_bc: Optional[str] = None
+    parts: List[pd.DataFrame] = []
+
+    def _flush() -> None:
+        nonlocal called, cur_bc, parts
+        if cur_bc is None or not parts:
+            return
         L_block = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
-        cand = topk.get(bc_s, [])
+        cand = topk.get(cur_bc, [])
         res = _select_model_for_barcode(L_block, eta, cfg, cand)
 
         out_handle.write(
             "\t".join(
                 [
-                    bc_s,
+                    cur_bc,
                     str(res.get("call", "")),
                     str(res.get("model", "")),
                     str(res.get("genome_1", "")),
@@ -914,8 +1181,43 @@ def _call_from_shard_file(
             + "\n"
         )
         called += 1
+        parts = []
 
+    for chunk in _iter_shard_chunks(shard_path, cfg):
+        # keep only needed columns and ensure order is preserved
+        chunk2 = chunk[["barcode", "read_id", "genome", "L", "L_amb"]]
+        
+        # --- OPTIMIZED MONOTONIC CHECK ---
+        b = chunk2["barcode"]
+        # Only perform the expensive check if there's actually a transition to check
+        if b.nunique() > 1:
+            if not b.is_monotonic_increasing:
+                raise RuntimeError(
+                   f"{shard_path.name} is not sorted by barcode; cannot stream safely. "
+                    "This usually happens if you pointed Pass 3 to worker shards (w*/) "
+                    "instead of merged shards. Delete shards and rerun Pass 1.5."
+                    )
+        # ---------------------------------
+        # chunk is expected sorted by barcode; groupby preserves order with sort=False
+        for bc, sub in chunk2.groupby("barcode", sort=False):
+            bc_s = str(bc)
+            sub2 = sub[["read_id", "genome", "L"]].copy()
+            
+            if cur_bc is None:
+                cur_bc = bc_s
+                parts = [sub2]
+                continue
+
+            if bc_s == cur_bc:
+                parts.append(sub2)
+            else:
+                _flush()
+                cur_bc = bc_s
+                parts = [sub2]
+
+    _flush()
     return called
+
 
 
 # --------------------------------------------------------------------------------------
@@ -937,6 +1239,7 @@ def _run_genotyping(
     ratio_top1_top2_min: Optional[float] = None,
     threads: Optional[int] = None,
     pass1_workers: Optional[int] = None,
+    pass3_workers: Optional[int] = None,
     shards: Optional[int] = None,
     chunk_rows: Optional[int] = None,
     pass2_chunksize: Optional[int] = None,
@@ -983,7 +1286,10 @@ def _run_genotyping(
     # worker policy: pass1 defaults to threads if not provided
     threads_eff = int(threads) if threads is not None else 1
     pass1_workers_eff = int(pass1_workers) if pass1_workers is not None else int(threads_eff)
-
+    
+    # worker policy: pass3 defaults to threads if not provided
+    pass3_workers_eff = int(pass3_workers) if pass3_workers is not None else int(threads_eff)
+  
     cfg = MergeConfig(sample=str(sample_eff), pass1_workers=int(pass1_workers_eff))
 
     if shards is not None:
@@ -1086,17 +1392,34 @@ def _run_genotyping(
     # -----------------------
     # Pass 1
     # -----------------------
-    if resume and C_path.exists() and N_path.exists() and any(shard_root.rglob("shard_*.tsv.gz")):
-        typer.echo("[1/4] Pass 1: resume (found C/N + shard spill)")
-        C_all = pd.read_csv(C_path, sep="\t", compression="gzip", dtype={"barcode": "string", "genome": "string", "C": "float64"})
-        N_all = pd.read_csv(N_path, sep="\t", compression="gzip", dtype={"barcode": "string", "n_reads": "int64"})
+    marker = shard_root / "_SHARD_FORMAT_v2_sorted_by_barcode.txt"
+    marker_ok = False
+    if marker.exists():
+        try:
+            marker_ok = marker.read_text().strip() == "v2"
+        except Exception:
+            marker_ok = False
+
+    has_worker_shards = any(shard_root.glob("w*/shard_*.tsv.gz"))
+    has_merged_shards = any((shard_root / "merged").glob("shard_*.tsv.gz"))
+    if resume and C_path.exists() and N_path.exists() and marker_ok and (has_worker_shards or has_merged_shards):    
+        typer.echo("[1/4] Pass 1: resume (found C/N + shard spill + marker v2)")
+        C_all = pd.read_csv(C_path, 
+                            sep="\t", 
+                            compression="gzip", 
+                            dtype={"barcode": "string", "genome": "string", "C": "float64"})
+        N_all = pd.read_csv(N_path,
+                            sep="\t",
+                            compression="gzip", dtype={"barcode": "string", "n_reads": "int64"})
+              
     else:
         typer.echo("[1/4] Pass 1: streaming assign inputs → per-read posteriors + spill shards")
 
         C_list: List[pd.DataFrame] = []
         N_list: List[pd.DataFrame] = []
 
-        args = [(i, str(f), cfg, str(shard_root), bc_to_chunk) for i, f in enumerate(files)]
+        cfg_dict = cfg.model_dump()
+        args = [(i, str(f), cfg_dict, str(shard_root), bc_to_chunk) for i, f in enumerate(files)]
         with ProcessPoolExecutor(max_workers=int(pass1_workers_eff)) as ex:
             futs = [ex.submit(_pass1_worker_job, a) for a in args]
             for fut in as_completed(futs):
@@ -1123,6 +1446,9 @@ def _run_genotyping(
         C_all.to_csv(C_path, sep="\t", index=False, compression="gzip")
         N_all.to_csv(N_path, sep="\t", index=False, compression="gzip")
         typer.echo(f"[1/4] wrote: {C_path.name}, {N_path.name}")
+        
+        # Only write marker when shards were (re)generated by this code path
+        marker.write_text("v2\n")
 
     all_genomes = C_all["genome"].astype(str).unique().tolist()
 
@@ -1130,15 +1456,48 @@ def _run_genotyping(
     for bc, sub in C_all.groupby("barcode", sort=False):
         s = sub.sort_values("C", ascending=False)["genome"].astype(str).head(int(cfg.topk_genomes)).tolist()
         topk[str(bc)] = s
+    
+    # -----------------------
+    # Pass 1.5: merge worker shards -> merged shards (globally sorted)
+    # -----------------------
+    typer.echo("[1.5/4] Pass 1.5: merging worker shards -> merged/ (globally sorted)")
+    
+    merged_path = shard_root / "merged"
+    force_merge = not resume
+
+    # If the user explicitly chose --no-resume, wipe the existing merged shards
+    # to ensure a clean start.
+    if force_merge and merged_path.exists():
+        typer.echo(f"  - force=True: cleaning existing merged directory: {merged_path}")
+        shutil.rmtree(merged_path)
+
+    # Define the temp directory for the external sort
+    pass15_tmp = Path(cfg.pass15_tmpdir) if cfg.pass15_tmpdir else (tmp_dir / "pass15_tmp")
+    pass15_tmp.mkdir(parents=True, exist_ok=True)
+  
+    merged_root = _merge_worker_shards_pass15(
+        shard_root=shard_root,
+        shards=cfg.shards,
+        force=force_merge,
+        sort_mem=str(cfg.pass15_sort_mem),
+        tmpdir=pass15_tmp,  # keeps sort temp out of merged/
+    )
+    
+    shards_list = sorted(merged_root.glob("shard_*.tsv.gz"))
+    if not shards_list:
+        raise RuntimeError(f"Pass 1.5 produced no merged shards under {merged_root}")
+
 
     # -----------------------
     # Pass 2
     # -----------------------
     if resume and eta_out.exists():
         typer.echo("[2/4] Pass 2: resume (found eta)")
-        eta = pd.read_csv(eta_out, sep="\t", compression="gzip").set_index("Unnamed: 0")["eta"]
+        eta_df = pd.read_csv(eta_out, sep="\t", compression="gzip")
+        idx_col = eta_df.columns[0]
+        eta = eta_df.set_index(idx_col)["eta"]
         eta.index = eta.index.astype(str)
-        eta = eta.astype(float)
+        eta = eta.astype(float)        
         eta = eta / (eta.sum() + 1e-12)
     else:
         typer.echo("[2/4] Pass 2: ambient learning (eta) from shard spill")
@@ -1147,46 +1506,102 @@ def _run_genotyping(
         typer.echo(f"[2/4] eta saved: {eta_out.name}  seed_sizes={eta_meta.get('seed_sizes')}")
 
     # -----------------------
-    # Pass 3
+    # Pass 3 parallelism support (globals per worker process)
     # -----------------------
+    
     if resume and calls_path.exists():
         typer.echo("[3/4] Pass 3: resume (found calls)")
     else:
-        typer.echo("[3/4] Pass 3: model selection / calls from shards")
-        with gzip.open(calls_path, "wt") as oh:
-            oh.write(
-                "\t".join(
-                    [
-                        "barcode",
-                        "call",
-                        "model",
-                        "genome_1",
-                        "genome_2",
-                        "alpha",
-                        "rho",
-                        "n_reads",
-                        "n_effective",
-                        "p_top1",
-                        "p_top2",
-                        "ratio12",
-                        "jsd_to_eta",
-                        "bic_empty",
-                        "bic_best",
-                        "bic_single",
-                        "bic_doublet",
-                        "bic_gap_sd",
-                        "near_tie_sd",
-                        "doublet_minor_frac",
-                    ]
-                )
-                + "\n"
-            )
+        typer.echo("[3/4] Pass 3: model selection / calls from shards (parallel)")        
+        merged_root = shard_root / "merged"        
+        shards_list = sorted((shard_root / "merged").glob("shard_*.tsv.gz"))
 
-            called_total = 0
-            for shard in sorted(shard_root.rglob("shard_*.tsv.gz")):
-                called_total += _call_from_shard_file(shard, eta, topk, cfg, oh)
+        if not shards_list:
+            raise RuntimeError(f"Pass 3: no shard_*.tsv.gz found under {shard_root}")
+        
+        pass3_tmp = tmp_dir / "pass3_parts"
+        pass3_tmp.mkdir(parents=True, exist_ok=True)
+        
+        # Write topk once so workers can load from disk
+        topk_path = pass3_tmp / f"{sample_eff}_topk.tsv.gz"
+        if not topk_path.exists():
+            _write_topk_tsv(topk, topk_path)
 
+        # eta already saved at eta_out; ensure it exists
+        if not eta_out.exists():
+            raise RuntimeError(f"Pass 3: expected eta file missing: {eta_out}")
+
+        # Make cfg pickling cheap/robust
+        cfg_dict = cfg.model_dump()
+
+        # Use threads_eff cores unless pass3_workers overrides; Pass 3 wants full CPU:
+        pass3_workers = max(1, int(pass3_workers_eff))
+
+        # Launch shard workers
+        part_paths: Dict[str, Path] = {}
+        jobs = []
+        for shard in shards_list:
+            part = pass3_tmp / (shard.name.replace(".tsv.gz", "") + ".calls.tsv.gz")
+            part_paths[shard.name] = part
+            jobs.append((str(shard), str(part)))
+
+        called_by_shard: Dict[str, int] = {}
+        with ProcessPoolExecutor(
+            max_workers=pass3_workers,
+            initializer=_pass3_init_worker,
+            initargs=(str(eta_out), str(topk_path), cfg_dict),
+        ) as ex:
+            futs = [ex.submit(_pass3_process_one_shard, shard_str, part_str) for shard_str, part_str in jobs]
+            for fut in as_completed(futs):
+                shard_name, n_called = fut.result()
+                called_by_shard[shard_name] = int(n_called)    
+
+        # Deterministic concatenation in shard-sorted order into calls_path
+        header = "\t".join(
+            [
+                "barcode",
+                "call",
+                "model",
+                "genome_1",
+                "genome_2",
+                "alpha",
+                "rho",
+                "n_reads",
+                "n_effective",
+                "p_top1",
+                "p_top2",
+                "ratio12",
+                "jsd_to_eta",
+                "bic_empty",
+                "bic_best",
+                "bic_single",
+                "bic_doublet",
+                "bic_gap_sd",
+                "near_tie_sd",
+                "doublet_minor_frac",
+            ]
+        )
+        
+        called_total = 0
+        with gzip.open(calls_path, "wt") as out_final:
+            out_final.write(header + "\n")
+            for shard in shards_list:
+                part = part_paths[shard.name]
+                if not part.exists():
+                    raise RuntimeError(f"Pass 3: missing part output for {shard.name}: {part}")
+                with gzip.open(part, "rt") as pf:
+                    # parts have no header; just copy lines
+                    for line in pf:
+                        out_final.write(line)
+                called_total += int(called_by_shard.get(shard.name, 0))
+
+        calls_df = pd.read_csv(calls_path, sep="\t", compression="gzip", usecols=["barcode"], dtype={"barcode":"string"})
+        if calls_df["barcode"].duplicated().any():
+            raise RuntimeError("Calls contain duplicate barcodes (unexpected after merged shards). Check Pass 1.5 merge and shard routing.")
+      
         typer.echo(f"[3/4] calls written: {calls_path.name} (emitted rows={called_total})")
+        typer.echo(f"[3/4] pass3_workers={pass3_workers} shards_processed={len(shards_list)}")
+        
 
     # -----------------------
     # Pass 4
@@ -1220,6 +1635,7 @@ def genotyping_cmd(
     ratio_top1_top2_min: Optional[float] = typer.Option(None, "--ratio-top1-top2-min"),
     threads: Optional[int] = typer.Option(None, "--threads"),
     pass1_workers: Optional[int] = typer.Option(None, "--pass1-workers"),
+    pass3_workers: Optional[int] = typer.Option(None, "--pass3-workers"),
     shards: Optional[int] = typer.Option(None, "--shards"),
     chunk_rows: Optional[int] = typer.Option(None, "--chunk-rows"),
     pass2_chunksize: Optional[int] = typer.Option(None, "--pass2-chunksize"),
@@ -1265,6 +1681,7 @@ def genotyping_cmd(
         ratio_top1_top2_min=ratio_top1_top2_min,
         threads=threads,
         pass1_workers=pass1_workers,
+        pass3_workers=pass3_workers,
         shards=shards,
         chunk_rows=chunk_rows,
         pass2_chunksize=pass2_chunksize,
