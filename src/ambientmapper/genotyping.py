@@ -218,6 +218,9 @@ def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
     agg = {"AS": "max", "MAPQ": "max", "NM": "min", "assigned_class": "first"}
     return df.groupby(keys, observed=True, sort=False).agg(agg).reset_index()
 
+def shlex_quote(s: str) -> str:
+    import shlex
+    return shlex.quote(s)
 
 def _merge_worker_shards_pass15(
     shard_root: Path,
@@ -241,32 +244,43 @@ def _merge_worker_shards_pass15(
     marker = merged_root / "_MERGED_SORTED_v1.txt"
 
     # --- RECOVERY / RESUME LOGIC ---
-    # 1. If worker shards are missing, see if we can salvage existing merged data
     if not any(shard_root.glob("w*/shard_*.tsv.gz")):
         if any(p.stat().st_size >= 64 for p in merged_root.glob("shard_*.tsv.gz")):
-            # Merged shards exist but worker folders are gone: 
-            # Recreate marker if missing and return existing directory.
             if not marker.exists():
                 marker.write_text("v1\n")
             return merged_root
         raise RuntimeError("Pass 1.5: No worker shards and no valid merged shards found.")
-      
+
     if marker.exists() and not force:
         if any(p.stat().st_size >= 64 for p in merged_root.glob("shard_*.tsv.gz")):
             return merged_root
-    
+
     # Tool availability checks
     sort_bin = shutil.which("sort")
     gzip_bin = shutil.which("gzip")
     zcat_bin = shutil.which("zcat") or shutil.which("gzcat")
+    bash = shutil.which("bash") or "/bin/bash"
     if sort_bin is None or gzip_bin is None or zcat_bin is None:
         raise RuntimeError("External tools (sort, gzip, zcat/gzcat) not found in PATH.")
 
     tmpdir_eff = Path(tmpdir) if tmpdir is not None else merged_root
     tmpdir_eff.mkdir(parents=True, exist_ok=True)
 
-    bash = shutil.which("bash") or "/bin/bash"
-    
+    # Sorting command (body only)
+    sort_cmd = [
+        sort_bin,
+        "-t", "\t",
+        "-k1,1",
+        "-k2,2",
+        "-k3,3",
+        "-S", str(sort_mem),
+        "-T", str(tmpdir_eff),
+    ]
+
+    # Environment: force bytewise collation for sort speed/determinism
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
+
     # Merge each shard id independently
     for sid in range(int(shards)):
         inputs = sorted(shard_root.glob(f"w*/shard_{sid:02d}.tsv.gz"))
@@ -276,72 +290,79 @@ def _merge_worker_shards_pass15(
         out_path = merged_root / f"shard_{sid:02d}.tsv.gz"
         if out_path.exists() and not force:
             continue
-        
-        # Filter out trivially empty gzip containers (your ~38-byte case)
+
+        # Filter out trivially empty gzip containers (~38 bytes) or similar
         inputs_eff = [p for p in inputs if p.exists() and p.stat().st_size >= 64]
         if not inputs_eff:
-            # do not create an output shard if no data
             if out_path.exists():
                 out_path.unlink()
             continue
 
-        in_list = " ".join([shlex_quote(str(p)) for p in inputs_eff])
+        # 1) Read header from first non-empty input
+        first = str(inputs_eff[0])
+        header_cmd = f'{zcat_bin} {shlex_quote(first)} | head -n 1 || true'
+        header = subprocess.check_output([bash, "-lc", header_cmd], env=env, text=True)
+        header = header.rstrip("\n") + "\n"
+        if header.strip() == "":
+            # Defensive: if header retrieval failed, avoid producing malformed output
+            raise RuntimeError(f"Pass 1.5: failed to read header for shard_{sid:02d} from {first}")
 
-        # Read header from first non-empty input, then stream rows from all files minus headers.
+        # 2) Write header as gzip member (member 1)
+        try:
+            with open(out_path, "wb") as out_fh:
+                pH = subprocess.Popen([gzip_bin, "-c"], stdin=subprocess.PIPE, stdout=out_fh, env=env)
+                assert pH.stdin is not None
+                pH.stdin.write(header.encode("utf-8"))
+                pH.stdin.close()
+                rcH = pH.wait()
+            if rcH != 0:
+                raise RuntimeError(f"Pass 1.5 header gzip failed: rc={rcH}")
+        except Exception:
+            if out_path.exists():
+                out_path.unlink()
+            raise
+
+        # 3) Stream BODY rows (no headers) from all inputs -> sort -> gzip append (member 2)
+        in_list = " ".join(shlex_quote(str(p)) for p in inputs_eff)
+
+        # IMPORTANT: this cmd outputs ONLY the body lines to stdout
+        # NOTE: zcat|tail may get SIGPIPE if downstream finishes early; we tolerate rc1==141
         cmd = f"""
 set -euo pipefail
-first={shlex_quote(str(inputs_eff[0]))}
-{zcat_bin} "$first" | head -n 1
 for f in {in_list}; do
   {zcat_bin} "$f" | tail -n +2
 done
 """.strip()
-      
-        # Get current environment and inject the LC_ALL variable
-        env = os.environ.copy()
-        env["LC_ALL"] = "C"
-        
-        sort_cmd = [
-            sort_bin,
-            "-t", "\t",
-            "-k1,1",
-            "-k2,2",
-            "-k3,3",
-            "-S", str(sort_mem),
-            "-T", str(tmpdir_eff),
-        ]
 
-        # Execute pipeline: bash -c cmd | sort ... | gzip -c > out_path
-        with open(out_path, "wb") as out_fh:
-            p1 = subprocess.Popen([bash, "-lc", cmd], stdout=subprocess.PIPE, env=env)
-            p2 = subprocess.Popen(sort_cmd, stdin=p1.stdout, stdout=subprocess.PIPE, env=env)
-            p3 = subprocess.Popen([gzip_bin, "-c"], stdin=p2.stdout, stdout=out_fh, env=env)
+        try:
+            with open(out_path, "ab") as out_fh:
+                p1 = subprocess.Popen([bash, "-lc", cmd], stdout=subprocess.PIPE, env=env)
+                p2 = subprocess.Popen(sort_cmd, stdin=p1.stdout, stdout=subprocess.PIPE, env=env)
+                p3 = subprocess.Popen([gzip_bin, "-c"], stdin=p2.stdout, stdout=out_fh, env=env)
 
-            assert p1.stdout is not None
-            assert p2.stdout is not None
+                assert p1.stdout is not None
+                assert p2.stdout is not None
+                p1.stdout.close()
+                p2.stdout.close()
 
-            p1.stdout.close()
-            p2.stdout.close()
+                rc3 = p3.wait()
+                rc2 = p2.wait()
+                rc1 = p1.wait()
 
-            rc3 = p3.wait()
-            rc2 = p2.wait()
-            rc1 = p1.wait()
-
-        if rc1 != 0 or rc2 != 0 or rc3 != 0:
+            ok_rc1 = (0, 141)  # 141 == 128 + SIGPIPE(13)
+            if rc1 not in ok_rc1 or rc2 != 0 or rc3 != 0:
+                raise RuntimeError(
+                    f"Pass 1.5 failed for shard_{sid:02d}: rc1={rc1} rc2={rc2} rc3={rc3}"
+                )
+        except Exception:
             # cleanup partial output
             if out_path.exists():
                 out_path.unlink()
-            raise RuntimeError(
-                f"Pass 1.5 failed for shard_{sid:02d}: rc1={rc1} rc2={rc2} rc3={rc3}"
-            )
+            raise
 
     marker.write_text("v1\n")
     return merged_root
 
-
-def shlex_quote(s: str) -> str:
-    import shlex
-    return shlex.quote(s)
 
 # --------------------------------------------------------------------------------------
 # Promiscuous ambiguous filter (NumPy)
