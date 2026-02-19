@@ -296,10 +296,13 @@ for f in {in_list}; do
   {zcat_bin} "$f" | tail -n +2
 done
 """.strip()
-
+      
+        # Get current environment and inject the LC_ALL variable
+        env = os.environ.copy()
+        env["LC_ALL"] = "C"
+        
         sort_cmd = [
             sort_bin,
-            "export LC_ALL=C",
             "-t", "\t",
             "-k1,1",
             "-k2,2",
@@ -310,9 +313,9 @@ done
 
         # Execute pipeline: bash -c cmd | sort ... | gzip -c > out_path
         with open(out_path, "wb") as out_fh:
-            p1 = subprocess.Popen([bash, "-lc", cmd], stdout=subprocess.PIPE)
-            p2 = subprocess.Popen(sort_cmd, stdin=p1.stdout, stdout=subprocess.PIPE)
-            p3 = subprocess.Popen([gzip_bin, "-c"], stdin=p2.stdout, stdout=out_fh)
+            p1 = subprocess.Popen([bash, "-lc", cmd], stdout=subprocess.PIPE, env=env)
+            p2 = subprocess.Popen(sort_cmd, stdin=p1.stdout, stdout=subprocess.PIPE, env=env)
+            p3 = subprocess.Popen([gzip_bin, "-c"], stdin=p2.stdout, stdout=out_fh, env=env)
 
             assert p1.stdout is not None
             assert p2.stdout is not None
@@ -348,7 +351,7 @@ def _filter_promiscuous_ambiguous_reads(df: pd.DataFrame, cfg: MergeConfig) -> T
     if cfg.max_hits is None or cfg.hits_delta_mapq is None:
         return df, {"enabled": False}
 
-    ssigned = df["assigned_class"].fillna("").astype(str).to_numpy()
+    assigned = df["assigned_class"].fillna("").astype(str).to_numpy()
     is_amb = assigned == "ambiguous"
     if not is_amb.any():
         return df, {"enabled": True, "dropped_groups": 0, "dropped_rows": 0}
@@ -835,7 +838,7 @@ def _iter_shard_chunks(shard_path: Path, cfg: MergeConfig) -> Iterator[pd.DataFr
             if chunk is None or chunk.empty:
                 continue
             yield chunk
-    except pd.errors.EmptyDataError:
+    except (pd.errors.EmptyDataError, OSError):
         # Header missing / no columns.
         return
 
@@ -850,18 +853,17 @@ class Pass1Outputs:
     N: pd.DataFrame
 
 
-def _pass1_worker_job(args: Tuple[int, str, MergeConfig, str, Optional[Dict[str, int]]]) -> Pass1Outputs:
+def _pass1_worker_job(args: Tuple[int, str, Dict[str, Any], str, Optional[Dict[str, int]]]) -> Pass1Outputs:
     """
     Top-level worker so it is picklable by multiprocessing.
     args: (worker_index, filepath, cfg, shard_root, bc_to_chunk)
     """
-    i, fp_str, cfg, shard_root_str, bc_to_chunk = args
+    i, fp_str, cfg_dict, shard_root_str, bc_to_chunk = args
+    cfg = MergeConfig(**cfg_dict)  
     fp = Path(fp_str)
     shard_root = Path(shard_root_str)
-    wdir = shard_root / f"w{i:03d}"
-    cfg = MergeConfig(**cfg_dict)
+    wdir = shard_root / f"w{i:03d}"    
     return _pass1_process_one_file(fp, cfg, wdir, bc_to_chunk)
-
 
 def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path, bc_to_chunk: Optional[Dict[str, int]]) -> Pass1Outputs:
     """
