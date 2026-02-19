@@ -1410,7 +1410,7 @@ def _run_genotyping(
     C_path = outdir_eff / f"{sample_eff}_C_all.tsv.gz"
     N_path = outdir_eff / f"{sample_eff}_N_all.tsv.gz"
     eta_out = outdir_eff / f"{sample_eff}_eta.tsv.gz"
-    calls_path = outdir_eff / f"{sample_eff}_genotype_calls.tsv.gz"
+    calls_path = outdir_eff / f"{sample_eff}_cells_calls.tsv.gz"
 
     # -----------------------
     # Pass 1
