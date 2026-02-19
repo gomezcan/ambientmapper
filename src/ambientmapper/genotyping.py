@@ -364,6 +364,79 @@ done
     return merged_root
 
 
+def _compute_N_all_from_merged_shards(merged_root: Path, cfg: MergeConfig) -> pd.DataFrame:
+    """
+    Exact per-barcode unique read_id counts from merged shards.
+    Requires merged shards sorted by (barcode, read_id, genome).
+
+    This is exact and avoids chunk-boundary double counting.
+    """
+    rows: List[Tuple[str, int]] = []
+
+    for shard in sorted(merged_root.glob("shard_*.tsv.gz")):
+        prev_bc: Optional[str] = None
+        prev_rid: Optional[str] = None
+        cur_count = 0
+
+        for chunk in _iter_shard_chunks(shard, cfg):
+            if chunk is None or chunk.empty:
+                continue
+
+            b = chunk["barcode"].astype(str).to_numpy()
+            r = chunk["read_id"].astype(str).to_numpy()
+
+            # determine "new read" boundaries within the chunk
+            new_bc = np.empty(len(b), dtype=bool)
+            new_bc[0] = True
+            new_bc[1:] = b[1:] != b[:-1]
+
+            new_rid = np.empty(len(r), dtype=bool)
+            new_rid[0] = True
+            new_rid[1:] = r[1:] != r[:-1]
+
+            new_read = new_bc | new_rid
+
+            # fix the first row of this chunk based on the previous chunk tail
+            if prev_bc is not None:
+                if b[0] == prev_bc and r[0] == prev_rid:
+                    new_read[0] = False
+                else:
+                    new_read[0] = True
+
+            # accumulate counts per barcode, flushing when barcode changes
+            # we iterate only over barcode change points (not every row)
+            change_idx = np.flatnonzero(new_bc)
+            for k in range(len(change_idx)):
+                start = int(change_idx[k])
+                end = int(change_idx[k + 1]) if k + 1 < len(change_idx) else len(b)
+
+                bc_k = b[start]
+
+                # flush previous barcode when moving to a new one
+                if prev_bc is not None and bc_k != prev_bc:
+                    rows.append((prev_bc, int(cur_count)))
+                    cur_count = 0
+
+                # count new reads in this barcode segment
+                cur_count += int(new_read[start:end].sum())
+
+                prev_bc = bc_k
+                prev_rid = r[end - 1]
+
+        # flush last barcode seen in this shard
+        if prev_bc is not None:
+            rows.append((prev_bc, int(cur_count)))
+
+    if not rows:
+        return pd.DataFrame(columns=["barcode", "n_reads"])
+
+    out = pd.DataFrame(rows, columns=["barcode", "n_reads"])
+    # Each barcode routes to exactly one shard, but be defensive:
+    out = out.groupby("barcode", sort=False, as_index=False)["n_reads"].sum()
+    out["barcode"] = out["barcode"].astype("string")
+    out["n_reads"] = out["n_reads"].astype("int64")
+    return out
+
 # --------------------------------------------------------------------------------------
 # Promiscuous ambiguous filter (NumPy)
 # --------------------------------------------------------------------------------------
@@ -776,7 +849,6 @@ def _select_model_for_barcode(
 # Cell chunk parsing for shard routing
 # --------------------------------------------------------------------------------------
 
-
 def _parse_chunk_id_from_path(p: Path, chunk_id_regex: str) -> Optional[int]:
     m = re.search(chunk_id_regex, p.name)
     if not m:
@@ -827,7 +899,6 @@ def _route_shards_for_barcodes(barcodes: pd.Series, cfg: MergeConfig, bc_to_chun
 # --------------------------------------------------------------------------------------
 # Robust shard reading (SKIP empty gz files)
 # --------------------------------------------------------------------------------------
-
 
 def _iter_shard_chunks(shard_path: Path, cfg: MergeConfig) -> Iterator[pd.DataFrame]:
     """
@@ -891,6 +962,10 @@ def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path, bc_to_c
     Writes per-read posterior rows to shard gzip files under shard_dir.
     FIX: shard files are opened lazily (only if we actually write rows),
          preventing creation of 38-byte empty gzip files.
+
+    CORRECTION (1): carry-over buffer to prevent (barcode, read_id) groups
+    from being split across pandas chunk boundaries before reduction.
+    Assumption for correctness: input is grouped by (barcode, read_id) at least.
     """
     shard_dir.mkdir(parents=True, exist_ok=True)
 
@@ -905,23 +980,26 @@ def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path, bc_to_c
         return h
 
     C_parts: List[pd.DataFrame] = []
-    N_parts: List[pd.DataFrame] = []
+    # N_parts removed here; we will compute exact N_all from merged shards (Fix #2)
 
-    for raw in pd.read_csv(fp, sep="\t", chunksize=int(cfg.chunk_rows), low_memory=False):
-        df = _coerce_assign_schema(raw)
-        df = _reduce_alignments_to_per_genome(df)
+    carry: Optional[pd.DataFrame] = None
+
+    def _process_block(df_block: pd.DataFrame) -> None:
+        nonlocal C_parts
+        if df_block is None or df_block.empty:
+            return
+
+        df = _reduce_alignments_to_per_genome(df_block)
         df = df.dropna(subset=["barcode", "read_id", "genome"])
-
         df, _ = _filter_promiscuous_ambiguous_reads(df, cfg)
         if df.empty:
-            continue
+            return
 
         Ldf = _compute_read_posteriors(df, cfg)
         if Ldf.empty:
-            continue
+            return
 
         C_parts.append(Ldf.groupby(["barcode", "genome"], sort=False)["L"].sum().rename("C").reset_index())
-        N_parts.append(Ldf.groupby("barcode", sort=False)["read_id"].nunique().rename("n_reads").reset_index())
 
         sid = _route_shards_for_barcodes(Ldf["barcode"], cfg, bc_to_chunk)
         Ldf = Ldf.assign(_sid=sid)
@@ -935,17 +1013,41 @@ def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path, bc_to_c
             if not header_written[i]:
                 h.write("barcode\tread_id\tgenome\tL\tL_amb\n")
                 header_written[i] = True
-            #sub.drop(columns="_sid").to_csv(h, sep="\t", header=False, index=False)
+
             sub2 = sub.drop(columns="_sid")
             sub2 = sub2.sort_values(["barcode", "read_id", "genome"], kind="mergesort")
             sub2.to_csv(h, sep="\t", header=False, index=False)
 
+    for raw in pd.read_csv(fp, sep="\t", chunksize=int(cfg.chunk_rows), low_memory=False):
+        df0 = _coerce_assign_schema(raw)
+
+        # Prepend carry-over from previous chunk
+        if carry is not None and not carry.empty:
+            df0 = pd.concat([carry, df0], ignore_index=True)
+
+        if df0.empty:
+            carry = None
+            continue
+
+        # Carry the last (barcode, read_id) group to the next chunk
+        last_bc = str(df0["barcode"].iloc[-1])
+        last_rid = str(df0["read_id"].iloc[-1])
+        mask_carry = (df0["barcode"].astype(str) == last_bc) & (df0["read_id"].astype(str) == last_rid)
+
+        carry = df0.loc[mask_carry].copy()
+        df_main = df0.loc[~mask_carry].copy()
+
+        _process_block(df_main)
+
+    # Process any remaining carry
+    if carry is not None and not carry.empty:
+        _process_block(carry)
 
     for h in handles.values():
         h.close()
 
     C_out = pd.concat(C_parts, ignore_index=True) if C_parts else pd.DataFrame(columns=["barcode", "genome", "C"])
-    N_out = pd.concat(N_parts, ignore_index=True) if N_parts else pd.DataFrame(columns=["barcode", "n_reads"])
+    N_out = pd.DataFrame(columns=["barcode", "n_reads"])  # placeholder; will be computed exactly post-merge
     return Pass1Outputs(C=C_out, N=N_out)
 
 
@@ -1510,6 +1612,18 @@ def _run_genotyping(
     if not shards_list:
         raise RuntimeError(f"Pass 1.5 produced no merged shards under {merged_root}")
 
+    # -----------------------
+    # Pass 1.75: exact N_all from merged shards (Fix #2)
+    # -----------------------
+    if resume and N_path.exists():
+        # Optional: keep existing N if you trust it; but safest is to recompute when C was regenerated.
+        typer.echo("[1.75/4] N_all: using existing N_all (resume)")
+        N_all = pd.read_csv(N_path, sep="\t", compression="gzip", dtype={"barcode": "string", "n_reads": "int64"})
+    else:
+        typer.echo("[1.75/4] N_all: computing exact unique read counts from merged shards")
+        N_all = _compute_N_all_from_merged_shards(merged_root, cfg)
+        N_all.to_csv(N_path, sep="\t", index=False, compression="gzip")
+        typer.echo(f"[1.75/4] wrote exact: {N_path.name}")
 
     # -----------------------
     # Pass 2
