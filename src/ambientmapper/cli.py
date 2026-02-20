@@ -657,6 +657,9 @@ def genotyping(
     w_mapq: Optional[float] = typer.Option(None, "--w-mapq"),
     w_nm: Optional[float] = typer.Option(None, "--w-nm"),
     ambient_const: Optional[float] = typer.Option(None, "--ambient-const"),
+    w_confident: Optional[float] = typer.Option(None, "--w-confident", help="Weight for non-ambiguous reads (default: 1.0)."),
+    w_ambiguous: Optional[float] = typer.Option(None, "--w-ambiguous", help="Weight for ambiguous reads (default: 1.0)."),
+    
     # empty gates
     empty_bic_margin: Optional[float] = typer.Option(None, "--empty-bic-margin"),
     empty_top1_max: Optional[float] = typer.Option(None, "--empty-top1-max"),
@@ -742,6 +745,11 @@ def genotyping(
         kwargs["max_hits"] = int(max_hits)
     if hits_delta_mapq is not None:
         kwargs["hits_delta_mapq"] = int(hits_delta_mapq)
+
+    if w_confident is not None:
+        kwargs["w_confident"] = float(w_confident)
+    if w_ambiguous is not None:
+        kwargs["w_ambiguous"] = float(w_ambiguous)
 
     # fusion / gates
     if beta is not None:
@@ -864,6 +872,8 @@ def run(
     genotyping_w_as: Optional[float] = typer.Option(None, "--genotyping-w-as"),
     genotyping_w_mapq: Optional[float] = typer.Option(None, "--genotyping-w-mapq"),
     genotyping_w_nm: Optional[float] = typer.Option(None, "--genotyping-w-nm"),
+    genotyping_w_confident: Optional[float] = typer.Option(None, "--genotyping-w-confident"),
+    genotyping_w_ambiguous: Optional[float] = typer.Option(None, "--genotyping-w-ambiguous"),
     genotyping_ambient_const: Optional[float] = typer.Option(None, "--genotyping-ambient-const"),
     genotyping_bic_margin: Optional[float] = typer.Option(None, "--genotyping-bic-margin"),
     genotyping_topk_genomes: Optional[int] = typer.Option(None, "--genotyping-topk-genomes"),
@@ -910,6 +920,8 @@ def run(
         ("w_as", genotyping_w_as),
         ("w_mapq", genotyping_w_mapq),
         ("w_nm", genotyping_w_nm),
+        ("w_confident", genotyping_w_confident),
+        ("w_ambiguous", genotyping_w_ambiguous),
         ("ambient_const", genotyping_ambient_const),
         ("bic_margin", genotyping_bic_margin),
         ("topk_genomes", genotyping_topk_genomes),
