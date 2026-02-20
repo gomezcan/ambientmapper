@@ -38,17 +38,17 @@ import gzip
 import json
 import math
 import re
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterator
 import os
 import shutil
 import subprocess
-
 import numpy as np
 import pandas as pd
 import typer
+
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterator, Callable
 from pydantic import BaseModel, ConfigDict
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -56,7 +56,6 @@ app = typer.Typer(add_completion=False, no_args_is_help=True)
 # --------------------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------------------
-
 
 class MergeConfig(BaseModel):
     """
@@ -127,6 +126,10 @@ class MergeConfig(BaseModel):
     max_hits: Optional[int] = None
     hits_delta_mapq: Optional[float] = None
     max_rows_per_read_guard: Optional[int] = 500
+    
+    # Reliability weights (applied to L and L_amb)
+    w_confident: float = 1.0
+    w_ambiguous: float = 1.0
 
 
 # --------------------------------------------------------------------------------------
@@ -215,7 +218,17 @@ def _coerce_assign_schema(df: pd.DataFrame) -> pd.DataFrame:
 
 def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
     keys = ["barcode", "read_id", "genome"]
-    agg = {"AS": "max", "MAPQ": "max", "NM": "min", "assigned_class": "first"}
+    def _agg_assigned_class(s: pd.Series) -> str:
+        # robust: if any row is ambiguous, treat the genome-hit as ambiguous
+        x = set(s.dropna().astype(str).tolist())
+        return "ambiguous" if "ambiguous" in x else (next(iter(x)) if x else "ambiguous")
+
+    agg: Dict[str, Callable] = {
+        "AS": "max",
+        "MAPQ": "max",
+        "NM": "min",
+        "assigned_class": _agg_assigned_class,
+    }
     return df.groupby(keys, observed=True, sort=False).agg(agg).reset_index()
 
 def shlex_quote(s: str) -> str:
@@ -523,7 +536,7 @@ def _filter_promiscuous_ambiguous_reads(df: pd.DataFrame, cfg: MergeConfig) -> T
 # --------------------------------------------------------------------------------------
 
 def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame:
-    df = df[["barcode", "read_id", "genome", "AS", "MAPQ", "NM"]].copy()
+    df = df[["barcode", "read_id", "genome", "AS", "MAPQ", "NM", "assigned_class"]].copy()
     df = df.dropna(subset=["barcode", "read_id", "genome"])
 
     AS = df["AS"].to_numpy(np.float32, copy=False)
@@ -534,15 +547,26 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
     codes = rid.astype("category").cat.codes.to_numpy(np.int32)
 
     score = (AS * float(cfg.w_as)) + (MQ * float(cfg.w_mapq)) - (NM * float(cfg.w_nm))
-
+    # Read-level weight: ambiguous reads contribute less (does not drop any reads)
+    cls = df["assigned_class"].fillna("").astype(str).to_numpy()
+    w_row = np.where(cls == "ambiguous", float(cfg.w_ambiguous), float(cfg.w_confident)).astype(np.float32)
+    # Ensure per-read weight is "ambiguous if any ambiguous hit" (max over rows for that read)
+    n_codes0 = int(codes.max()) + 1 if codes.size else 0
+    w_read = np.zeros(n_codes0, dtype=np.float32)
+    np.maximum.at(w_read, codes, w_row)
+  
     if cfg.winner_only:
         df["_code"] = codes
         df["_score"] = score
         df = df.sort_values(["_code", "_score"], ascending=[True, False]).drop_duplicates("_code", keep="first")
-        df["L"] = 1.0
-        df["L_amb"] = float(cfg.ambient_const)
-        return df[["barcode", "read_id", "genome", "L", "L_amb"]]
-
+        # pick read-weight for the chosen winner row
+        codes2 = (df["barcode"].astype(str) + "::" + df["read_id"].astype(str)).astype("category").cat.codes.to_numpy(np.int32)
+        w2 = w_read[codes2].astype(np.float32, copy=False)
+        df["L"] = (1.0 * w2).astype(np.float32)
+        df["L_amb"] = (float(cfg.ambient_const) * w2).astype(np.float32)
+        df["w_read"] = w2
+        return df[["barcode", "read_id", "genome", "L", "L_amb", "w_read"]]        
+                
     n_codes = int(codes.max()) + 1 if codes.size else 0
     max_per = np.full(n_codes, -np.inf, dtype=np.float32)
     np.maximum.at(max_per, codes, score)
@@ -550,12 +574,15 @@ def _compute_read_posteriors(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame
 
     w = np.exp(np.clip(float(cfg.beta) * s, -50, 50)).astype(np.float32)
     denom = np.bincount(codes, weights=w).astype(np.float32) + float(cfg.ambient_const)
-
-    df["L"] = w / denom[codes]
-    df["L_amb"] = float(cfg.ambient_const) / denom[codes]
-    return df[["barcode", "read_id", "genome", "L", "L_amb"]]
-
-
+    L = (w / denom[codes]).astype(np.float32, copy=False)
+    Lamb = (float(cfg.ambient_const) / denom[codes]).astype(np.float32, copy=False)
+    wr = w_read[codes].astype(np.float32, copy=False)
+    
+    df["L"] = L * wr
+    df["L_amb"] = Lamb * wr
+    df["w_read"] = wr
+    return df[["barcode", "read_id", "genome", "L", "L_amb", "w_read"]]
+  
 # --------------------------------------------------------------------------------------
 # Likelihood / BIC / JSD
 # --------------------------------------------------------------------------------------
@@ -583,12 +610,13 @@ def _precompute_per_read_arrays(
     L_block: pd.DataFrame,
     eta: pd.Series,
     candidate_genomes: Sequence[str],
-) -> Tuple[int, np.ndarray, Dict[str, np.ndarray]]:
+) -> Tuple[int, float, np.ndarray, Dict[str, np.ndarray]]:
     """
     Precompute exact per-read aggregates used by the current likelihood functions.
 
     Returns:
       n_reads: number of unique read_id in this barcode
+      n_reads_eff: sum of per-read weights (diagnostic)
       E: shape (n_reads,) where E[r] = sum_g eta[g] * L_{r,g}
       Lg: dict genome->array shape (n_reads,) where Lg[g][r] = sum_{rows with genome==g, read_id==r} L
     """
@@ -596,11 +624,20 @@ def _precompute_per_read_arrays(
     read_codes, _ = pd.factorize(L_block["read_id"], sort=False)
     n_reads = int(read_codes.max()) + 1 if len(read_codes) else 0
     if n_reads == 0:
-        return 0, np.zeros(0, dtype=np.float64), {g: np.zeros(0, dtype=np.float64) for g in candidate_genomes}
+        return 0, 0.0, np.zeros(0, dtype=np.float64), {g: np.zeros(0, dtype=np.float64) for g in candidate_genomes}
 
     # Base arrays
     L = L_block["L"].to_numpy(dtype=np.float64, copy=False)
     gn = L_block["genome"].astype(str).to_numpy()
+    # per-read weight (same for all rows of the same read_id); use max for safety
+    wr_row = (
+        L_block["w_read"].to_numpy(dtype=np.float64, copy=False)
+        if "w_read" in L_block.columns
+        else np.ones(len(L_block), dtype=np.float64)
+    )
+    wr = np.zeros(n_reads, dtype=np.float64)
+    np.maximum.at(wr, read_codes, wr_row)
+    n_reads_eff = float(wr.sum())
 
     # E_r = sum eta_g * L_{r,g} (exactly what _loglik_empty_from_E computes)
     eta_row = eta.reindex(pd.Index(gn)).fillna(0.0).to_numpy(dtype=np.float64, copy=False)
@@ -614,14 +651,11 @@ def _precompute_per_read_arrays(
             Lg[g] = np.zeros(n_reads, dtype=np.float64)
         else:
             Lg[g] = np.bincount(read_codes[m], weights=L[m], minlength=n_reads).astype(np.float64, copy=False)
-
-    return n_reads, E, Lg
-
+    return n_reads, n_reads_eff, E, Lg
 
 def _loglik_empty_from_E(E: np.ndarray) -> float:
     # loglik_empty = sum_r log(E_r)
     return float(np.log(np.clip(E, 1e-12, None)).sum())
-
 
 def _best_single_from_arrays(
     n_reads: int,
@@ -707,8 +741,8 @@ def _select_model_for_barcode(
     cfg: MergeConfig,
     candidate_genomes: Sequence[str],
 ) -> Dict[str, Any]:
-    # Precompute per-read arrays (exactly preserves loglik math)
-    n_reads, E, Lg = _precompute_per_read_arrays(L_block, eta, candidate_genomes)
+    # Precompute per-read arrays (exactly preserves loglik math)    
+    n_reads, n_reads_eff, E, Lg = _precompute_per_read_arrays(L_block, eta, candidate_genomes)
     read_count = int(n_reads)
 
     mass = L_block.groupby("genome", sort=False)["L"].sum().sort_values(ascending=False)
@@ -725,12 +759,14 @@ def _select_model_for_barcode(
     out: Dict[str, Any] = {
         "n_reads": read_count,
         "n_effective": tot,
+        "n_reads_eff": float(n_reads_eff),
         "p_top1": p_top1,
         "p_top2": p_top2,
         "ratio12": ratio12,
         "top_genome": (mass.index[0] if len(mass) else None),
         "jsd_to_eta": jsd,
         "doublet_minor_frac": minor_frac,
+        "purity_best": None,  # filled after choosing model (1 - alpha)
     }
     # Empty BIC from precomputed E    
     bic_empty = _bic(_loglik_empty_from_E(E), 0, read_count)
@@ -828,6 +864,8 @@ def _select_model_for_barcode(
     out["alpha"] = chosen.get("alpha")
     out["rho"] = chosen.get("rho")
     out["bic_best"] = float(chosen["bic"])
+    if chosen.get("alpha") is not None:
+        out["purity_best"] = float(1.0 - float(chosen["alpha"]))
 
     # --------------------------
     # Purity/strength sublabels
@@ -925,6 +963,7 @@ def _iter_shard_chunks(shard_path: Path, cfg: MergeConfig) -> Iterator[pd.DataFr
                 "genome": "string",
                 "L": "float32",
                 "L_amb": "float32",
+                "w_read": "float32",
             },
         ):
             if chunk is None or chunk.empty:
@@ -1010,8 +1049,8 @@ def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path, bc_to_c
             if sub.empty:
                 continue
             h = _get_handle(i)
-            if not header_written[i]:
-                h.write("barcode\tread_id\tgenome\tL\tL_amb\n")
+            if not header_written[i]:                
+                h.write("barcode\tread_id\tgenome\tL\tL_amb\tw_read\n")
                 header_written[i] = True
 
             sub2 = sub.drop(columns="_sid")
@@ -1289,6 +1328,7 @@ def _call_from_shard_file(
                     f"{float(res.get('alpha')):.6g}" if res.get("alpha") is not None else "",
                     f"{float(res.get('rho')):.6g}" if res.get("rho") is not None else "",
                     str(int(res.get("n_reads", 0))),
+                    f"{float(res.get('n_reads_eff', 0.0)):.6g}",
                     f"{float(res.get('n_effective', 0.0)):.6g}",
                     f"{float(res.get('p_top1', 0.0)):.6g}",
                     f"{float(res.get('p_top2', 0.0)):.6g}",
@@ -1301,6 +1341,7 @@ def _call_from_shard_file(
                     f"{float(res.get('bic_gap_sd')):.6g}" if res.get("bic_gap_sd") is not None else "",
                     "1" if res.get("near_tie_sd") else "0" if res.get("near_tie_sd") is not None else "",
                     f"{float(res.get('doublet_minor_frac', 0.0)):.6g}",
+                    f"{float(res.get('purity_best')):.6g}" if res.get("purity_best") is not None else "",
                 ]
             )
             + "\n"
@@ -1309,8 +1350,8 @@ def _call_from_shard_file(
         parts = []
 
     for chunk in _iter_shard_chunks(shard_path, cfg):
-        # keep only needed columns and ensure order is preserved
-        chunk2 = chunk[["barcode", "read_id", "genome", "L", "L_amb"]]
+        # keep only needed columns and ensure order is preserved        
+        chunk2 = chunk[["barcode", "read_id", "genome", "L", "L_amb", "w_read"]]
         
         # --- OPTIMIZED MONOTONIC CHECK ---
         b = chunk2["barcode"]
@@ -1325,8 +1366,8 @@ def _call_from_shard_file(
         # ---------------------------------
         # chunk is expected sorted by barcode; groupby preserves order with sort=False
         for bc, sub in chunk2.groupby("barcode", sort=False):
-            bc_s = str(bc)
-            sub2 = sub[["read_id", "genome", "L"]].copy()
+            bc_s = str(bc)            
+            sub2 = sub[["read_id", "genome", "L", "w_read"]].copy()
             
             if cur_bc is None:
                 cur_bc = bc_s
@@ -1379,6 +1420,9 @@ def _run_genotyping(
     w_mapq: Optional[float] = None,
     w_nm: Optional[float] = None,
     ambient_const: Optional[float] = None,
+    w_confident: Optional[float] = None,
+    w_ambiguous: Optional[float] = None,
+  
     # empty gates
     empty_bic_margin: Optional[float] = None,
     empty_top1_max: Optional[float] = None,
@@ -1441,6 +1485,10 @@ def _run_genotyping(
         cfg.w_nm = float(w_nm)
     if ambient_const is not None:
         cfg.ambient_const = float(ambient_const)
+    if w_confident is not None:
+        cfg.w_confident = float(w_confident)
+    if w_ambiguous is not None:
+        cfg.w_ambiguous = float(w_ambiguous)
 
     if min_reads is not None:
         cfg.min_reads = int(min_reads)
@@ -1503,8 +1551,8 @@ def _run_genotyping(
     typer.echo(f"[genotyping] cell_chunks_glob={cell_chunks_pat}")
     typer.echo(
         f"[genotyping] filter: max_hits={cfg.max_hits} hits_delta_mapq={cfg.hits_delta_mapq} guard={cfg.max_rows_per_read_guard}"
-    )
-    typer.echo(f"[genotyping] winner_only={cfg.winner_only} ambient_const={cfg.ambient_const}")
+    )    
+    typer.echo(f"[genotyping] weights: w_confident={cfg.w_confident} w_ambiguous={cfg.w_ambiguous}")
     typer.echo(f"[genotyping] gates: empty_bic_margin={cfg.empty_bic_margin} bic_margin={cfg.bic_margin} near_tie_margin={cfg.near_tie_margin}")
     if cfg.empty_seed_bic_min is not None:
         typer.echo("[genotyping] NOTE: empty_seed_bic_min is currently not used in eta learning in this implementation.")
@@ -1704,6 +1752,7 @@ def _run_genotyping(
                 "alpha",
                 "rho",
                 "n_reads",
+                "n_reads_eff",
                 "n_effective",
                 "p_top1",
                 "p_top2",
@@ -1716,6 +1765,7 @@ def _run_genotyping(
                 "bic_gap_sd",
                 "near_tie_sd",
                 "doublet_minor_frac",
+                "purity_best",
             ]
         )
         
@@ -1787,6 +1837,9 @@ def genotyping_cmd(
     w_mapq: Optional[float] = typer.Option(None, "--w-mapq"),
     w_nm: Optional[float] = typer.Option(None, "--w-nm"),
     ambient_const: Optional[float] = typer.Option(None, "--ambient-const"),
+    w_confident: Optional[float] = typer.Option(None, "--w-confident", help="Weight for non-ambiguous reads (default 1.0)."),
+    w_ambiguous: Optional[float] = typer.Option(None, "--w-ambiguous", help="Weight for ambiguous reads (default 0.1)."),
+  
     # empty gates
     empty_bic_margin: Optional[float] = typer.Option(None, "--empty-bic-margin"),
     empty_top1_max: Optional[float] = typer.Option(None, "--empty-top1-max"),
@@ -1831,6 +1884,9 @@ def genotyping_cmd(
         w_mapq=w_mapq,
         w_nm=w_nm,
         ambient_const=ambient_const,
+        w_confident=w_confident,
+        w_ambiguous=w_ambiguous,
+        #
         empty_bic_margin=empty_bic_margin,
         empty_top1_max=empty_top1_max,
         empty_ratio12_max=empty_ratio12_max,
