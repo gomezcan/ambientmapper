@@ -107,7 +107,7 @@ class MergeConfig(BaseModel):
     # Search grid
     alpha_grid: float = 0.02
     rho_grid: float = 0.05
-    max_alpha: float = 0.8
+    max_alpha: float = 0.5
     topk_genomes: int = 3
 
     # System / IO
@@ -1410,6 +1410,10 @@ def _run_genotyping(
     chunk_rows: Optional[int] = None,
     pass2_chunksize: Optional[int] = None,
     winner_only: Optional[bool] = None,
+    # model
+    alpha_grid: Optional[float] = None,
+    rho_grid: Optional[float] = None,
+    max_alpha: Optional[float] = None,
     # optional read-filter
     max_hits: Optional[int] = None,
     hits_delta_mapq: Optional[float] = None,
@@ -1490,6 +1494,13 @@ def _run_genotyping(
     if w_ambiguous is not None:
         cfg.w_ambiguous = float(w_ambiguous)
 
+    if alpha_grid is not None:
+        cfg.alpha_grid = float(alpha_grid)
+    if rho_grid is not None:
+        cfg.rho_grid = float(rho_grid)
+    if max_alpha is not None:
+        cfg.max_alpha = float(max_alpha)
+
     if min_reads is not None:
         cfg.min_reads = int(min_reads)
     if single_mass_min is not None:
@@ -1531,6 +1542,11 @@ def _run_genotyping(
     files = [Path(f) for f in glob.glob(assign_glob, recursive=True)]
     if not files:
         raise typer.BadParameter(f"No files matched: {assign_glob}")
+
+    if cfg.alpha_grid <= 0 or cfg.rho_grid <= 0:
+        raise ValueError("alpha_grid and rho_grid must be > 0")
+    if not (0 < cfg.max_alpha <= 1.0):
+        raise ValueError("max_alpha must be in (0,1]")
 
     tmp_dir = outdir_eff / f"tmp_{sample_eff}"
     shard_root = tmp_dir / "L_shards_workers"
@@ -1831,6 +1847,11 @@ def genotyping_cmd(
     max_hits: Optional[int] = typer.Option(None, "--max-hits"),
     hits_delta_mapq: Optional[float] = typer.Option(None, "--hits-delta-mapq"),
     max_rows_per_read_guard: Optional[int] = typer.Option(None, "--max-rows-per-read-guard"),
+    # model
+    alpha_grid: Optional[float] = typer.Option(None, "--alpha-grid", help="Alpha step for grid search (default 0.02)."),
+    rho_grid: Optional[float] = typer.Option(None, "--rho-grid", help="Rho step for doublet grid search (default 0.05)."),
+    max_alpha: Optional[float] = typer.Option(None, "--max-alpha", help="Max alpha for grid search (default 0.5)."),
+  
     # fusion
     beta: Optional[float] = typer.Option(None, "--beta"),
     w_as: Optional[float] = typer.Option(None, "--w-as"),
