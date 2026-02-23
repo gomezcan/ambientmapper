@@ -637,6 +637,11 @@ def genotyping(
     chunk_rows: Optional[int] = typer.Option(None, "--chunk-rows"),
     pass2_chunksize: Optional[int] = typer.Option(None, "--pass2-chunksize"),
     winner_only: Optional[bool] = typer.Option(None, "--winner-only/--no-winner-only"),
+    # Model
+    alpha_grid: Optional[float] = typer.Option(None, "--alpha-grid"),
+    rho_grid: Optional[float] = typer.Option(None, "--rho-grid"),
+    max_alpha: Optional[float] = typer.Option(None, "--max-alpha"),
+    
     # optional read-filter (NEW)
     max_hits: Optional[int] = typer.Option(
         None,
@@ -739,8 +744,16 @@ def genotyping(
         kwargs["ratio_top1_top2_min"] = float(ratio_top1_top2_min)
     if pass1_workers is not None:
         kwargs["pass1_workers"] = max(1, int(pass1_workers))
-
-    # NEW: optional read-filter passthrough
+    
+    # model, grid paramters
+    if alpha_grid is not None:
+        kwargs["alpha_grid"] = float(alpha_grid)
+    if rho_grid is not None:
+        kwargs["rho_grid"] = float(rho_grid)
+    if max_alpha is not None:
+        kwargs["max_alpha"] = float(max_alpha)
+    
+    # Optional read-filter passthrough
     if max_hits is not None:
         kwargs["max_hits"] = int(max_hits)
     if hits_delta_mapq is not None:
@@ -872,6 +885,9 @@ def run(
     genotyping_w_as: Optional[float] = typer.Option(None, "--genotyping-w-as"),
     genotyping_w_mapq: Optional[float] = typer.Option(None, "--genotyping-w-mapq"),
     genotyping_w_nm: Optional[float] = typer.Option(None, "--genotyping-w-nm"),
+    genotyping_alpha_grid: Optional[float] = typer.Option(None, "--alpha-grid"),
+    genotyping_rho_grid: Optional[float] = typer.Option(None, "--rho-grid"),
+    genotyping_max_alpha: Optional[float] = typer.Option(None, "--max-alpha"),
     genotyping_w_confident: Optional[float] = typer.Option(None, "--genotyping-w-confident"),
     genotyping_w_ambiguous: Optional[float] = typer.Option(None, "--genotyping-w-ambiguous"),
     genotyping_ambient_const: Optional[float] = typer.Option(None, "--genotyping-ambient-const"),
