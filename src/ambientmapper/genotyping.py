@@ -1570,6 +1570,7 @@ def _run_genotyping(
     )    
     typer.echo(f"[genotyping] weights: w_confident={cfg.w_confident} w_ambiguous={cfg.w_ambiguous}")
     typer.echo(f"[genotyping] gates: empty_bic_margin={cfg.empty_bic_margin} bic_margin={cfg.bic_margin} near_tie_margin={cfg.near_tie_margin}")
+    typer.echo(f"[genotyping] grid: alpha_grid={cfg.alpha_grid} rho_grid={cfg.rho_grid} max_alpha={cfg.max_alpha}")
     if cfg.empty_seed_bic_min is not None:
         typer.echo("[genotyping] NOTE: empty_seed_bic_min is currently not used in eta learning in this implementation.")
 
