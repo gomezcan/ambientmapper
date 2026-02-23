@@ -107,7 +107,7 @@ class MergeConfig(BaseModel):
     # Search grid
     alpha_grid: float = 0.02
     rho_grid: float = 0.05
-    max_alpha: float = 0.5
+    max_alpha: float = 0.8
     topk_genomes: int = 3
 
     # System / IO
