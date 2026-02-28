@@ -130,7 +130,7 @@ class DeltaHist:
     tail_p(x) = P(X >= x) under the empirical distribution.
     """
 
-    __slots__ = ("lo", "hi", "nbins", "edges", "counts", "overflow")
+    __slots__ = ("lo", "hi", "nbins", "edges", "counts", "overflow", "_total", "_suffix", "_frozen")
 
     def __init__(self, lo: float, hi: float, nbins: int):
         self.lo = float(lo)
@@ -139,12 +139,18 @@ class DeltaHist:
         self.edges = np.linspace(self.lo, self.hi, self.nbins + 1, dtype=np.float64)
         self.counts = np.zeros(self.nbins, dtype=np.int64)
         self.overflow = 0
+        self._total: int = 0
+        self._suffix: Optional[np.ndarray] = None
+        self._frozen: bool = False
 
     def add(self, x: float) -> None:
+        if self._frozen:
+            raise RuntimeError("DeltaHist.add() called after freeze()")
         if not np.isfinite(x):
             return
         if x >= self.hi:
             self.overflow += 1
+            self._total += 1
             return
         if x <= self.lo:
             idx = 0
@@ -155,24 +161,40 @@ class DeltaHist:
             elif idx >= self.nbins:
                 idx = self.nbins - 1
         self.counts[idx] += 1
+        self._total += 1
+
+    def freeze(self) -> None:
+        """Precompute suffix-sum for O(1) tail_p. Call once after all add() calls."""
+        self._total = int(self.counts.sum()) + self.overflow
+        self._suffix = np.cumsum(self.counts[::-1])[::-1].astype(np.int64)
+        self._frozen = True
 
     def tail_p(self, x: float) -> float:
         if not np.isfinite(x):
             return np.nan
-        total = int(self.counts.sum() + self.overflow)
-        if total == 0:
-            return np.nan
-        if x >= self.hi:
-            return self.overflow / total
-        if x <= self.lo:
-            return 1.0
-        idx = int((x - self.lo) / (self.hi - self.lo) * self.nbins)
-        if idx < 0:
-            idx = 0
-        elif idx >= self.nbins:
-            idx = self.nbins - 1
-        tail = int(self.counts[idx:].sum() + self.overflow)
-        return tail / total
+        if self._frozen:
+            total = self._total
+            if total == 0:
+                return np.nan
+            if x >= self.hi:
+                return self.overflow / total
+            if x <= self.lo:
+                return 1.0
+            idx = int((x - self.lo) / (self.hi - self.lo) * self.nbins)
+            idx = max(0, min(idx, self.nbins - 1))
+            return (int(self._suffix[idx]) + self.overflow) / total
+        else:
+            # Unfrozen path: used during Pass A/B accumulation if tail_p is ever called
+            total = int(self.counts.sum() + self.overflow)
+            if total == 0:
+                return np.nan
+            if x >= self.hi:
+                return self.overflow / total
+            if x <= self.lo:
+                return 1.0
+            idx = int((x - self.lo) / (self.hi - self.lo) * self.nbins)
+            idx = max(0, min(idx, self.nbins - 1))
+            return int(self.counts[idx:].sum() + self.overflow) / total
 
 
 # winner hist specs
@@ -221,8 +243,7 @@ def assign_decile_scalar(v: float, edges: np.ndarray) -> int:
     """
     if edges.size == 0 or not np.isfinite(v):
         return 1
-    # np.digitize returns 0..len(edges)
-    return int(np.digitize([v], bins=edges, right=True)[0] + 1)
+    return int(np.searchsorted(edges, v, side="left") + 1)
 
 
 # -----------------------------
@@ -349,8 +370,7 @@ def _iter_rows(
             continue
 
         # dedup within chunk
-        if df.duplicated(subset=["Read", "BC"]).any():
-            df = df.drop_duplicates(subset=["Read", "BC"], keep="first")
+        df = df.drop_duplicates(subset=["Read", "BC"], keep="first")
 
         if max_rows_for_genome is not None:
             remaining = max_rows_for_genome - seen
@@ -365,6 +385,55 @@ def _iter_rows(
         for r in df.itertuples(index=False):
             # r.Read, r.BC are pandas String scalars => convert to str once
             yield (str(r.Read), str(r.BC), float(r.AS), float(r.MAPQ), float(r.NM))
+
+
+def _iter_rows_with_genome_xa(
+    fp: Path,
+    genome: str,
+    bcs: set[str],
+    chunksize: int,
+    mapq_min: int,
+    xa_max: int,
+) -> Iterable[Tuple[str, str, float, float, float, float, str]]:
+    """
+    Yield (Read, BC, AS, MAPQ, NM, XAcount, genome) for rows passing filters.
+    Identical filtering logic to _iter_rows but also yields XAcount and genome.
+    Used exclusively in score_chunk (Pass C) to support single-pass output.
+    """
+    usecols = ["Read", "BC", "MAPQ", "AS", "NM", "XAcount"]
+
+    for df in pd.read_csv(
+        fp,
+        sep="\t",
+        usecols=usecols,
+        chunksize=chunksize,
+        dtype={
+            "Read": "string",
+            "BC": "string",
+            "AS": "float32",
+            "MAPQ": "float32",
+            "NM": "float32",
+            "XAcount": "float32",
+        },
+        engine="c",
+        low_memory=True,
+        memory_map=False,
+    ):
+        df = df[df["BC"].isin(bcs)]
+        if df.empty:
+            continue
+
+        if mapq_min > 0:
+            df = df[df["MAPQ"] >= mapq_min]
+        if xa_max >= 0:
+            df = df[df["XAcount"] <= xa_max]
+        if df.empty:
+            continue
+
+        df = df.drop_duplicates(subset=["Read", "BC"], keep="first")
+
+        for r in df.itertuples(index=False):
+            yield (str(r.Read), str(r.BC), float(r.AS), float(r.MAPQ), float(r.NM), float(r.XAcount), genome)
 
 
 # -----------------------------
@@ -737,12 +806,14 @@ def _load_ecdf_model(path: Path):
         H = DeltaHist(float(dat["dAS_lo"][0]), float(dat["dAS_hi"][0]), int(dat["dAS_nbins"][0]))
         H.counts = dat["dAS_counts"][i].astype(np.int64)
         H.overflow = int(dat["dAS_overflow"][i])
+        H.freeze()
         dAS.append(H)
 
     for i in range(k):
         H = DeltaHist(float(dat["dMQ_lo"][0]), float(dat["dMQ_hi"][0]), int(dat["dMQ_nbins"][0]))
         H.counts = dat["dMQ_counts"][i].astype(np.int64)
         H.overflow = int(dat["dMQ_overflow"][i])
+        H.freeze()
         dMQ.append(H)
 
     return k, as_edges, mq_edges, dAS, dMQ
@@ -791,20 +862,30 @@ def score_chunk(
 
     bcs = _chunk_bcs(chunk_file)
     rb_map: dict[tuple[str, str], ReadAcc] = {}
+    # per_read_genome stores raw per-genome evidence collected during the single pass;
+    # used to build the filtered output without a second file scan.
+    per_read_genome: dict[tuple[str, str], list[tuple[str, float, float, float, float]]] = {}
 
     _log(f"[assign/score] ▶ {chunk_file.name} BCs={len(bcs):,}", verbose)
     t0 = time.time()
 
-    # Accumulate best1/best2/worst across all genomes
+    # Single pass: accumulate best1/best2/worst AND store per-genome evidence
     for fp in files:
         genome = _genome_from_filename(fp)
-        for read, bc, AS, MQ, NM in _iter_rows(fp, bcs, chunksize, mapq_min, xa_max):
+        for read, bc, AS, MQ, NM, XA, gname in _iter_rows_with_genome_xa(
+            fp, genome, bcs, chunksize, mapq_min, xa_max
+        ):
             key = (read, bc)
             acc = rb_map.get(key)
             if acc is None:
                 acc = ReadAcc()
                 rb_map[key] = acc
-            update_acc(acc, genome, AS, MQ, NM)
+            update_acc(acc, gname, AS, MQ, NM)
+            grecs = per_read_genome.get(key)
+            if grecs is None:
+                grecs = []
+                per_read_genome[key] = grecs
+            grecs.append((gname, AS, MQ, NM, XA))
 
     if not rb_map:
         # Write empty outputs
@@ -813,8 +894,31 @@ def score_chunk(
         _log_ok(f"[assign/score] ■ empty chunk → wrote empty outputs", verbose)
         return
 
-    # Build raw summary table (vectorized-ish via list accumulation)
-    raw_rows = []
+    # Build raw summary table using per-column lists (avoids dict-per-row overhead)
+    col_read: list[str] = []
+    col_bc: list[str] = []
+    col_gwin: list[str] = []
+    col_as1: list[float] = []
+    col_mq1: list[float] = []
+    col_nm1: list[float] = []
+    col_g2: list[str] = []
+    col_as2: list[float] = []
+    col_mq2: list[float] = []
+    col_nm2: list[float] = []
+    col_glast: list[str] = []
+    col_aslast: list[float] = []
+    col_mqlast: list[float] = []
+    col_nmlast: list[float] = []
+    col_das: list[float] = []
+    col_dmq: list[float] = []
+    col_dnm: list[float] = []
+    col_ngen: list[int] = []
+    col_decas: list[int] = []
+    col_decmq: list[int] = []
+    col_pas: list[float] = []
+    col_pmq: list[float] = []
+    col_klass: list[str] = []
+
     class_by: dict[tuple[str, str], str] = {}
     p_lookup: dict[tuple[str, str], tuple[float, float]] = {}
     gwin_by: dict[tuple[str, str], str] = {}
@@ -834,131 +938,101 @@ def score_chunk(
             as2 = mq2 = nm2 = np.nan
             dAS = dMQ = dNM = np.nan
 
-        dec_as = assign_decile_scalar(as1, as_edges)
-        dec_mq = assign_decile_scalar(mq1, mq_edges)
+        # Inline searchsorted (faster than wrapping scalar in list for np.digitize)
+        dec_as = (int(np.searchsorted(as_edges, as1, side="left") + 1)
+                  if as_edges.size > 0 and np.isfinite(as1) else 1)
+        dec_mq = (int(np.searchsorted(mq_edges, mq1, side="left") + 1)
+                  if mq_edges.size > 0 and np.isfinite(mq1) else 1)
 
-        p_as = H_dAS[dec_as - 1].tail_p(dAS) if np.isfinite(dAS) else np.nan
-        p_mq = H_dMQ[dec_mq - 1].tail_p(dMQ) if np.isfinite(dMQ) else np.nan
+        p_as_val = H_dAS[dec_as - 1].tail_p(dAS) if np.isfinite(dAS) else np.nan
+        p_mq_val = H_dMQ[dec_mq - 1].tail_p(dMQ) if np.isfinite(dMQ) else np.nan
 
-        clear_by_p = (np.isfinite(p_as) and p_as <= alpha) or (np.isfinite(p_mq) and p_mq <= alpha)
-        clear_by_nm = np.isfinite(dNM) and dNM > 0
-        single_hit = acc.best2_g is None
-
-        klass = "winner" if (clear_by_p or clear_by_nm or single_hit) else "ambiguous"
+        clear_by_p = (np.isfinite(p_as_val) and p_as_val <= alpha) or \
+                     (np.isfinite(p_mq_val) and p_mq_val <= alpha)
+        klass = "winner" if (clear_by_p or (np.isfinite(dNM) and dNM > 0) or acc.best2_g is None) \
+                else "ambiguous"
 
         key = (read, bc)
         class_by[key] = klass
-        p_lookup[key] = (float(p_as) if np.isfinite(p_as) else np.nan, float(p_mq) if np.isfinite(p_mq) else np.nan)
+        p_lookup[key] = (float(p_as_val) if np.isfinite(p_as_val) else np.nan,
+                         float(p_mq_val) if np.isfinite(p_mq_val) else np.nan)
         gwin_by[key] = acc.best1_g
 
-        raw_rows.append(
-            {
-                "Read": read,
-                "BC": bc,
-                "Genome_winner": acc.best1_g,
-                "AS_winner": as1,
-                "MAPQ_winner": mq1,
-                "NM_winner": nm1,
-                "Genome_2": acc.best2_g or "",
-                "AS_2": as2,
-                "MAPQ_2": mq2,
-                "NM_2": nm2,
-                "Genome_last": acc.worst_g or "",
-                "AS_last": acc.worst_as if np.isfinite(acc.worst_as) else np.nan,
-                "MAPQ_last": acc.worst_mq if np.isfinite(acc.worst_mq) else np.nan,
-                "NM_last": acc.worst_nm if np.isfinite(acc.worst_nm) else np.nan,
-                "delta_AS_1_2": dAS,
-                "delta_MAPQ_1_2": dMQ,
-                "delta_NM_1_2": dNM,
-                "n_genomes_considered": acc.n_genomes,
-                "decile_AS": dec_as,
-                "decile_MAPQ": dec_mq,
-                "p_as": p_as,
-                "p_mq": p_mq,
-                "assigned_class": klass,
-            }
-        )
+        col_read.append(read)
+        col_bc.append(bc)
+        col_gwin.append(acc.best1_g)
+        col_as1.append(float(as1))
+        col_mq1.append(float(mq1))
+        col_nm1.append(float(nm1))
+        col_g2.append(acc.best2_g or "")
+        col_as2.append(float(as2) if np.isfinite(as2) else np.nan)
+        col_mq2.append(float(mq2) if np.isfinite(mq2) else np.nan)
+        col_nm2.append(float(nm2) if np.isfinite(nm2) else np.nan)
+        col_glast.append(acc.worst_g or "")
+        col_aslast.append(float(acc.worst_as) if np.isfinite(acc.worst_as) else np.nan)
+        col_mqlast.append(float(acc.worst_mq) if np.isfinite(acc.worst_mq) else np.nan)
+        col_nmlast.append(float(acc.worst_nm) if np.isfinite(acc.worst_nm) else np.nan)
+        col_das.append(float(dAS) if np.isfinite(dAS) else np.nan)
+        col_dmq.append(float(dMQ) if np.isfinite(dMQ) else np.nan)
+        col_dnm.append(float(dNM) if np.isfinite(dNM) else np.nan)
+        col_ngen.append(acc.n_genomes)
+        col_decas.append(dec_as)
+        col_decmq.append(dec_mq)
+        col_pas.append(float(p_as_val) if np.isfinite(p_as_val) else np.nan)
+        col_pmq.append(float(p_mq_val) if np.isfinite(p_mq_val) else np.nan)
+        col_klass.append(klass)
 
-    raw_df = pd.DataFrame(raw_rows)
+    raw_df = pd.DataFrame({
+        "Read": col_read, "BC": col_bc,
+        "Genome_winner": col_gwin, "AS_winner": col_as1, "MAPQ_winner": col_mq1, "NM_winner": col_nm1,
+        "Genome_2": col_g2, "AS_2": col_as2, "MAPQ_2": col_mq2, "NM_2": col_nm2,
+        "Genome_last": col_glast, "AS_last": col_aslast, "MAPQ_last": col_mqlast, "NM_last": col_nmlast,
+        "delta_AS_1_2": col_das, "delta_MAPQ_1_2": col_dmq, "delta_NM_1_2": col_dnm,
+        "n_genomes_considered": col_ngen, "decile_AS": col_decas, "decile_MAPQ": col_decmq,
+        "p_as": col_pas, "p_mq": col_pmq, "assigned_class": col_klass,
+    })
     raw_df.to_csv(raw_out, sep="\t", index=False, compression="gzip")
 
-    # Filtered per-read/per-genome table:
-    # Keep all genome rows for ambiguous reads; for winner reads keep only winner genome.
-    keep_pairs = set(class_by.keys())
-    bc_keep = {bc for (_, bc) in keep_pairs}
+    # Filtered per-read/per-genome table — built from in-memory per_read_genome.
+    # No second file scan: per_read_genome holds all per-genome evidence from the single pass above.
+    f_read: list[str] = []
+    f_bc: list[str] = []
+    f_genome: list[str] = []
+    f_as: list[float] = []
+    f_mq: list[float] = []
+    f_nm: list[float] = []
+    f_xa: list[float] = []
+    f_klass: list[str] = []
+    f_pas: list[float] = []
+    f_pmq: list[float] = []
 
-    out_rows = []
-    usecols = ["Read", "BC", "MAPQ", "AS", "NM", "XAcount"]
-
-    for fp in files:
-        genome = _genome_from_filename(fp)
-
-        for df in pd.read_csv(
-            fp,
-            sep="\t",
-            usecols=usecols,
-            chunksize=chunksize,
-            dtype={
-                "Read": "string",
-                "BC": "string",
-                "AS": "float32",
-                "MAPQ": "float32",
-                "NM": "float32",
-                "XAcount": "float32",
-            },
-            engine="c",
-            low_memory=True,
-            memory_map=False,
-        ):
-            df = df[df["BC"].isin(bc_keep)]
-            if df.empty:
+    for key, grecs in per_read_genome.items():
+        klass = class_by.get(key)
+        if klass is None:
+            continue
+        pa, pm = p_lookup[key]
+        gwin = gwin_by[key]
+        for gname, AS, MQ, NM, XA in grecs:
+            # winner reads: keep only the winner genome row
+            if klass == "winner" and gname != gwin:
                 continue
+            # ambiguous reads: keep all genome rows
+            f_read.append(key[0])
+            f_bc.append(key[1])
+            f_genome.append(gname)
+            f_as.append(AS)
+            f_mq.append(MQ)
+            f_nm.append(NM)
+            f_xa.append(XA)
+            f_klass.append(klass)
+            f_pas.append(pa)
+            f_pmq.append(pm)
 
-            if mapq_min > 0:
-                df = df[df["MAPQ"] >= mapq_min]
-            if xa_max >= 0:
-                df = df[df["XAcount"] <= xa_max]
-            if df.empty:
-                continue
-
-            # We only care about (Read,BC) pairs in rb_map
-            # Build pairs vector; avoid Python list membership per-row by using merge keys
-            reads = df["Read"].astype(str).to_numpy()
-            bcs2 = df["BC"].astype(str).to_numpy()
-            mask = np.fromiter(((r, b) in keep_pairs for r, b in zip(reads, bcs2)), dtype=bool, count=len(df))
-            if not mask.any():
-                continue
-            df = df.loc[mask]
-
-            for row in df.itertuples(index=False):
-                read = str(row.Read)
-                bc = str(row.BC)
-                key = (read, bc)
-
-                klass = class_by.get(key, "ambiguous")
-                gwin = gwin_by.get(key, "")
-                pa, pm = p_lookup.get(key, (np.nan, np.nan))
-
-                # if winner-class, keep only the winner genome row
-                if klass == "winner" and genome != gwin:
-                    continue
-
-                out_rows.append(
-                    {
-                        "Read": read,
-                        "BC": bc,
-                        "Genome": genome,
-                        "AS": float(row.AS),
-                        "MAPQ": float(row.MAPQ),
-                        "NM": float(row.NM),
-                        "XAcount": float(row.XAcount),
-                        "assigned_class": klass,
-                        "p_as": pa,
-                        "p_mq": pm,
-                    }
-                )
-
-    out_df = pd.DataFrame(out_rows)
+    out_df = pd.DataFrame({
+        "Read": f_read, "BC": f_bc, "Genome": f_genome,
+        "AS": f_as, "MAPQ": f_mq, "NM": f_nm, "XAcount": f_xa,
+        "assigned_class": f_klass, "p_as": f_pas, "p_mq": f_pmq,
+    })
     out_df.to_csv(filt_out, sep="\t", index=False, compression="gzip")
 
     _log_ok(f"[assign/score] ■ done {chunk_file.name} ({time.time()-t0:0.1f}s) raw={raw_out.name} filt={filt_out.name}", verbose)
