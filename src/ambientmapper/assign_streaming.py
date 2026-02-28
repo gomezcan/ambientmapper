@@ -71,6 +71,13 @@ import typer
 
 app = typer.Typer(add_completion=False)
 
+try:
+    import duckdb as _duckdb
+    _HAS_DUCKDB = True
+except ImportError:
+    _duckdb = None  # type: ignore
+    _HAS_DUCKDB = False
+
 # -----------------------------
 # Logging helpers
 # -----------------------------
@@ -119,6 +126,130 @@ def _filtered_files(workdir: Path, sample: str) -> list[Path]:
     if not files:
         raise FileNotFoundError(f"No filtered_* files under {d}")
     return files
+
+
+def _build_duckdb_union_sql(
+    files: list,
+    mapq_min: int,
+    xa_max: int,
+    bc_table: str = "_bcs",
+) -> str:
+    """
+    Build a UNION ALL SQL fragment over all genome files.
+    AS is a SQL reserved word — aliased to as_ throughout.
+    Filters are applied inside each SELECT for DuckDB pushdown.
+    xa_max < 0 means no XAcount filter.
+    """
+    parts = []
+    for fp in files:
+        genome = _genome_from_filename(fp).replace("'", "''")
+        path   = str(fp).replace("'", "''")
+        where  = [f"BC IN (SELECT bc FROM {bc_table})"]
+        if mapq_min > 0:
+            where.append(f"MAPQ >= {mapq_min}")
+        if xa_max >= 0:
+            where.append(f"XAcount <= {xa_max}")
+        parts.append(
+            f"SELECT Read, BC, CAST(\"AS\" AS FLOAT) AS as_, "
+            f"CAST(MAPQ AS FLOAT) AS MAPQ, CAST(NM AS FLOAT) AS NM, "
+            f"CAST(XAcount AS FLOAT) AS XAcount, '{genome}' AS Genome "
+            f"FROM read_csv('{path}', delim='\\t', header=true) "
+            f"WHERE {' AND '.join(where)}"
+        )
+    return "\n    UNION ALL\n    ".join(parts)
+
+
+def _score_chunk_duckdb(
+    files: list,
+    bcs: set,
+    mapq_min: int,
+    xa_max: int,
+    duckdb_threads: int,
+):
+    """
+    DuckDB-backed Pass C helpers.
+
+    Returns (top3_df, lazy_ambig) where:
+      top3_df   — DataFrame with _rn=1 (best1), _rn=2 (best2), _rn_worst=1 (worst), n_genomes
+      lazy_ambig — callable(ambiguous_bcs) → DataFrame of ALL genome rows for those BCs
+
+    The DuckDB connection is kept alive inside the closure; it is released when
+    lazy_ambig is garbage-collected at the end of score_chunk.
+    """
+    import pyarrow as pa
+
+    con = _duckdb.connect()
+    con.execute(f"SET threads TO {max(1, duckdb_threads)}")
+
+    # Register BC set via Arrow (zero-copy)
+    con.register("_bcs", pa.table({"bc": pa.array(list(bcs), type=pa.string())}))
+
+    union_sql = _build_duckdb_union_sql(files, mapq_min, xa_max, "_bcs")
+
+    q1 = f"""
+    WITH all_reads AS (
+        {union_sql}
+    ),
+    deduped AS (
+        SELECT Read, BC, Genome, as_, MAPQ, NM, XAcount
+        FROM (
+            SELECT *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY Read, BC, Genome
+                    ORDER BY NM ASC, as_ DESC, MAPQ DESC
+                ) AS _rg
+            FROM all_reads
+        ) t WHERE _rg = 1
+    ),
+    ranked AS (
+        SELECT *,
+            ROW_NUMBER() OVER (
+                PARTITION BY Read, BC ORDER BY NM ASC, as_ DESC, MAPQ DESC
+            ) AS _rn,
+            ROW_NUMBER() OVER (
+                PARTITION BY Read, BC ORDER BY NM DESC, as_ ASC, MAPQ ASC
+            ) AS _rn_worst,
+            COUNT(*) OVER (PARTITION BY Read, BC) AS n_genomes
+        FROM deduped
+    )
+    SELECT Read, BC, Genome, as_, MAPQ, NM, XAcount, _rn, _rn_worst, n_genomes
+    FROM ranked
+    WHERE _rn <= 2 OR _rn_worst = 1
+    """
+
+    top3_df = con.execute(q1).df()
+
+    def lazy_ambig(ambiguous_bcs: set) -> "pd.DataFrame":
+        if not ambiguous_bcs:
+            return pd.DataFrame(
+                columns=["Read", "BC", "Genome", "as_", "MAPQ", "NM", "XAcount"]
+            )
+        con.register(
+            "_ambiguous_bcs",
+            pa.table({"bc": pa.array(list(ambiguous_bcs), type=pa.string())})
+        )
+        # Re-use the same union_sql but restrict to ambiguous BCs only
+        ambig_union = _build_duckdb_union_sql(files, mapq_min, xa_max, "_ambiguous_bcs")
+        q2 = f"""
+        WITH all_reads AS (
+            {ambig_union}
+        ),
+        deduped AS (
+            SELECT Read, BC, Genome, as_, MAPQ, NM, XAcount
+            FROM (
+                SELECT *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY Read, BC, Genome
+                        ORDER BY NM ASC, as_ DESC, MAPQ DESC
+                    ) AS _rg
+                FROM all_reads
+            ) t WHERE _rg = 1
+        )
+        SELECT * FROM deduped
+        """
+        return con.execute(q2).df()
+
+    return top3_df, lazy_ambig
 
 
 # -----------------------------
@@ -837,6 +968,8 @@ def score_chunk(
     xa_max: int = typer.Option(2, "--xa-max"),
     chunksize: int = typer.Option(500_000, "--chunksize"),
     alpha: float = typer.Option(0.05, "--alpha"),
+    use_duckdb: bool = typer.Option(True, "--score-duckdb/--score-no-duckdb"),
+    duckdb_threads: int = typer.Option(2, "--duckdb-threads"),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
 ):
     """
@@ -868,6 +1001,165 @@ def score_chunk(
 
     _log(f"[assign/score] ▶ {chunk_file.name} BCs={len(bcs):,}", verbose)
     t0 = time.time()
+
+    # ----------------------------------------------------------------
+    # DuckDB fast path (Pass C)
+    # ----------------------------------------------------------------
+    if use_duckdb and _HAS_DUCKDB:
+        top3_df, lazy_ambig = _score_chunk_duckdb(
+            files, bcs, mapq_min, xa_max, duckdb_threads
+        )
+        if top3_df.empty:
+            pd.DataFrame().to_csv(raw_out, sep="\t", index=False, compression="gzip")
+            pd.DataFrame().to_csv(filt_out, sep="\t", index=False, compression="gzip")
+            _log_ok(f"[assign/score] ■ empty chunk → wrote empty outputs", verbose)
+            return
+
+        best1 = (top3_df[top3_df["_rn"] == 1]
+                 .drop_duplicates(["Read", "BC"])
+                 .set_index(["Read", "BC"]))
+        best2 = (top3_df[top3_df["_rn"] == 2]
+                 .drop_duplicates(["Read", "BC"])
+                 .set_index(["Read", "BC"]))
+        worst = (top3_df[top3_df["_rn_worst"] == 1]
+                 .drop_duplicates(["Read", "BC"])
+                 .set_index(["Read", "BC"]))
+
+        b1 = best1.join(
+            best2[["Genome", "as_", "MAPQ", "NM"]].rename(
+                columns={"Genome": "Genome_2", "as_": "as_2", "MAPQ": "MAPQ_2", "NM": "NM_2"}
+            ),
+            how="left",
+        ).join(
+            worst[["Genome", "as_", "MAPQ", "NM"]].rename(
+                columns={"Genome": "Genome_last", "as_": "as_last", "MAPQ": "MAPQ_last", "NM": "NM_last"}
+            ),
+            how="left",
+        )
+
+        as1_arr = b1["as_"].values.astype(np.float64)
+        mq1_arr = b1["MAPQ"].values.astype(np.float64)
+        nm1_arr = b1["NM"].values.astype(np.float64)
+        as2_arr = b1["as_2"].values.astype(np.float64)
+        mq2_arr = b1["MAPQ_2"].values.astype(np.float64)
+        nm2_arr = b1["NM_2"].values.astype(np.float64)
+
+        dAS_arr = as1_arr - as2_arr
+        dMQ_arr = mq1_arr - mq2_arr
+        dNM_arr = nm2_arr - nm1_arr
+
+        if as_edges.size > 0:
+            dec_as = np.clip(
+                np.searchsorted(as_edges, as1_arr, side="left") + 1, 1, k
+            ).astype(np.int64)
+        else:
+            dec_as = np.ones(len(b1), dtype=np.int64)
+
+        if mq_edges.size > 0:
+            dec_mq = np.clip(
+                np.searchsorted(mq_edges, mq1_arr, side="left") + 1, 1, k
+            ).astype(np.int64)
+        else:
+            dec_mq = np.ones(len(b1), dtype=np.int64)
+
+        # p-value loop — O(N_reads), not O(N_reads × G_genomes)
+        p_as_arr = np.array(
+            [H_dAS[int(d) - 1].tail_p(float(v)) if np.isfinite(v) else np.nan
+             for v, d in zip(dAS_arr, dec_as)],
+            dtype=np.float64,
+        )
+        p_mq_arr = np.array(
+            [H_dMQ[int(d) - 1].tail_p(float(v)) if np.isfinite(v) else np.nan
+             for v, d in zip(dMQ_arr, dec_mq)],
+            dtype=np.float64,
+        )
+
+        has_best2 = ~np.isnan(as2_arr)
+        klass_arr = np.where(
+            (np.isfinite(p_as_arr) & (p_as_arr <= alpha))
+            | (np.isfinite(p_mq_arr) & (p_mq_arr <= alpha))
+            | (np.isfinite(dNM_arr) & (dNM_arr > 0))
+            | ~has_best2,
+            "winner",
+            "ambiguous",
+        )
+
+        read_idx = b1.index.get_level_values("Read")
+        bc_idx   = b1.index.get_level_values("BC")
+
+        raw_df = pd.DataFrame({
+            "Read":                 read_idx,
+            "BC":                   bc_idx,
+            "Genome_winner":        b1["Genome"].values,
+            "AS_winner":            as1_arr.astype(np.float32),
+            "MAPQ_winner":          mq1_arr.astype(np.float32),
+            "NM_winner":            nm1_arr.astype(np.float32),
+            "Genome_2":             b1["Genome_2"].fillna("").values,
+            "AS_2":                 as2_arr.astype(np.float32),
+            "MAPQ_2":               mq2_arr.astype(np.float32),
+            "NM_2":                 nm2_arr.astype(np.float32),
+            "Genome_last":          b1["Genome_last"].fillna("").values,
+            "AS_last":              b1["as_last"].values.astype(np.float32),
+            "MAPQ_last":            b1["MAPQ_last"].values.astype(np.float32),
+            "NM_last":              b1["NM_last"].values.astype(np.float32),
+            "delta_AS_1_2":         dAS_arr.astype(np.float32),
+            "delta_MAPQ_1_2":       dMQ_arr.astype(np.float32),
+            "delta_NM_1_2":         dNM_arr.astype(np.float32),
+            "n_genomes_considered": b1["n_genomes"].values.astype(np.int32),
+            "decile_AS":            dec_as.astype(np.int16),
+            "decile_MAPQ":          dec_mq.astype(np.int16),
+            "p_as":                 p_as_arr.astype(np.float32),
+            "p_mq":                 p_mq_arr.astype(np.float32),
+            "assigned_class":       klass_arr,
+        })
+        raw_df.to_csv(raw_out, sep="\t", index=False, compression="gzip")
+
+        # Filtered output: winners from b1; ambiguous via lazy Query 2
+        win_mask = klass_arr == "winner"
+        wb1 = b1[win_mask]
+        p_as_s = pd.Series(p_as_arr, index=b1.index)
+        p_mq_s = pd.Series(p_mq_arr, index=b1.index)
+
+        winner_df = pd.DataFrame({
+            "Read":           wb1.index.get_level_values("Read"),
+            "BC":             wb1.index.get_level_values("BC"),
+            "Genome":         wb1["Genome"].values,
+            "AS":             wb1["as_"].values.astype(np.float32),
+            "MAPQ":           wb1["MAPQ"].values.astype(np.float32),
+            "NM":             wb1["NM"].values.astype(np.float32),
+            "XAcount":        wb1["XAcount"].values.astype(np.float32),
+            "assigned_class": "winner",
+            "p_as":           p_as_s[win_mask].values.astype(np.float32),
+            "p_mq":           p_mq_s[win_mask].values.astype(np.float32),
+        })
+
+        ambiguous_bcs_d = set(bc_idx[klass_arr == "ambiguous"].tolist())
+        ambig_raw = lazy_ambig(ambiguous_bcs_d)
+        if not ambig_raw.empty:
+            ambig_idx = pd.MultiIndex.from_arrays(
+                [ambig_raw["Read"].values, ambig_raw["BC"].values]
+            )
+            ambig_df = ambig_raw.rename(columns={"as_": "AS"}).copy()
+            ambig_df["assigned_class"] = "ambiguous"
+            ambig_df["p_as"] = p_as_s.reindex(ambig_idx).values.astype(np.float32)
+            ambig_df["p_mq"] = p_mq_s.reindex(ambig_idx).values.astype(np.float32)
+            ambig_df = ambig_df[["Read", "BC", "Genome", "AS", "MAPQ", "NM",
+                                  "XAcount", "assigned_class", "p_as", "p_mq"]]
+        else:
+            ambig_df = pd.DataFrame(columns=winner_df.columns)
+
+        out_df = pd.concat([winner_df, ambig_df], ignore_index=True)
+        out_df.to_csv(filt_out, sep="\t", index=False, compression="gzip")
+
+        _log_ok(
+            f"[assign/score] ■ done {chunk_file.name} ({time.time()-t0:0.1f}s) "
+            f"[duckdb] raw={raw_out.name} filt={filt_out.name}",
+            verbose,
+        )
+        return
+
+    if use_duckdb and not _HAS_DUCKDB:
+        _log_err("[assign/score] duckdb not installed — falling back to Python path", True)
 
     # Pass 1: accumulate best1/best2/worst across all genome files; best1_xa tracks XAcount
     # of the winner alignment. per_read_genome is NOT built here — winners are reconstructed

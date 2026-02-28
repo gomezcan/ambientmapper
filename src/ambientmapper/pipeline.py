@@ -241,6 +241,9 @@ def _run_assign(ctx: Ctx) -> None:
         chunksize=parse_int(chunksize_val), verbose=verbose, workers=parse_int(ecdf_workers)
     )
 
+    score_duckdb_eff   = bool(aconf.get("score_duckdb", True))
+    duckdb_threads_eff = int(aconf.get("duckdb_threads", 2))
+
     pool_n = max(1, min(threads, len(chunk_files)))
     with ProcessPoolExecutor(max_workers=pool_n) as ex:
         fut = {
@@ -249,6 +252,7 @@ def _run_assign(ctx: Ctx) -> None:
                 workdir=workdir, sample=sample, chunk_file=chf, ecdf_model=ecdf_npz,
                 out_raw_dir=None, out_filtered_dir=None,
                 mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize_val, alpha=alpha,
+                use_duckdb=score_duckdb_eff, duckdb_threads=duckdb_threads_eff,
             ): chf
             for chf in chunk_files
         }

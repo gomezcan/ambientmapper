@@ -435,6 +435,16 @@ def assign(
         "--score-workers",
         help="Number of parallel workers for scoring chunks. Default: 2 (independent of --threads).",
     ),
+    score_duckdb: bool = typer.Option(
+        True,
+        "--score-duckdb/--score-no-duckdb",
+        help="Use DuckDB for Pass C scoring (default: on). Falls back to Python if duckdb is not installed.",
+    ),
+    duckdb_threads: int = typer.Option(
+        2,
+        "--duckdb-threads",
+        help="DuckDB threads per scoring worker (default: 2).",
+    ),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
     resume: bool = typer.Option(True, "--resume/--no-resume"),
 ) -> None:
@@ -533,6 +543,8 @@ def assign(
         # scoring workers is independent of --threads; default 2
         score_workers_eff = 2 if score_workers is None else max(1, int(score_workers))
         pool_n = min(score_workers_eff, len(chunk_files))
+        score_duckdb_eff   = bool(aconf.get("score_duckdb", score_duckdb))
+        duckdb_threads_eff = int(aconf.get("duckdb_threads", duckdb_threads))
 
         if verbose:
             typer.echo(
@@ -599,6 +611,8 @@ def assign(
                     xa_max=xa_max_eff,
                     chunksize=chunksize_val,
                     alpha=alpha_eff,
+                    use_duckdb=score_duckdb_eff,
+                    duckdb_threads=duckdb_threads_eff,
                     verbose=verbose,
                 ): chf
                 for chf in chunk_files
