@@ -255,6 +255,7 @@ class ReadAcc:
     best1_as: float = -np.inf
     best1_mq: float = -np.inf
     best1_nm: float = np.inf
+    best1_xa: float = np.nan   # XAcount for best1 alignment; np.nan for Pass A/B callers
 
     best2_g: Optional[str] = None
     best2_as: float = -np.inf
@@ -278,7 +279,7 @@ def _better(nm1: float, as1: float, mq1: float, nm2: float, as2: float, mq2: flo
     return mq1 > mq2
 
 
-def update_acc(acc: ReadAcc, genome: str, AS: float, MAPQ: float, NM: float) -> None:
+def update_acc(acc: ReadAcc, genome: str, AS: float, MAPQ: float, NM: float, xa: float = np.nan) -> None:
     acc.n_genomes += 1
 
     if acc.best1_g is None:
@@ -286,6 +287,7 @@ def update_acc(acc: ReadAcc, genome: str, AS: float, MAPQ: float, NM: float) -> 
         acc.best1_as = AS
         acc.best1_mq = MAPQ
         acc.best1_nm = NM
+        acc.best1_xa = xa
 
         acc.worst_g = genome
         acc.worst_as = AS
@@ -312,6 +314,7 @@ def update_acc(acc: ReadAcc, genome: str, AS: float, MAPQ: float, NM: float) -> 
         acc.best1_as = AS
         acc.best1_mq = MAPQ
         acc.best1_nm = NM
+        acc.best1_xa = xa
     else:
         if acc.best2_g is None or _better(NM, AS, MAPQ, acc.best2_nm, acc.best2_as, acc.best2_mq):
             acc.best2_g = genome
@@ -862,14 +865,13 @@ def score_chunk(
 
     bcs = _chunk_bcs(chunk_file)
     rb_map: dict[tuple[str, str], ReadAcc] = {}
-    # per_read_genome stores raw per-genome evidence collected during the single pass;
-    # used to build the filtered output without a second file scan.
-    per_read_genome: dict[tuple[str, str], list[tuple[str, float, float, float, float]]] = {}
 
     _log(f"[assign/score] ▶ {chunk_file.name} BCs={len(bcs):,}", verbose)
     t0 = time.time()
 
-    # Single pass: accumulate best1/best2/worst AND store per-genome evidence
+    # Pass 1: accumulate best1/best2/worst across all genome files; best1_xa tracks XAcount
+    # of the winner alignment. per_read_genome is NOT built here — winners are reconstructed
+    # directly from rb_map; ambiguous reads get a targeted second scan below.
     for fp in files:
         genome = _genome_from_filename(fp)
         for read, bc, AS, MQ, NM, XA, gname in _iter_rows_with_genome_xa(
@@ -880,12 +882,7 @@ def score_chunk(
             if acc is None:
                 acc = ReadAcc()
                 rb_map[key] = acc
-            update_acc(acc, gname, AS, MQ, NM)
-            grecs = per_read_genome.get(key)
-            if grecs is None:
-                grecs = []
-                per_read_genome[key] = grecs
-            grecs.append((gname, AS, MQ, NM, XA))
+            update_acc(acc, gname, AS, MQ, NM, xa=XA)
 
     if not rb_map:
         # Write empty outputs
@@ -993,8 +990,11 @@ def score_chunk(
     })
     raw_df.to_csv(raw_out, sep="\t", index=False, compression="gzip")
 
-    # Filtered per-read/per-genome table — built from in-memory per_read_genome.
-    # No second file scan: per_read_genome holds all per-genome evidence from the single pass above.
+    # Filtered per-read/per-genome table.
+    # Winners: reconstructed directly from rb_map (no second file scan).
+    #   best1_xa captured best1's XAcount during Pass 1.
+    # Ambiguous: requires all genome rows per read → Pass 2, restricted to ambiguous BCs only
+    #   (typically 10–30% of BCs), so the second scan is fast.
     f_read: list[str] = []
     f_bc: list[str] = []
     f_genome: list[str] = []
@@ -1006,27 +1006,55 @@ def score_chunk(
     f_pas: list[float] = []
     f_pmq: list[float] = []
 
-    for key, grecs in per_read_genome.items():
-        klass = class_by.get(key)
-        if klass is None:
+    # --- Winners: reconstruct from rb_map ---
+    for (read, bc), acc in rb_map.items():
+        key = (read, bc)
+        if class_by.get(key) != "winner":
             continue
         pa, pm = p_lookup[key]
-        gwin = gwin_by[key]
-        for gname, AS, MQ, NM, XA in grecs:
-            # winner reads: keep only the winner genome row
-            if klass == "winner" and gname != gwin:
-                continue
-            # ambiguous reads: keep all genome rows
-            f_read.append(key[0])
-            f_bc.append(key[1])
-            f_genome.append(gname)
-            f_as.append(AS)
-            f_mq.append(MQ)
-            f_nm.append(NM)
-            f_xa.append(XA)
-            f_klass.append(klass)
-            f_pas.append(pa)
-            f_pmq.append(pm)
+        f_read.append(read)
+        f_bc.append(bc)
+        f_genome.append(acc.best1_g)
+        f_as.append(float(acc.best1_as))
+        f_mq.append(float(acc.best1_mq))
+        f_nm.append(float(acc.best1_nm))
+        f_xa.append(float(acc.best1_xa))
+        f_klass.append("winner")
+        f_pas.append(pa)
+        f_pmq.append(pm)
+
+    # --- Ambiguous: Pass 2 over genome files, BC-filtered to ambiguous reads only ---
+    ambiguous_bcs = {bc for (_, bc), klass in class_by.items() if klass == "ambiguous"}
+    if ambiguous_bcs:
+        per_read_genome: dict[tuple[str, str], list[tuple[str, float, float, float, float]]] = {}
+        for fp in files:
+            genome = _genome_from_filename(fp)
+            for read, bc, AS, MQ, NM, XA, gname in _iter_rows_with_genome_xa(
+                fp, genome, ambiguous_bcs, chunksize, mapq_min, xa_max
+            ):
+                key = (read, bc)
+                if class_by.get(key) != "ambiguous":
+                    # guard: same BC shared between an ambiguous and a winner read
+                    continue
+                grecs = per_read_genome.get(key)
+                if grecs is None:
+                    grecs = []
+                    per_read_genome[key] = grecs
+                grecs.append((gname, AS, MQ, NM, XA))
+
+        for key, grecs in per_read_genome.items():
+            pa, pm = p_lookup[key]
+            for gname, AS, MQ, NM, XA in grecs:
+                f_read.append(key[0])
+                f_bc.append(key[1])
+                f_genome.append(gname)
+                f_as.append(AS)
+                f_mq.append(MQ)
+                f_nm.append(NM)
+                f_xa.append(XA)
+                f_klass.append("ambiguous")
+                f_pas.append(pa)
+                f_pmq.append(pm)
 
     out_df = pd.DataFrame({
         "Read": f_read, "BC": f_bc, "Genome": f_genome,
