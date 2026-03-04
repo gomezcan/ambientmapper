@@ -548,6 +548,28 @@ class DeltaHist:
             idx = max(0, min(idx, self.nbins - 1))
             return int(self.counts[idx:].sum() + self.overflow) / total
 
+    def tail_p_batch(self, xs: np.ndarray) -> np.ndarray:
+        """Vectorized tail_p for an array of values. Requires freeze()."""
+        if not self._frozen:
+            raise RuntimeError("tail_p_batch requires freeze()")
+        total = self._total
+        if total == 0:
+            return np.full(len(xs), np.nan)
+        result = np.full(len(xs), np.nan)
+        finite = np.isfinite(xs)
+        high = finite & (xs >= self.hi)
+        result[high] = self.overflow / total
+        low = finite & (xs <= self.lo)
+        result[low] = 1.0
+        mid = finite & ~high & ~low
+        if mid.any():
+            idx = np.clip(
+                ((xs[mid] - self.lo) / (self.hi - self.lo) * self.nbins).astype(np.int64),
+                0, self.nbins - 1,
+            )
+            result[mid] = (self._suffix[idx].astype(np.float64) + self.overflow) / total
+        return result
+
 
 # winner hist specs
 _AS_RANGE = (0.0, 200.0, 2000)  # lo, hi, nbins
@@ -1280,6 +1302,183 @@ def _load_ecdf_model(path: Path):
 
 
 # -----------------------------
+# Pass C: shared helpers
+# -----------------------------
+
+def _batched(iterable, n):
+    """Yield successive n-sized chunks from *iterable*. Python 3.9 compat."""
+    lst = list(iterable)
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
+def _classify_chunk_top3(
+    top3_df: "pd.DataFrame",
+    as_edges: np.ndarray,
+    mq_edges: np.ndarray,
+    H_dAS: list,
+    H_dMQ: list,
+    k: int,
+    alpha: float,
+    raw_out: Path,
+) -> tuple:
+    """
+    Given DuckDB top3_df for one chunk, compute p-values, classify reads,
+    write raw output.
+
+    Returns (winner_df, p_as_s, p_mq_s, ambiguous_bcs, n_reads, n_winner, n_ambig).
+    """
+    best1 = (top3_df[top3_df["_rn"] == 1]
+             .drop_duplicates(["Read", "BC"])
+             .set_index(["Read", "BC"]))
+    best2 = (top3_df[top3_df["_rn"] == 2]
+             .drop_duplicates(["Read", "BC"])
+             .set_index(["Read", "BC"]))
+    worst = (top3_df[top3_df["_rn_worst"] == 1]
+             .drop_duplicates(["Read", "BC"])
+             .set_index(["Read", "BC"]))
+
+    b1 = best1.join(
+        best2[["Genome", "as_", "MAPQ", "NM"]].rename(
+            columns={"Genome": "Genome_2", "as_": "as_2", "MAPQ": "MAPQ_2", "NM": "NM_2"}
+        ),
+        how="left",
+    ).join(
+        worst[["Genome", "as_", "MAPQ", "NM"]].rename(
+            columns={"Genome": "Genome_last", "as_": "as_last", "MAPQ": "MAPQ_last", "NM": "NM_last"}
+        ),
+        how="left",
+    )
+
+    as1_arr = b1["as_"].values.astype(np.float64)
+    mq1_arr = b1["MAPQ"].values.astype(np.float64)
+    nm1_arr = b1["NM"].values.astype(np.float64)
+    as2_arr = b1["as_2"].values.astype(np.float64)
+    mq2_arr = b1["MAPQ_2"].values.astype(np.float64)
+    nm2_arr = b1["NM_2"].values.astype(np.float64)
+
+    dAS_arr = as1_arr - as2_arr
+    dMQ_arr = mq1_arr - mq2_arr
+    dNM_arr = nm2_arr - nm1_arr
+
+    if as_edges.size > 0:
+        dec_as = np.clip(
+            np.searchsorted(as_edges, as1_arr, side="left") + 1, 1, k
+        ).astype(np.int64)
+    else:
+        dec_as = np.ones(len(b1), dtype=np.int64)
+
+    if mq_edges.size > 0:
+        dec_mq = np.clip(
+            np.searchsorted(mq_edges, mq1_arr, side="left") + 1, 1, k
+        ).astype(np.int64)
+    else:
+        dec_mq = np.ones(len(b1), dtype=np.int64)
+
+    # Vectorized p-values via tail_p_batch
+    p_as_arr = np.full(len(dAS_arr), np.nan)
+    p_mq_arr = np.full(len(dMQ_arr), np.nan)
+    for d_val in range(1, k + 1):
+        mask = (dec_as == d_val) & np.isfinite(dAS_arr)
+        if mask.any():
+            p_as_arr[mask] = H_dAS[d_val - 1].tail_p_batch(dAS_arr[mask])
+        mask = (dec_mq == d_val) & np.isfinite(dMQ_arr)
+        if mask.any():
+            p_mq_arr[mask] = H_dMQ[d_val - 1].tail_p_batch(dMQ_arr[mask])
+
+    has_best2 = ~np.isnan(as2_arr)
+    klass_arr = np.where(
+        (np.isfinite(p_as_arr) & (p_as_arr <= alpha))
+        | (np.isfinite(p_mq_arr) & (p_mq_arr <= alpha))
+        | (np.isfinite(dNM_arr) & (dNM_arr > 0))
+        | ~has_best2,
+        "winner",
+        "ambiguous",
+    )
+
+    read_idx = b1.index.get_level_values("Read")
+    bc_idx = b1.index.get_level_values("BC")
+
+    raw_df = pd.DataFrame({
+        "Read":                 read_idx,
+        "BC":                   bc_idx,
+        "Genome_winner":        b1["Genome"].values,
+        "AS_winner":            as1_arr.astype(np.float32),
+        "MAPQ_winner":          mq1_arr.astype(np.float32),
+        "NM_winner":            nm1_arr.astype(np.float32),
+        "Genome_2":             b1["Genome_2"].fillna("").values,
+        "AS_2":                 as2_arr.astype(np.float32),
+        "MAPQ_2":               mq2_arr.astype(np.float32),
+        "NM_2":                 nm2_arr.astype(np.float32),
+        "Genome_last":          b1["Genome_last"].fillna("").values,
+        "AS_last":              b1["as_last"].values.astype(np.float32),
+        "MAPQ_last":            b1["MAPQ_last"].values.astype(np.float32),
+        "NM_last":              b1["NM_last"].values.astype(np.float32),
+        "delta_AS_1_2":         dAS_arr.astype(np.float32),
+        "delta_MAPQ_1_2":       dMQ_arr.astype(np.float32),
+        "delta_NM_1_2":         dNM_arr.astype(np.float32),
+        "n_genomes_considered": b1["n_genomes"].values.astype(np.int32),
+        "decile_AS":            dec_as.astype(np.int16),
+        "decile_MAPQ":          dec_mq.astype(np.int16),
+        "p_as":                 p_as_arr.astype(np.float32),
+        "p_mq":                 p_mq_arr.astype(np.float32),
+        "assigned_class":       klass_arr,
+    })
+    raw_df.to_csv(raw_out, sep="\t", index=False, compression="gzip")
+
+    # Build winner_df + p-value Series for filtered output
+    win_mask = klass_arr == "winner"
+    wb1 = b1[win_mask]
+    p_as_s = pd.Series(p_as_arr, index=b1.index)
+    p_mq_s = pd.Series(p_mq_arr, index=b1.index)
+
+    winner_df = pd.DataFrame({
+        "Read":           wb1.index.get_level_values("Read"),
+        "BC":             wb1.index.get_level_values("BC"),
+        "Genome":         wb1["Genome"].values,
+        "AS":             wb1["as_"].values.astype(np.float32),
+        "MAPQ":           wb1["MAPQ"].values.astype(np.float32),
+        "NM":             wb1["NM"].values.astype(np.float32),
+        "XAcount":        wb1["XAcount"].values.astype(np.float32),
+        "assigned_class": "winner",
+        "p_as":           p_as_s[win_mask].values.astype(np.float32),
+        "p_mq":           p_mq_s[win_mask].values.astype(np.float32),
+    })
+
+    ambiguous_bcs = set(bc_idx[klass_arr == "ambiguous"].tolist())
+    n_reads = len(b1)
+    n_winner = int(win_mask.sum())
+    n_ambig = n_reads - n_winner
+
+    return winner_df, p_as_s, p_mq_s, ambiguous_bcs, n_reads, n_winner, n_ambig
+
+
+def _write_chunk_filtered(
+    winner_df: "pd.DataFrame",
+    ambig_raw: "pd.DataFrame",
+    p_as_s: "pd.Series",
+    p_mq_s: "pd.Series",
+    filt_out: Path,
+) -> None:
+    """Write filtered output from winner + ambiguous DataFrames."""
+    if not ambig_raw.empty:
+        ambig_idx = pd.MultiIndex.from_arrays(
+            [ambig_raw["Read"].values, ambig_raw["BC"].values]
+        )
+        ambig_df = ambig_raw.rename(columns={"as_": "AS"}).copy()
+        ambig_df["assigned_class"] = "ambiguous"
+        ambig_df["p_as"] = p_as_s.reindex(ambig_idx).values.astype(np.float32)
+        ambig_df["p_mq"] = p_mq_s.reindex(ambig_idx).values.astype(np.float32)
+        ambig_df = ambig_df[["Read", "BC", "Genome", "AS", "MAPQ", "NM",
+                              "XAcount", "assigned_class", "p_as", "p_mq"]]
+    else:
+        ambig_df = pd.DataFrame(columns=winner_df.columns)
+
+    out_df = pd.concat([winner_df, ambig_df], ignore_index=True)
+    out_df.to_csv(filt_out, sep="\t", index=False, compression="gzip")
+
+
+# -----------------------------
 # Pass C: score one chunk (single-pass + streaming output)
 # -----------------------------
 @app.command()
@@ -1339,150 +1538,26 @@ def score_chunk(
             pd.DataFrame().to_csv(raw_out, sep="\t", index=False, compression="gzip")
             pd.DataFrame().to_csv(filt_out, sep="\t", index=False, compression="gzip")
             _log_ok(f"[assign/score] ■ empty chunk → wrote empty outputs", verbose)
-            return
+            return {"chunk": chunk_file.name, "reads": 0, "winner": 0,
+                    "ambig": 0, "ambig_bcs": 0, "elapsed": time.time() - t0}
 
-        best1 = (top3_df[top3_df["_rn"] == 1]
-                 .drop_duplicates(["Read", "BC"])
-                 .set_index(["Read", "BC"]))
-        best2 = (top3_df[top3_df["_rn"] == 2]
-                 .drop_duplicates(["Read", "BC"])
-                 .set_index(["Read", "BC"]))
-        worst = (top3_df[top3_df["_rn_worst"] == 1]
-                 .drop_duplicates(["Read", "BC"])
-                 .set_index(["Read", "BC"]))
-
-        b1 = best1.join(
-            best2[["Genome", "as_", "MAPQ", "NM"]].rename(
-                columns={"Genome": "Genome_2", "as_": "as_2", "MAPQ": "MAPQ_2", "NM": "NM_2"}
-            ),
-            how="left",
-        ).join(
-            worst[["Genome", "as_", "MAPQ", "NM"]].rename(
-                columns={"Genome": "Genome_last", "as_": "as_last", "MAPQ": "MAPQ_last", "NM": "NM_last"}
-            ),
-            how="left",
-        )
-
-        as1_arr = b1["as_"].values.astype(np.float64)
-        mq1_arr = b1["MAPQ"].values.astype(np.float64)
-        nm1_arr = b1["NM"].values.astype(np.float64)
-        as2_arr = b1["as_2"].values.astype(np.float64)
-        mq2_arr = b1["MAPQ_2"].values.astype(np.float64)
-        nm2_arr = b1["NM_2"].values.astype(np.float64)
-
-        dAS_arr = as1_arr - as2_arr
-        dMQ_arr = mq1_arr - mq2_arr
-        dNM_arr = nm2_arr - nm1_arr
-
-        if as_edges.size > 0:
-            dec_as = np.clip(
-                np.searchsorted(as_edges, as1_arr, side="left") + 1, 1, k
-            ).astype(np.int64)
-        else:
-            dec_as = np.ones(len(b1), dtype=np.int64)
-
-        if mq_edges.size > 0:
-            dec_mq = np.clip(
-                np.searchsorted(mq_edges, mq1_arr, side="left") + 1, 1, k
-            ).astype(np.int64)
-        else:
-            dec_mq = np.ones(len(b1), dtype=np.int64)
-
-        # p-value loop — O(N_reads), not O(N_reads × G_genomes)
-        p_as_arr = np.array(
-            [H_dAS[int(d) - 1].tail_p(float(v)) if np.isfinite(v) else np.nan
-             for v, d in zip(dAS_arr, dec_as)],
-            dtype=np.float64,
-        )
-        p_mq_arr = np.array(
-            [H_dMQ[int(d) - 1].tail_p(float(v)) if np.isfinite(v) else np.nan
-             for v, d in zip(dMQ_arr, dec_mq)],
-            dtype=np.float64,
-        )
-
-        has_best2 = ~np.isnan(as2_arr)
-        klass_arr = np.where(
-            (np.isfinite(p_as_arr) & (p_as_arr <= alpha))
-            | (np.isfinite(p_mq_arr) & (p_mq_arr <= alpha))
-            | (np.isfinite(dNM_arr) & (dNM_arr > 0))
-            | ~has_best2,
-            "winner",
-            "ambiguous",
-        )
-
-        read_idx = b1.index.get_level_values("Read")
-        bc_idx   = b1.index.get_level_values("BC")
-
-        raw_df = pd.DataFrame({
-            "Read":                 read_idx,
-            "BC":                   bc_idx,
-            "Genome_winner":        b1["Genome"].values,
-            "AS_winner":            as1_arr.astype(np.float32),
-            "MAPQ_winner":          mq1_arr.astype(np.float32),
-            "NM_winner":            nm1_arr.astype(np.float32),
-            "Genome_2":             b1["Genome_2"].fillna("").values,
-            "AS_2":                 as2_arr.astype(np.float32),
-            "MAPQ_2":               mq2_arr.astype(np.float32),
-            "NM_2":                 nm2_arr.astype(np.float32),
-            "Genome_last":          b1["Genome_last"].fillna("").values,
-            "AS_last":              b1["as_last"].values.astype(np.float32),
-            "MAPQ_last":            b1["MAPQ_last"].values.astype(np.float32),
-            "NM_last":              b1["NM_last"].values.astype(np.float32),
-            "delta_AS_1_2":         dAS_arr.astype(np.float32),
-            "delta_MAPQ_1_2":       dMQ_arr.astype(np.float32),
-            "delta_NM_1_2":         dNM_arr.astype(np.float32),
-            "n_genomes_considered": b1["n_genomes"].values.astype(np.int32),
-            "decile_AS":            dec_as.astype(np.int16),
-            "decile_MAPQ":          dec_mq.astype(np.int16),
-            "p_as":                 p_as_arr.astype(np.float32),
-            "p_mq":                 p_mq_arr.astype(np.float32),
-            "assigned_class":       klass_arr,
-        })
-        raw_df.to_csv(raw_out, sep="\t", index=False, compression="gzip")
-
-        # Filtered output: winners from b1; ambiguous via lazy Query 2
-        win_mask = klass_arr == "winner"
-        wb1 = b1[win_mask]
-        p_as_s = pd.Series(p_as_arr, index=b1.index)
-        p_mq_s = pd.Series(p_mq_arr, index=b1.index)
-
-        winner_df = pd.DataFrame({
-            "Read":           wb1.index.get_level_values("Read"),
-            "BC":             wb1.index.get_level_values("BC"),
-            "Genome":         wb1["Genome"].values,
-            "AS":             wb1["as_"].values.astype(np.float32),
-            "MAPQ":           wb1["MAPQ"].values.astype(np.float32),
-            "NM":             wb1["NM"].values.astype(np.float32),
-            "XAcount":        wb1["XAcount"].values.astype(np.float32),
-            "assigned_class": "winner",
-            "p_as":           p_as_s[win_mask].values.astype(np.float32),
-            "p_mq":           p_mq_s[win_mask].values.astype(np.float32),
-        })
-
-        ambiguous_bcs_d = set(bc_idx[klass_arr == "ambiguous"].tolist())
-        ambig_raw = lazy_ambig(ambiguous_bcs_d)
-        if not ambig_raw.empty:
-            ambig_idx = pd.MultiIndex.from_arrays(
-                [ambig_raw["Read"].values, ambig_raw["BC"].values]
+        winner_df, p_as_s, p_mq_s, ambiguous_bcs_d, n_reads, n_winner, n_ambig = (
+            _classify_chunk_top3(
+                top3_df, as_edges, mq_edges, H_dAS, H_dMQ, k, alpha, raw_out,
             )
-            ambig_df = ambig_raw.rename(columns={"as_": "AS"}).copy()
-            ambig_df["assigned_class"] = "ambiguous"
-            ambig_df["p_as"] = p_as_s.reindex(ambig_idx).values.astype(np.float32)
-            ambig_df["p_mq"] = p_mq_s.reindex(ambig_idx).values.astype(np.float32)
-            ambig_df = ambig_df[["Read", "BC", "Genome", "AS", "MAPQ", "NM",
-                                  "XAcount", "assigned_class", "p_as", "p_mq"]]
-        else:
-            ambig_df = pd.DataFrame(columns=winner_df.columns)
-
-        out_df = pd.concat([winner_df, ambig_df], ignore_index=True)
-        out_df.to_csv(filt_out, sep="\t", index=False, compression="gzip")
+        )
+        ambig_raw = lazy_ambig(ambiguous_bcs_d)
+        _write_chunk_filtered(winner_df, ambig_raw, p_as_s, p_mq_s, filt_out)
 
         _log_ok(
             f"[assign/score] ■ done {chunk_file.name} ({time.time()-t0:0.1f}s) "
-            f"[duckdb] raw={raw_out.name} filt={filt_out.name}",
+            f"[duckdb] reads={n_reads:,} winner={n_winner:,} ambig={n_ambig:,} "
+            f"ambig_bcs={len(ambiguous_bcs_d):,}",
             verbose,
         )
-        return
+        return {"chunk": chunk_file.name, "reads": n_reads, "winner": n_winner,
+                "ambig": n_ambig, "ambig_bcs": len(ambiguous_bcs_d),
+                "elapsed": time.time() - t0}
 
     if use_duckdb and not _HAS_DUCKDB:
         _log_err("[assign/score] duckdb not installed — falling back to Python path", True)
@@ -1507,7 +1582,8 @@ def score_chunk(
         pd.DataFrame().to_csv(raw_out, sep="\t", index=False, compression="gzip")
         pd.DataFrame().to_csv(filt_out, sep="\t", index=False, compression="gzip")
         _log_ok(f"[assign/score] ■ empty chunk → wrote empty outputs", verbose)
-        return
+        return {"chunk": chunk_file.name, "reads": 0, "winner": 0,
+                "ambig": 0, "ambig_bcs": 0, "elapsed": time.time() - t0}
 
     # Build raw summary table using per-column lists (avoids dict-per-row overhead)
     col_read: list[str] = []
@@ -1681,7 +1757,184 @@ def score_chunk(
     })
     out_df.to_csv(filt_out, sep="\t", index=False, compression="gzip")
 
-    _log_ok(f"[assign/score] ■ done {chunk_file.name} ({time.time()-t0:0.1f}s) raw={raw_out.name} filt={filt_out.name}", verbose)
+    n_reads = len(col_klass)
+    n_winner = sum(1 for v in col_klass if v == "winner")
+    n_ambig = n_reads - n_winner
+    n_ambig_bcs = len(ambiguous_bcs) if ambiguous_bcs else 0
+
+    _log_ok(
+        f"[assign/score] ■ done {chunk_file.name} ({time.time()-t0:0.1f}s) "
+        f"reads={n_reads:,} winner={n_winner:,} ambig={n_ambig:,} "
+        f"ambig_bcs={n_ambig_bcs:,}",
+        verbose,
+    )
+    return {"chunk": chunk_file.name, "reads": n_reads, "winner": n_winner,
+            "ambig": n_ambig, "ambig_bcs": n_ambig_bcs,
+            "elapsed": time.time() - t0}
+
+
+# -----------------------------
+# Pass C: batched scoring (multiple chunks per DuckDB scan)
+# -----------------------------
+
+def score_chunks_batched(
+    workdir: Path,
+    sample: str,
+    chunk_files: list,
+    ecdf_model: Path,
+    out_raw_dir: Path,
+    out_filtered_dir: Path,
+    mapq_min: int,
+    xa_max: int,
+    chunksize: int,
+    alpha: float,
+    duckdb_threads: int,
+    verbose: bool,
+) -> list:
+    """
+    Score multiple chunk files in a single DuckDB scan.
+
+    Instead of opening one DuckDB connection per chunk (each reading ALL genome
+    files), this batches N chunks: union their BCs, one query, split results.
+    Reduces file scans from N*G to G (G = number of genomes).
+
+    Returns list of per-chunk stats dicts.
+    """
+    t_batch = time.time()
+    files = _filtered_files(workdir, sample)
+    k, as_edges, mq_edges, H_dAS, H_dMQ = _load_ecdf_model(ecdf_model)
+
+    out_raw_dir.mkdir(parents=True, exist_ok=True)
+    out_filtered_dir.mkdir(parents=True, exist_ok=True)
+
+    # Collect BCs per chunk, build union set
+    chunk_bc_map: dict[Path, set] = {}
+    all_bcs: set = set()
+    for chf in chunk_files:
+        bcs = _chunk_bcs(chf)
+        chunk_bc_map[chf] = bcs
+        all_bcs.update(bcs)
+
+    _log(
+        f"[assign/score-batch] ▶ {len(chunk_files)} chunks, "
+        f"BCs={len(all_bcs):,} (union)",
+        verbose,
+    )
+
+    # Single DuckDB query for the entire batch
+    top3_df, lazy_ambig = _score_chunk_duckdb(
+        files, all_bcs, mapq_min, xa_max, duckdb_threads
+    )
+
+    if top3_df.empty:
+        # All chunks empty — write empty outputs
+        stats = []
+        for chf in chunk_files:
+            tag = chf.stem
+            suff = tag.split("_cell_map_ref_chunk_")[-1] if "_cell_map_ref_chunk_" in tag else tag
+            base = f"{sample}_chunk{suff}"
+            raw_out = out_raw_dir / f"{base}_raw.tsv.gz"
+            filt_out = out_filtered_dir / f"{base}_filtered.tsv.gz"
+            pd.DataFrame().to_csv(raw_out, sep="\t", index=False, compression="gzip")
+            pd.DataFrame().to_csv(filt_out, sep="\t", index=False, compression="gzip")
+            stats.append({"chunk": chf.name, "reads": 0, "winner": 0,
+                          "ambig": 0, "ambig_bcs": 0, "elapsed": 0.0})
+        _log_ok(f"[assign/score-batch] ■ empty batch → wrote empty outputs", verbose)
+        return stats
+
+    # Index top3_df by BC for fast per-chunk filtering
+    top3_bc_values = top3_df["BC"].values
+
+    # Phase 1: classify each chunk, collect ambiguous BCs across batch
+    chunk_intermediates = []
+    all_ambig_bcs: set = set()
+
+    for chf in chunk_files:
+        t0 = time.time()
+        bcs = chunk_bc_map[chf]
+        tag = chf.stem
+        suff = tag.split("_cell_map_ref_chunk_")[-1] if "_cell_map_ref_chunk_" in tag else tag
+        base = f"{sample}_chunk{suff}"
+        raw_out = out_raw_dir / f"{base}_raw.tsv.gz"
+        filt_out = out_filtered_dir / f"{base}_filtered.tsv.gz"
+
+        # Filter top3_df to this chunk's BCs
+        mask = np.isin(top3_bc_values, list(bcs))
+        chunk_top3 = top3_df[mask]
+
+        if chunk_top3.empty:
+            pd.DataFrame().to_csv(raw_out, sep="\t", index=False, compression="gzip")
+            pd.DataFrame().to_csv(filt_out, sep="\t", index=False, compression="gzip")
+            chunk_intermediates.append(None)
+            _log_ok(
+                f"[assign/score] ■ done {chf.name} ({time.time()-t0:0.1f}s) "
+                f"[duckdb-batch] reads=0 winner=0 ambig=0 ambig_bcs=0",
+                verbose,
+            )
+            continue
+
+        winner_df, p_as_s, p_mq_s, ambiguous_bcs_d, n_reads, n_winner, n_ambig = (
+            _classify_chunk_top3(
+                chunk_top3, as_edges, mq_edges, H_dAS, H_dMQ, k, alpha, raw_out,
+            )
+        )
+        all_ambig_bcs.update(ambiguous_bcs_d)
+        chunk_intermediates.append(
+            (chf, winner_df, p_as_s, p_mq_s, ambiguous_bcs_d,
+             n_reads, n_winner, n_ambig, filt_out, t0)
+        )
+
+    # Phase 2: single lazy_ambig call for ALL ambiguous BCs across batch
+    ambig_raw_all = lazy_ambig(all_ambig_bcs)
+    # Free DuckDB connection (lazy_ambig closure holds it)
+    del lazy_ambig
+
+    # Index by BC for fast per-chunk filtering
+    if not ambig_raw_all.empty:
+        ambig_bc_values = ambig_raw_all["BC"].values
+    else:
+        ambig_bc_values = np.array([], dtype=object)
+
+    # Phase 3: write filtered outputs per chunk
+    stats = []
+    for i, chf in enumerate(chunk_files):
+        inter = chunk_intermediates[i]
+        if inter is None:
+            stats.append({"chunk": chf.name, "reads": 0, "winner": 0,
+                          "ambig": 0, "ambig_bcs": 0, "elapsed": 0.0})
+            continue
+
+        (chf_, winner_df, p_as_s, p_mq_s, ambiguous_bcs_d,
+         n_reads, n_winner, n_ambig, filt_out, t0) = inter
+
+        # Filter ambig results to this chunk's ambiguous BCs
+        if ambiguous_bcs_d and not ambig_raw_all.empty:
+            amask = np.isin(ambig_bc_values, list(ambiguous_bcs_d))
+            chunk_ambig = ambig_raw_all[amask]
+        else:
+            chunk_ambig = pd.DataFrame(
+                columns=["Read", "BC", "Genome", "as_", "MAPQ", "NM", "XAcount"]
+            )
+
+        _write_chunk_filtered(winner_df, chunk_ambig, p_as_s, p_mq_s, filt_out)
+
+        elapsed = time.time() - t0
+        _log_ok(
+            f"[assign/score] ■ done {chf_.name} ({elapsed:0.1f}s) "
+            f"[duckdb-batch] reads={n_reads:,} winner={n_winner:,} ambig={n_ambig:,} "
+            f"ambig_bcs={len(ambiguous_bcs_d):,}",
+            verbose,
+        )
+        stats.append({"chunk": chf_.name, "reads": n_reads, "winner": n_winner,
+                       "ambig": n_ambig, "ambig_bcs": len(ambiguous_bcs_d),
+                       "elapsed": elapsed})
+
+    _log_ok(
+        f"[assign/score-batch] ■ batch done ({time.time()-t_batch:0.1f}s) "
+        f"{len(chunk_files)} chunks, {sum(s['reads'] for s in stats):,} reads",
+        verbose,
+    )
+    return stats
 
 
 # -----------------------------

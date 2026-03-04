@@ -6,6 +6,7 @@ import csv
 import glob
 import hashlib
 import json
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -191,6 +192,7 @@ def _apply_assign_overrides(
     ecdf_subsample: Optional[int] = None,
     ecdf_duckdb: Optional[bool] = None,
     ecdf_duckdb_threads: Optional[int] = None,
+    score_batch_size: Optional[int] = None,
 ) -> None:
     """Ensure cfg['assign'] exists and apply CLI overrides if provided."""
     assign = cfg.get("assign")
@@ -229,6 +231,8 @@ def _apply_assign_overrides(
         assign["ecdf_duckdb"] = bool(ecdf_duckdb)
     if ecdf_duckdb_threads is not None:
         assign["ecdf_duckdb_threads"] = int(ecdf_duckdb_threads)
+    if score_batch_size is not None:
+        assign["score_batch_size"] = int(score_batch_size)
 
 
 def _ensure_minimal_chunk(workdir: Path, sample: str) -> None:
@@ -493,11 +497,16 @@ def assign(
         "--ecdf-duckdb-threads",
         help="DuckDB threads for Pass B ECDF learning (default: 4).",
     ),
+    score_batch_size: Optional[int] = typer.Option(
+        None,
+        "--score-batch-size",
+        help="Batch N chunks per DuckDB scan in Pass C (default: 50). Reduces file I/O by ~Nx. 0 = no batching.",
+    ),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
     resume: bool = typer.Option(True, "--resume/--no-resume"),
 ) -> None:
     """Learn edges/ECDFs and score each chunk (parallel)."""
-    from .assign_streaming import learn_edges, learn_ecdfs, score_chunk
+    from .assign_streaming import learn_edges, learn_ecdfs, score_chunk, score_chunks_batched
 
     if only_score:
         skip_edges = True
@@ -525,6 +534,7 @@ def assign(
             ecdf_subsample=ecdf_subsample,
             ecdf_duckdb=ecdf_duckdb,
             ecdf_duckdb_threads=ecdf_duckdb_threads,
+            score_batch_size=score_batch_size,
         )
 
         workdir = Path(str(cfg["workdir"]))
@@ -558,6 +568,8 @@ def assign(
         ecdf_subsample_eff = int(aconf.get("ecdf_subsample", 50_000))
         ecdf_duckdb_eff = bool(aconf.get("ecdf_duckdb", True))
         ecdf_duckdb_threads_eff = int(aconf.get("ecdf_duckdb_threads", 4))
+
+        score_batch_size_eff = int(aconf.get("score_batch_size", 50))
 
         # NOTE: sentinel should not gate partial runs; only gate full runs.
         params = {
@@ -621,6 +633,7 @@ def assign(
                 + (" [skip-edges]" if (skip_edges and not only_score) else "")
                 + (" [skip-ecdf]" if (skip_ecdf and not only_score) else "")
                 + f" score_workers={score_workers_eff}"
+                + (f" score_batch_size={score_batch_size_eff}" if score_duckdb_eff and score_batch_size_eff > 0 else "")
             )
 
         # (1) edges
@@ -668,29 +681,100 @@ def assign(
                 typer.echo(f"[assign/ecdf] skip: reuse {ecdf_npz}")
 
         # (3) score chunks
-        typer.echo(f"[assign/score] {sample}: start {len(chunk_files)} chunks, procs={pool_n}")
-        with ProcessPoolExecutor(max_workers=pool_n) as ex:
-            fut = {
-                ex.submit(
-                    score_chunk,
-                    workdir=workdir,
-                    sample=sample,
-                    chunk_file=chf,
-                    ecdf_model=ecdf_npz,
-                    out_raw_dir=None,
-                    out_filtered_dir=None,
-                    mapq_min=mapq_min_eff,
-                    xa_max=xa_max_eff,
-                    chunksize=chunksize_val,
-                    alpha=alpha_eff,
-                    use_duckdb=score_duckdb_eff,
-                    duckdb_threads=duckdb_threads_eff,
-                    verbose=verbose,
-                ): chf
-                for chf in chunk_files
-            }
-            for f in as_completed(fut):
-                f.result()
+        from .assign_streaming import _batched
+        use_batch = score_duckdb_eff and score_batch_size_eff > 0
+
+        out_raw_dir = workdir / sample / "raw_cell_map_ref_chunks"
+        out_filtered_dir = workdir / sample / "cell_map_ref_chunks"
+
+        if use_batch:
+            batches = list(_batched(chunk_files, score_batch_size_eff))
+            typer.echo(
+                f"[assign/score] {sample}: start {len(chunk_files)} chunks "
+                f"in {len(batches)} batches (batch_size={score_batch_size_eff}), procs={pool_n}"
+            )
+            t_score = time.time()
+            all_stats: list = []
+            with ProcessPoolExecutor(max_workers=pool_n) as ex:
+                fut = {
+                    ex.submit(
+                        score_chunks_batched,
+                        workdir=workdir,
+                        sample=sample,
+                        chunk_files=list(batch),
+                        ecdf_model=ecdf_npz,
+                        out_raw_dir=out_raw_dir,
+                        out_filtered_dir=out_filtered_dir,
+                        mapq_min=mapq_min_eff,
+                        xa_max=xa_max_eff,
+                        chunksize=chunksize_val,
+                        alpha=alpha_eff,
+                        duckdb_threads=duckdb_threads_eff,
+                        verbose=verbose,
+                    ): batch
+                    for batch in batches
+                }
+                done_chunks = 0
+                for f in as_completed(fut):
+                    batch_stats = f.result()
+                    all_stats.extend(batch_stats)
+                    done_chunks += len(batch_stats)
+                    typer.echo(
+                        f"[assign/score] {sample}: {done_chunks}/{len(chunk_files)} chunks done"
+                    )
+            elapsed_score = time.time() - t_score
+            total_reads = sum(s["reads"] for s in all_stats)
+            total_winner = sum(s["winner"] for s in all_stats)
+            total_ambig = sum(s["ambig"] for s in all_stats)
+            total_ambig_bcs = sum(s["ambig_bcs"] for s in all_stats)
+            typer.echo(
+                f"[assign/score] {sample}: finished {len(chunk_files)} chunks in {elapsed_score:.1f}s "
+                f"({total_reads:,} reads, {total_winner:,} winner, {total_ambig:,} ambig, "
+                f"{total_ambig_bcs:,} ambig_bcs)"
+            )
+        else:
+            typer.echo(f"[assign/score] {sample}: start {len(chunk_files)} chunks, procs={pool_n}")
+            t_score = time.time()
+            all_stats = []
+            with ProcessPoolExecutor(max_workers=pool_n) as ex:
+                fut = {
+                    ex.submit(
+                        score_chunk,
+                        workdir=workdir,
+                        sample=sample,
+                        chunk_file=chf,
+                        ecdf_model=ecdf_npz,
+                        out_raw_dir=None,
+                        out_filtered_dir=None,
+                        mapq_min=mapq_min_eff,
+                        xa_max=xa_max_eff,
+                        chunksize=chunksize_val,
+                        alpha=alpha_eff,
+                        use_duckdb=score_duckdb_eff,
+                        duckdb_threads=duckdb_threads_eff,
+                        verbose=verbose,
+                    ): chf
+                    for chf in chunk_files
+                }
+                done_chunks = 0
+                for f in as_completed(fut):
+                    result = f.result()
+                    if isinstance(result, dict):
+                        all_stats.append(result)
+                    done_chunks += 1
+                    typer.echo(
+                        f"[assign/score] {sample}: {done_chunks}/{len(chunk_files)} chunks done"
+                    )
+            elapsed_score = time.time() - t_score
+            total_reads = sum(s["reads"] for s in all_stats)
+            total_winner = sum(s["winner"] for s in all_stats)
+            total_ambig = sum(s["ambig"] for s in all_stats)
+            total_ambig_bcs = sum(s["ambig_bcs"] for s in all_stats)
+            typer.echo(
+                f"[assign/score] {sample}: finished {len(chunk_files)} chunks in {elapsed_score:.1f}s "
+                f"({total_reads:,} reads, {total_winner:,} winner, {total_ambig:,} ambig, "
+                f"{total_ambig_bcs:,} ambig_bcs)"
+            )
 
         # Only write an assign sentinel for FULL runs (so it remains meaningful).
         if (not skip_edges) and (not skip_ecdf):
@@ -971,6 +1055,7 @@ def run(
     assign_ecdf_subsample: Optional[int] = typer.Option(None, "--assign-ecdf-subsample"),
     assign_ecdf_duckdb: Optional[bool] = typer.Option(None, "--assign-ecdf-duckdb/--assign-ecdf-no-duckdb"),
     assign_ecdf_duckdb_threads: Optional[int] = typer.Option(None, "--assign-ecdf-duckdb-threads"),
+    assign_score_batch_size: Optional[int] = typer.Option(None, "--assign-score-batch-size"),
     # genotyping overrides
     genotyping_min_reads: Optional[int] = typer.Option(None, "--genotyping-min-reads"),
     genotyping_beta: Optional[float] = typer.Option(None, "--genotyping-beta"),
@@ -1082,6 +1167,7 @@ def run(
             ecdf_subsample=assign_ecdf_subsample,
             ecdf_duckdb=assign_ecdf_duckdb,
             ecdf_duckdb_threads=assign_ecdf_duckdb_threads,
+            score_batch_size=assign_score_batch_size,
         )
 
         params = {

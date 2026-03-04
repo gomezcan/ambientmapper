@@ -864,6 +864,7 @@ Pass via JSON (`assign` block) or CLI prefix (`--assign-*`) when using `ambientm
 | `assign.ecdf_subsample` / `--assign-ecdf-subsample` | `50000` | Subsample N barcodes for Pass B ECDF learning (0 = all). Dramatically reduces I/O for large experiments. |
 | `assign.ecdf_duckdb` / `--assign-ecdf-duckdb` | `true` | Use DuckDB for Pass B ECDF learning. Falls back to Python if duckdb unavailable. |
 | `assign.ecdf_duckdb_threads` / `--assign-ecdf-duckdb-threads` | `4` | DuckDB threads for Pass B ECDF learning. |
+| `assign.score_batch_size` / `--assign-score-batch-size` | `50` | Batch N chunks per DuckDB scan in Pass C. Reduces file I/O by ~Nx. 0 = no batching (one chunk per scan). |
 
 **Standalone assign sub-flags** (when calling `ambientmapper assign` directly):
 

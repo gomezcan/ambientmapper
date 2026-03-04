@@ -197,7 +197,7 @@ def _run_chunks(ctx: Ctx) -> None:
     _ = make_barcode_chunks(d["filtered"], d["chunks"], cfg["sample"], int(cfg.get("chunk_size_cells", 5000)))
 
 def _run_assign(ctx: Ctx) -> None:
-    from .assign_streaming import learn_edges, learn_ecdfs, score_chunk
+    from .assign_streaming import learn_edges, learn_ecdfs, score_chunk, score_chunks_batched, _batched
     cfg = ctx.cfg; d = ctx.dirs
     workdir = Path(cfg["workdir"]); sample = cfg["sample"]
     chunks_dir = d["chunks"]
@@ -258,21 +258,65 @@ def _run_assign(ctx: Ctx) -> None:
 
     score_duckdb_eff   = bool(aconf.get("score_duckdb", True))
     duckdb_threads_eff = int(aconf.get("duckdb_threads", 2))
+    score_batch_size   = int(aconf.get("score_batch_size", 50))
 
     pool_n = max(1, min(threads, len(chunk_files)))
-    with ProcessPoolExecutor(max_workers=pool_n) as ex:
-        fut = {
-            ex.submit(
-                score_chunk,
-                workdir=workdir, sample=sample, chunk_file=chf, ecdf_model=ecdf_npz,
-                out_raw_dir=None, out_filtered_dir=None,
-                mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize_val, alpha=alpha,
-                use_duckdb=score_duckdb_eff, duckdb_threads=duckdb_threads_eff,
-            ): chf
-            for chf in chunk_files
-        }
-        for f in as_completed(fut):
-            f.result()
+    use_batch = score_duckdb_eff and score_batch_size > 0
+
+    out_raw_dir = workdir / sample / "raw_cell_map_ref_chunks"
+    out_filtered_dir = workdir / sample / "cell_map_ref_chunks"
+
+    if use_batch:
+        batches = list(_batched(chunk_files, score_batch_size))
+        typer.echo(
+            f"[assign/score] {sample}: start {len(chunk_files)} chunks "
+            f"in {len(batches)} batches (batch_size={score_batch_size}), procs={pool_n}"
+        )
+        t_score = time.time()
+        all_stats = []
+        with ProcessPoolExecutor(max_workers=pool_n) as ex:
+            fut = {
+                ex.submit(
+                    score_chunks_batched,
+                    workdir=workdir, sample=sample, chunk_files=list(batch),
+                    ecdf_model=ecdf_npz,
+                    out_raw_dir=out_raw_dir, out_filtered_dir=out_filtered_dir,
+                    mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize_val, alpha=alpha,
+                    duckdb_threads=duckdb_threads_eff, verbose=verbose,
+                ): batch
+                for batch in batches
+            }
+            done_chunks = 0
+            for f in as_completed(fut):
+                batch_stats = f.result()
+                all_stats.extend(batch_stats)
+                done_chunks += len(batch_stats)
+                typer.echo(
+                    f"[assign/score] {sample}: {done_chunks}/{len(chunk_files)} chunks done"
+                )
+        elapsed_score = time.time() - t_score
+        total_reads = sum(s["reads"] for s in all_stats)
+        total_winner = sum(s["winner"] for s in all_stats)
+        total_ambig = sum(s["ambig"] for s in all_stats)
+        typer.echo(
+            f"[assign/score] {sample}: finished {len(chunk_files)} chunks in {elapsed_score:.1f}s "
+            f"({total_reads:,} reads, {total_winner:,} winner, {total_ambig:,} ambig)"
+        )
+    else:
+        pool_n = max(1, min(threads, len(chunk_files)))
+        with ProcessPoolExecutor(max_workers=pool_n) as ex:
+            fut = {
+                ex.submit(
+                    score_chunk,
+                    workdir=workdir, sample=sample, chunk_file=chf, ecdf_model=ecdf_npz,
+                    out_raw_dir=None, out_filtered_dir=None,
+                    mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize_val, alpha=alpha,
+                    use_duckdb=score_duckdb_eff, duckdb_threads=duckdb_threads_eff,
+                ): chf
+                for chf in chunk_files
+            }
+            for f in as_completed(fut):
+                f.result()
 
 def _run_genotyping(ctx: Ctx) -> None:
     from .genotyping import genotyping as _run
