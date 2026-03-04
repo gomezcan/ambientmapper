@@ -851,9 +851,18 @@ def genotyping(
     eta_iters: Optional[int] = typer.Option(None, "--eta-iters"),
     eta_seed_quantile: Optional[float] = typer.Option(None, "--eta-seed-quantile"),
     topk_genomes: Optional[int] = typer.Option(None, "--topk-genomes"),
+    # DuckDB acceleration
+    pass1_duckdb: Optional[bool] = typer.Option(
+        None, "--pass1-duckdb/--pass1-no-duckdb",
+        help="Use DuckDB for Pass 1 file reading (default: on). Falls back if duckdb unavailable.",
+    ),
+    pass2_duckdb: Optional[bool] = typer.Option(
+        None, "--pass2-duckdb/--pass2-no-duckdb",
+        help="Use DuckDB for Pass 2 eta computation (default: on). Falls back if duckdb unavailable.",
+    ),
     resume: bool = typer.Option(True, "--resume/--no-resume"),
 ) -> None:
-    """Posterior-aware genotyping (merge → per-cell genotype calls)."""    
+    """Posterior-aware genotyping (merge → per-cell genotype calls)."""
     from .genotyping import _run_genotyping
 
 
@@ -975,6 +984,11 @@ def genotyping(
     if topk_genomes is not None:
         kwargs["topk_genomes"] = max(1, int(topk_genomes))
 
+    if pass1_duckdb is not None:
+        kwargs["pass1_duckdb"] = bool(pass1_duckdb)
+    if pass2_duckdb is not None:
+        kwargs["pass2_duckdb"] = bool(pass2_duckdb)
+
     # Sentinel for genotyping keyed by actual kwargs (Paths stringified)
     params = {k: (str(v) if isinstance(v, Path) else v) for k, v in kwargs.items()}
     if resume and _has_sentinel(d, "genotyping", cfg, params):
@@ -1092,6 +1106,9 @@ def run(
     # NEW: pass through max-hits filter to genotyping.py
     genotyping_max_hits: Optional[int] = typer.Option(None, "--genotyping-max-hits"),
     genotyping_hits_delta_mapq: Optional[int] = typer.Option(None, "--genotyping-hits-delta-mapq"),
+    # DuckDB acceleration for genotyping
+    genotyping_pass1_duckdb: Optional[bool] = typer.Option(None, "--genotyping-pass1-duckdb/--genotyping-pass1-no-duckdb"),
+    genotyping_pass2_duckdb: Optional[bool] = typer.Option(None, "--genotyping-pass2-duckdb/--genotyping-pass2-no-duckdb"),
 ) -> None:
     """Run the full pipeline."""
     inline_ready = all([sample, genome, bam, workdir])
@@ -1140,6 +1157,9 @@ def run(
         # NEW
         ("max_hits", genotyping_max_hits),
         ("hits_delta_mapq", genotyping_hits_delta_mapq),
+        # DuckDB acceleration
+        ("pass1_duckdb", genotyping_pass1_duckdb),
+        ("pass2_duckdb", genotyping_pass2_duckdb),
     ]:
         if v2 is not None:
             genotyping_conf[k2] = v2

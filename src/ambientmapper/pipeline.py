@@ -368,6 +368,9 @@ def _run_genotyping(ctx: Ctx) -> None:
     if pass1_workers is not None:
         pass1_workers = max(1, int(pass1_workers))
 
+    pass1_duckdb = gconf.get("pass1_duckdb", None)
+    pass2_duckdb = gconf.get("pass2_duckdb", None)
+
     # Log the effective genotyping parameters
     # Log the effective genotyping parameters (single positional argument!)
     msg = (
@@ -399,6 +402,8 @@ def _run_genotyping(ctx: Ctx) -> None:
         ratio_top1_top2_min = ratio_top1_top2_min,
         single_mass_min=single_mass_min,
         doublet_minor_min=doublet_minor_min,
+        pass1_duckdb=pass1_duckdb,
+        pass2_duckdb=pass2_duckdb,
     )
 
 def _run_interpool(ctx: Ctx) -> None:

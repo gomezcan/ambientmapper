@@ -51,6 +51,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterator, Callable
 from pydantic import BaseModel, ConfigDict
 
+try:
+    import duckdb as _duckdb
+    _HAS_DUCKDB = True
+except ImportError:
+    _duckdb = None  # type: ignore
+    _HAS_DUCKDB = False
+
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
 # --------------------------------------------------------------------------------------
@@ -130,6 +137,10 @@ class MergeConfig(BaseModel):
     # Reliability weights (applied to L and L_amb)
     w_confident: float = 1.0
     w_ambiguous: float = 1.0
+
+    # DuckDB acceleration
+    pass1_duckdb: bool = True   # Use DuckDB for Pass 1 file reading + reduction
+    pass2_duckdb: bool = True   # Use DuckDB for Pass 2 eta computation
 
 
 # --------------------------------------------------------------------------------------
@@ -984,27 +995,91 @@ class Pass1Outputs:
     N: pd.DataFrame
 
 
-def _pass1_worker_job(args: Tuple[int, str, Dict[str, Any], str, Optional[Dict[str, int]]]) -> Pass1Outputs:
+def _pass1_read_and_reduce_duckdb(fp: Path) -> pd.DataFrame:
+    """
+    DuckDB fast path: read an assign output TSV(.gz) and perform the
+    _reduce_alignments_to_per_genome() reduction in a single SQL pass.
+
+    Returns a DataFrame with columns:
+      barcode, read_id, genome, AS, MAPQ, NM, assigned_class
+    identical in schema to _coerce_assign_schema() + _reduce_alignments_to_per_genome().
+    """
+    import duckdb
+
+    # Sniff header to handle BC/barcode, Read/read_id, Genome/genome variants
+    opener = gzip.open if str(fp).endswith(".gz") else open
+    with opener(fp, "rt") as f:
+        header = f.readline().strip().split("\t")
+    bc_col = "BC" if "BC" in header else "barcode"
+    read_col = '"Read"' if "Read" in header else "read_id"
+    genome_col = '"Genome"' if "Genome" in header else "genome"
+    # AS is a SQL keyword — always quote it
+    as_col = '"AS"'
+
+    path_str = str(fp).replace("'", "''")
+    compression = "'gzip'" if str(fp).endswith(".gz") else "'none'"
+
+    sql = f"""
+    SELECT
+        CAST({bc_col} AS VARCHAR) AS barcode,
+        CAST({read_col} AS VARCHAR) AS read_id,
+        CAST({genome_col} AS VARCHAR) AS genome,
+        MAX(CAST({as_col} AS FLOAT)) AS "AS",
+        MAX(CAST(MAPQ AS FLOAT)) AS MAPQ,
+        MIN(CAST(NM AS FLOAT)) AS NM,
+        CASE
+            WHEN SUM(CASE WHEN assigned_class = 'ambiguous' THEN 1 ELSE 0 END) > 0
+            THEN 'ambiguous'
+            ELSE FIRST(assigned_class)
+        END AS assigned_class
+    FROM read_csv(
+        '{path_str}',
+        delim='\\t',
+        header=true,
+        compression={compression},
+        ignore_errors=true
+    )
+    GROUP BY {bc_col}, {read_col}, {genome_col}
+    """
+
+    con = duckdb.connect()
+    con.execute("SET threads TO 2")
+    result = con.execute(sql).fetchdf()
+    con.close()
+
+    for col in ["barcode", "read_id", "genome", "assigned_class"]:
+        if col in result.columns:
+            result[col] = result[col].astype("string")
+
+    return result
+
+
+def _pass1_worker_job(args) -> Pass1Outputs:
     """
     Top-level worker so it is picklable by multiprocessing.
-    args: (worker_index, filepath, cfg, shard_root, bc_to_chunk)
+    args: (worker_index, filepath, cfg, shard_root, bc_to_chunk, use_duckdb)
     """
-    i, fp_str, cfg_dict, shard_root_str, bc_to_chunk = args
-    cfg = MergeConfig(**cfg_dict)  
+    i, fp_str, cfg_dict, shard_root_str, bc_to_chunk, use_duckdb = args
+    cfg = MergeConfig(**cfg_dict)
     fp = Path(fp_str)
     shard_root = Path(shard_root_str)
-    wdir = shard_root / f"w{i:03d}"    
-    return _pass1_process_one_file(fp, cfg, wdir, bc_to_chunk)
+    wdir = shard_root / f"w{i:03d}"
+    return _pass1_process_one_file(fp, cfg, wdir, bc_to_chunk, use_duckdb=use_duckdb)
 
-def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path, bc_to_chunk: Optional[Dict[str, int]]) -> Pass1Outputs:
+def _pass1_process_one_file(
+    fp: Path, cfg: MergeConfig, shard_dir: Path,
+    bc_to_chunk: Optional[Dict[str, int]], use_duckdb: bool = False,
+) -> Pass1Outputs:
     """
     Writes per-read posterior rows to shard gzip files under shard_dir.
     FIX: shard files are opened lazily (only if we actually write rows),
          preventing creation of 38-byte empty gzip files.
 
-    CORRECTION (1): carry-over buffer to prevent (barcode, read_id) groups
-    from being split across pandas chunk boundaries before reduction.
-    Assumption for correctness: input is grouped by (barcode, read_id) at least.
+    Two paths:
+    - DuckDB (use_duckdb=True): single SQL query for file read + reduction,
+      then process result in memory-safe chunks.
+    - Python (use_duckdb=False): chunked pandas reader with carry-over buffer
+      to prevent (barcode, read_id) groups from splitting across chunk boundaries.
     """
     shard_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1019,68 +1094,69 @@ def _pass1_process_one_file(fp: Path, cfg: MergeConfig, shard_dir: Path, bc_to_c
         return h
 
     C_parts: List[pd.DataFrame] = []
-    # N_parts removed here; we will compute exact N_all from merged shards (Fix #2)
 
-    carry: Optional[pd.DataFrame] = None
-
-    def _process_block(df_block: pd.DataFrame) -> None:
+    def _posterior_and_shard(df: pd.DataFrame) -> None:
+        """Filter, compute posteriors, accumulate C, write to shards."""
         nonlocal C_parts
-        if df_block is None or df_block.empty:
+        if df is None or df.empty:
             return
-
-        df = _reduce_alignments_to_per_genome(df_block)
-        df = df.dropna(subset=["barcode", "read_id", "genome"])
         df, _ = _filter_promiscuous_ambiguous_reads(df, cfg)
         if df.empty:
             return
-
         Ldf = _compute_read_posteriors(df, cfg)
         if Ldf.empty:
             return
-
         C_parts.append(Ldf.groupby(["barcode", "genome"], sort=False)["L"].sum().rename("C").reset_index())
-
         sid = _route_shards_for_barcodes(Ldf["barcode"], cfg, bc_to_chunk)
         Ldf = Ldf.assign(_sid=sid)
-
-        # Write per shard (avoid creating files for shards with no rows)
         for i in range(cfg.shards):
             sub = Ldf[Ldf["_sid"] == i]
             if sub.empty:
                 continue
             h = _get_handle(i)
-            if not header_written[i]:                
+            if not header_written[i]:
                 h.write("barcode\tread_id\tgenome\tL\tL_amb\tw_read\n")
                 header_written[i] = True
-
             sub2 = sub.drop(columns="_sid")
             sub2 = sub2.sort_values(["barcode", "read_id", "genome"], kind="mergesort")
             sub2.to_csv(h, sep="\t", header=False, index=False)
 
-    for raw in pd.read_csv(fp, sep="\t", chunksize=int(cfg.chunk_rows), low_memory=False):
-        df0 = _coerce_assign_schema(raw)
+    if use_duckdb and _HAS_DUCKDB:
+        # --- DuckDB path: single SQL query for read + reduction ---
+        df_reduced = _pass1_read_and_reduce_duckdb(fp)
+        df_reduced = df_reduced.dropna(subset=["barcode", "read_id", "genome"])
 
-        # Prepend carry-over from previous chunk
+        # Process in memory-safe chunks (no carry-over needed — GROUP BY is complete)
+        chunk_sz = int(cfg.chunk_rows)
+        for start in range(0, len(df_reduced), chunk_sz):
+            block = df_reduced.iloc[start:start + chunk_sz]
+            _posterior_and_shard(block)
+    else:
+        # --- Original pandas chunked path ---
+        carry: Optional[pd.DataFrame] = None
+
+        def _process_block(df_block: pd.DataFrame) -> None:
+            if df_block is None or df_block.empty:
+                return
+            df = _reduce_alignments_to_per_genome(df_block)
+            df = df.dropna(subset=["barcode", "read_id", "genome"])
+            _posterior_and_shard(df)
+
+        for raw in pd.read_csv(fp, sep="\t", chunksize=int(cfg.chunk_rows), low_memory=False):
+            df0 = _coerce_assign_schema(raw)
+            if carry is not None and not carry.empty:
+                df0 = pd.concat([carry, df0], ignore_index=True)
+            if df0.empty:
+                carry = None
+                continue
+            last_bc = str(df0["barcode"].iloc[-1])
+            last_rid = str(df0["read_id"].iloc[-1])
+            mask_carry = (df0["barcode"].astype(str) == last_bc) & (df0["read_id"].astype(str) == last_rid)
+            carry = df0.loc[mask_carry].copy()
+            df_main = df0.loc[~mask_carry].copy()
+            _process_block(df_main)
         if carry is not None and not carry.empty:
-            df0 = pd.concat([carry, df0], ignore_index=True)
-
-        if df0.empty:
-            carry = None
-            continue
-
-        # Carry the last (barcode, read_id) group to the next chunk
-        last_bc = str(df0["barcode"].iloc[-1])
-        last_rid = str(df0["read_id"].iloc[-1])
-        mask_carry = (df0["barcode"].astype(str) == last_bc) & (df0["read_id"].astype(str) == last_rid)
-
-        carry = df0.loc[mask_carry].copy()
-        df_main = df0.loc[~mask_carry].copy()
-
-        _process_block(df_main)
-
-    # Process any remaining carry
-    if carry is not None and not carry.empty:
-        _process_block(carry)
+            _process_block(carry)
 
     for h in handles.values():
         h.close()
@@ -1201,6 +1277,66 @@ def _compute_eta_from_shards(shard_root: Path, target_bcs: Sequence[str], all_ge
     return eta / eta.sum()
 
 
+def _compute_eta_from_shards_duckdb(
+    shard_root: Path,
+    target_bcs: Sequence[str],
+    all_genomes: Sequence[str],
+    cfg: MergeConfig,
+) -> pd.Series:
+    """DuckDB fast path: read all merged shards and aggregate L by genome in one SQL pass."""
+    import duckdb
+    import pyarrow as pa
+
+    target_set = set(map(str, target_bcs))
+    if not target_set:
+        eta = pd.Series({g: 1.0 for g in all_genomes}, dtype=float)
+        return eta / eta.sum()
+
+    merged_glob = str(shard_root / "merged" / "shard_*.tsv.gz").replace("'", "''")
+
+    con = duckdb.connect()
+    con.execute("SET threads TO 4")
+
+    con.register(
+        "_target_bcs",
+        pa.table({"barcode": pa.array(sorted(target_set), type=pa.string())}),
+    )
+
+    sql = f"""
+    SELECT
+        CAST(genome AS VARCHAR) AS genome,
+        SUM(CAST(L AS DOUBLE)) AS L_sum
+    FROM read_csv(
+        '{merged_glob}',
+        delim='\\t',
+        header=true,
+        compression='gzip',
+        columns={{
+            'barcode': 'VARCHAR',
+            'read_id': 'VARCHAR',
+            'genome': 'VARCHAR',
+            'L': 'FLOAT',
+            'L_amb': 'FLOAT',
+            'w_read': 'FLOAT'
+        }}
+    )
+    WHERE barcode IN (SELECT barcode FROM _target_bcs)
+    GROUP BY genome
+    """
+
+    result = con.execute(sql).fetchdf()
+    con.close()
+
+    mix = {g: 0.0 for g in all_genomes}
+    for _, row in result.iterrows():
+        g = str(row["genome"])
+        if g in mix:
+            mix[g] += float(row["L_sum"])
+
+    eta = pd.Series(mix, dtype=float) + 1e-12
+    return eta / eta.sum()
+
+
 def _pick_initial_eta_seed(C_all: pd.DataFrame, N_all: pd.DataFrame, cfg: MergeConfig) -> List[str]:
     if C_all.empty:
         return []
@@ -1273,16 +1409,22 @@ def _learn_eta(
 ) -> Tuple[pd.Series, Dict[str, Any]]:
     meta: Dict[str, Any] = {"iters": int(cfg.eta_iters), "seed_sizes": []}
 
+    _eta_fn = (
+        _compute_eta_from_shards_duckdb
+        if cfg.pass2_duckdb and _HAS_DUCKDB
+        else _compute_eta_from_shards
+    )
+
     seed = _pick_initial_eta_seed(C_all, N_all, cfg)
     meta["seed_sizes"].append(len(seed))
-    eta = _compute_eta_from_shards(shard_root, seed, list(all_genomes), cfg)
+    eta = _eta_fn(shard_root, seed, list(all_genomes), cfg)
 
     for _ in range(int(cfg.eta_iters)):
         seed = _refine_eta_seed_by_jsd(C_all, N_all, eta, cfg)
         meta["seed_sizes"].append(len(seed))
         if not seed:
             break
-        eta = _compute_eta_from_shards(shard_root, seed, list(all_genomes), cfg)
+        eta = _eta_fn(shard_root, seed, list(all_genomes), cfg)
 
     return eta, meta
 
@@ -1444,6 +1586,9 @@ def _run_genotyping(
     eta_iters: Optional[int] = None,
     eta_seed_quantile: Optional[float] = None,
     topk_genomes: Optional[int] = None,
+    # DuckDB acceleration
+    pass1_duckdb: Optional[bool] = None,
+    pass2_duckdb: Optional[bool] = None,
     resume: bool = True,
 ) -> None:
     cfg_json = _read_cfg_json(Path(config))
@@ -1538,6 +1683,10 @@ def _run_genotyping(
         cfg.eta_seed_quantile = float(eta_seed_quantile)
     if topk_genomes is not None:
         cfg.topk_genomes = int(topk_genomes)
+    if pass1_duckdb is not None:
+        cfg.pass1_duckdb = bool(pass1_duckdb)
+    if pass2_duckdb is not None:
+        cfg.pass2_duckdb = bool(pass2_duckdb)
 
     files = [Path(f) for f in glob.glob(assign_glob, recursive=True)]
     if not files:
@@ -1571,6 +1720,12 @@ def _run_genotyping(
     typer.echo(f"[genotyping] weights: w_confident={cfg.w_confident} w_ambiguous={cfg.w_ambiguous}")
     typer.echo(f"[genotyping] gates: empty_bic_margin={cfg.empty_bic_margin} bic_margin={cfg.bic_margin} near_tie_margin={cfg.near_tie_margin}")
     typer.echo(f"[genotyping] grid: alpha_grid={cfg.alpha_grid} rho_grid={cfg.rho_grid} max_alpha={cfg.max_alpha}")
+    use_pass1_duckdb = bool(cfg.pass1_duckdb) and _HAS_DUCKDB
+    use_pass2_duckdb = bool(cfg.pass2_duckdb) and _HAS_DUCKDB
+    typer.echo(
+        f"[genotyping] pass1_duckdb={'on' if use_pass1_duckdb else 'off (fallback)'} "
+        f"pass2_duckdb={'on' if use_pass2_duckdb else 'off (fallback)'}"
+    )
     if cfg.empty_seed_bic_min is not None:
         typer.echo("[genotyping] NOTE: empty_seed_bic_min is currently not used in eta learning in this implementation.")
 
@@ -1603,13 +1758,16 @@ def _run_genotyping(
                             compression="gzip", dtype={"barcode": "string", "n_reads": "int64"})
               
     else:
-        typer.echo("[1/4] Pass 1: streaming assign inputs → per-read posteriors + spill shards")
+        typer.echo(
+            f"[1/4] Pass 1: streaming assign inputs → per-read posteriors + spill shards"
+            f"{' [duckdb]' if use_pass1_duckdb else ''}"
+        )
 
         C_list: List[pd.DataFrame] = []
         N_list: List[pd.DataFrame] = []
 
         cfg_dict = cfg.model_dump()
-        args = [(i, str(f), cfg_dict, str(shard_root), bc_to_chunk) for i, f in enumerate(files)]
+        args = [(i, str(f), cfg_dict, str(shard_root), bc_to_chunk, use_pass1_duckdb) for i, f in enumerate(files)]
         with ProcessPoolExecutor(max_workers=int(pass1_workers_eff)) as ex:
             futs = [ex.submit(_pass1_worker_job, a) for a in args]
             for fut in as_completed(futs):
@@ -1702,7 +1860,10 @@ def _run_genotyping(
         eta = eta.astype(float)        
         eta = eta / (eta.sum() + 1e-12)
     else:
-        typer.echo("[2/4] Pass 2: ambient learning (eta) from shard spill")
+        typer.echo(
+            f"[2/4] Pass 2: ambient learning (eta) from shard spill"
+            f"{' [duckdb]' if use_pass2_duckdb else ''}"
+        )
         eta, eta_meta = _learn_eta(C_all, N_all, shard_root, all_genomes, cfg)
         eta.to_frame("eta").to_csv(eta_out, sep="\t", compression="gzip")
         typer.echo(f"[2/4] eta saved: {eta_out.name}  seed_sizes={eta_meta.get('seed_sizes')}")
@@ -1879,6 +2040,15 @@ def genotyping_cmd(
     eta_iters: Optional[int] = typer.Option(None, "--eta-iters"),
     eta_seed_quantile: Optional[float] = typer.Option(None, "--eta-seed-quantile"),
     topk_genomes: Optional[int] = typer.Option(None, "--topk-genomes"),
+    # DuckDB acceleration
+    pass1_duckdb: Optional[bool] = typer.Option(
+        None, "--pass1-duckdb/--pass1-no-duckdb",
+        help="Use DuckDB for Pass 1 file reading (default: on). Falls back if duckdb unavailable.",
+    ),
+    pass2_duckdb: Optional[bool] = typer.Option(
+        None, "--pass2-duckdb/--pass2-no-duckdb",
+        help="Use DuckDB for Pass 2 eta computation (default: on). Falls back if duckdb unavailable.",
+    ),
     resume: bool = typer.Option(True, "--resume/--no-resume"),
 ) -> None:
     _run_genotyping(
@@ -1923,6 +2093,8 @@ def genotyping_cmd(
         eta_iters=eta_iters,
         eta_seed_quantile=eta_seed_quantile,
         topk_genomes=topk_genomes,
+        pass1_duckdb=pass1_duckdb,
+        pass2_duckdb=pass2_duckdb,
         resume=resume,
     )
 
