@@ -159,6 +159,90 @@ def _build_duckdb_union_sql(
     return "\n    UNION ALL\n    ".join(parts)
 
 
+def _learn_edges_duckdb(
+    files: list,
+    sampled_bcs: set,
+    mapq_min: int,
+    xa_max: int,
+    duckdb_threads: int,
+    lo_as: float,
+    hi_as: float,
+    nb_as: int,
+    lo_mq: float,
+    hi_mq: float,
+    nb_mq: int,
+    verbose: bool,
+) -> tuple:
+    """
+    DuckDB fast path for Pass A: compute winner AS/MAPQ histograms in one SQL pass.
+
+    Scans each genome file exactly once (total = len(files) file scans).
+    Returns (as_counts, mq_counts, n_winners).
+    """
+    import pyarrow as pa
+
+    con = _duckdb.connect()
+    con.execute(f"SET threads TO {max(1, duckdb_threads)}")
+
+    con.register(
+        "_bcs",
+        pa.table({"bc": pa.array(sorted(sampled_bcs), type=pa.string())}),
+    )
+
+    union_sql = _build_duckdb_union_sql(files, mapq_min, xa_max, "_bcs")
+
+    sql = f"""
+    WITH all_reads AS (
+        {union_sql}
+    ),
+    deduped AS (
+        SELECT Read, BC, Genome, as_, MAPQ, NM
+        FROM (
+            SELECT *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY Read, BC, Genome
+                    ORDER BY NM ASC, as_ DESC, MAPQ DESC
+                ) AS _rg
+            FROM all_reads
+        ) t WHERE _rg = 1
+    ),
+    ranked AS (
+        SELECT as_, MAPQ,
+            ROW_NUMBER() OVER (
+                PARTITION BY Read, BC
+                ORDER BY NM ASC, as_ DESC, MAPQ DESC
+            ) AS _rn
+        FROM deduped
+    )
+    SELECT as_, MAPQ FROM ranked WHERE _rn = 1
+    """
+
+    if verbose:
+        _log("[assign/edges] DuckDB query running ...", True)
+    winners_df = con.execute(sql).df()
+    con.close()
+
+    n_winners = len(winners_df)
+    if n_winners == 0:
+        return (
+            np.zeros(nb_as, dtype=np.int64),
+            np.zeros(nb_mq, dtype=np.int64),
+            0,
+        )
+
+    as_vals = winners_df["as_"].values.astype(np.float64)
+    mq_vals = winners_df["MAPQ"].values.astype(np.float64)
+
+    as_counts = np.histogram(
+        as_vals, bins=nb_as, range=(lo_as, hi_as)
+    )[0].astype(np.int64)
+    mq_counts = np.histogram(
+        mq_vals, bins=nb_mq, range=(lo_mq, hi_mq)
+    )[0].astype(np.int64)
+
+    return as_counts, mq_counts, n_winners
+
+
 def _score_chunk_duckdb(
     files: list,
     bcs: set,
@@ -749,11 +833,28 @@ def learn_edges(
     batch_size: int = typer.Option(16, "--batch-size"),
     workers: int = typer.Option(4, "--workers"),
     max_reads_per_genome: Optional[int] = typer.Option(None, "--max-reads-per-genome"),
+    edges_subsample: int = typer.Option(
+        50_000,
+        "--edges-subsample",
+        help="Subsample N BCs for decile learning (0 = use all). Default: 50000.",
+    ),
+    edges_duckdb: bool = typer.Option(
+        True,
+        "--edges-duckdb/--edges-no-duckdb",
+        help="Use DuckDB for Pass A (faster). Falls back to Python if duckdb unavailable.",
+    ),
+    duckdb_threads: int = typer.Option(
+        4,
+        "--edges-duckdb-threads",
+        help="DuckDB threads for Pass A edge learning (default: 4).",
+    ),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
 ):
     """
     Learn global AS/MAPQ decile edges from winner distributions.
-    Parallelization: chunk batches across workers; each worker streams each genome file once.
+
+    By default, subsamples 50 000 barcodes and uses DuckDB to scan each genome
+    file exactly once.  Set --edges-subsample 0 to use all barcodes (legacy).
     """
     files = _filtered_files(workdir, sample)
     chunk_files = sorted(Path(chunks_dir).glob("*_cell_map_ref_chunk_*.txt"))
@@ -763,54 +864,88 @@ def learn_edges(
     lo_as, hi_as, nb_as = _AS_RANGE
     lo_mq, hi_mq, nb_mq = _MQ_RANGE
 
-    batches: list[tuple[int, list[Path]]] = []
-    for bi, ofs in enumerate(range(0, len(chunk_files), batch_size), start=1):
-        batches.append((bi, chunk_files[ofs : ofs + batch_size]))
-
-    as_counts = np.zeros(nb_as, dtype=np.int64)
-    mq_counts = np.zeros(nb_mq, dtype=np.int64)
-
-    _log(f"[assign/edges] start: chunks={len(chunk_files)} batches={len(batches)} workers={workers}", verbose)
-
-    max_workers = max(1, min(int(workers), len(batches)))
     t0 = time.time()
 
-    with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        futs = []
-        for bi, chs in batches:
-            futs.append(
-                ex.submit(
-                    _edges_batch_worker,
-                    bi,
-                    [str(p) for p in chs],
-                    [str(p) for p in files],
-                    mapq_min,
-                    xa_max,
-                    chunksize,
-                    lo_as,
-                    hi_as,
-                    nb_as,
-                    lo_mq,
-                    hi_mq,
-                    nb_mq,
-                    max_reads_per_genome,
-                    verbose,
-                )
+    # ---- Collect all BCs and optionally subsample ----
+    all_bcs: set = set()
+    for cf in chunk_files:
+        all_bcs.update(_chunk_bcs(cf))
+
+    if edges_subsample > 0 and len(all_bcs) > edges_subsample:
+        import random
+        rng = random.Random(42)
+        sampled_bcs = set(rng.sample(sorted(all_bcs), edges_subsample))
+        _log(
+            f"[assign/edges] subsampled {len(sampled_bcs):,} / {len(all_bcs):,} BCs (seed=42)",
+            verbose,
+        )
+    else:
+        sampled_bcs = all_bcs
+        _log(
+            f"[assign/edges] using all {len(all_bcs):,} BCs (no subsampling needed)",
+            verbose,
+        )
+
+    # ---- DuckDB fast path ----
+    if edges_duckdb and _HAS_DUCKDB:
+        _log(
+            f"[assign/edges] DuckDB fast path: {len(files)} genome files, "
+            f"{duckdb_threads} threads, {len(sampled_bcs):,} BCs",
+            verbose,
+        )
+        as_counts, mq_counts, winners = _learn_edges_duckdb(
+            files, sampled_bcs, mapq_min, xa_max, duckdb_threads,
+            lo_as, hi_as, nb_as, lo_mq, hi_mq, nb_mq, verbose,
+        )
+        _log_ok(
+            f"[assign/edges] DuckDB done: winners={winners:,} ({time.time()-t0:.1f}s)",
+            verbose,
+        )
+
+    # ---- Python fallback (single batch with sampled BCs) ----
+    else:
+        if edges_duckdb and not _HAS_DUCKDB:
+            _log_err(
+                "[assign/edges] duckdb not installed — falling back to Python path",
+                True,
             )
 
-        done = 0
-        for fut in as_completed(futs):
-            try:
-                bi, as_part, mq_part, winners = fut.result()
-            except Exception as e:
-                _log_err(f"[assign/edges][ERROR] worker failed: {e}", True)
-                raise
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, prefix="edges_bcs_",
+        )
+        tmp.write("\n".join(sorted(sampled_bcs)))
+        tmp.close()
+        tf_path = tmp.name
 
-            as_counts += as_part
-            mq_counts += mq_part
-            done += 1
-            _log_ok(f"[assign/edges] ■ batch {bi} reduced winners={winners:,} ({done}/{len(futs)})", verbose)
+        _log(
+            f"[assign/edges] Python path: 1 batch, {len(files)} genome files, "
+            f"{len(sampled_bcs):,} BCs",
+            verbose,
+        )
 
+        try:
+            _, as_counts, mq_counts, winners = _edges_batch_worker(
+                1,
+                [tf_path],
+                [str(p) for p in files],
+                mapq_min,
+                xa_max,
+                chunksize,
+                lo_as, hi_as, nb_as,
+                lo_mq, hi_mq, nb_mq,
+                max_reads_per_genome,
+                verbose,
+            )
+        finally:
+            Path(tf_path).unlink(missing_ok=True)
+
+        _log_ok(
+            f"[assign/edges] Python done: winners={winners:,} ({time.time()-t0:.1f}s)",
+            verbose,
+        )
+
+    # ---- Compute edges (unchanged) ----
     as_edges = edges_from_hist_counts(as_counts, lo_as, hi_as, k)
     mq_edges = edges_from_hist_counts(mq_counts, lo_mq, hi_mq, k)
 
@@ -1374,6 +1509,21 @@ def assign_streaming_pipeline(
     batch_size: int = typer.Option(16, "--batch-size"),
     workers: int = typer.Option(4, "--workers"),
     max_reads_per_genome: Optional[int] = typer.Option(None, "--max-reads-per-genome"),
+    edges_subsample: int = typer.Option(
+        50_000,
+        "--edges-subsample",
+        help="Subsample N BCs for decile learning (0 = use all). Default: 50000.",
+    ),
+    edges_duckdb: bool = typer.Option(
+        True,
+        "--edges-duckdb/--edges-no-duckdb",
+        help="Use DuckDB for Pass A (faster). Falls back to Python if duckdb unavailable.",
+    ),
+    edges_duckdb_threads: int = typer.Option(
+        4,
+        "--edges-duckdb-threads",
+        help="DuckDB threads for Pass A edge learning (default: 4).",
+    ),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
 ):
     """
@@ -1401,6 +1551,9 @@ def assign_streaming_pipeline(
             batch_size=batch_size,
             workers=workers,
             max_reads_per_genome=max_reads_per_genome,
+            edges_subsample=edges_subsample,
+            edges_duckdb=edges_duckdb,
+            duckdb_threads=edges_duckdb_threads,
             verbose=verbose,
         )
     else:

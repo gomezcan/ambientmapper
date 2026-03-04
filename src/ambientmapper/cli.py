@@ -185,6 +185,9 @@ def _apply_assign_overrides(
     edges_workers: Optional[int] = None,
     edges_max_reads: Optional[int] = None,
     ecdf_workers: Optional[int] = None,
+    edges_subsample: Optional[int] = None,
+    edges_duckdb: Optional[bool] = None,
+    edges_duckdb_threads: Optional[int] = None,
 ) -> None:
     """Ensure cfg['assign'] exists and apply CLI overrides if provided."""
     assign = cfg.get("assign")
@@ -211,6 +214,12 @@ def _apply_assign_overrides(
         typer.echo(f"[assign] edges_max_reads cap in effect: {int(edges_max_reads):,} rows/genome")
     if ecdf_workers is not None:
         assign["ecdf_workers"] = int(ecdf_workers)
+    if edges_subsample is not None:
+        assign["edges_subsample"] = int(edges_subsample)
+    if edges_duckdb is not None:
+        assign["edges_duckdb"] = bool(edges_duckdb)
+    if edges_duckdb_threads is not None:
+        assign["edges_duckdb_threads"] = int(edges_duckdb_threads)
 
 
 def _ensure_minimal_chunk(workdir: Path, sample: str) -> None:
@@ -445,6 +454,21 @@ def assign(
         "--duckdb-threads",
         help="DuckDB threads per scoring worker (default: 2).",
     ),
+    edges_subsample: Optional[int] = typer.Option(
+        None,
+        "--edges-subsample",
+        help="Subsample N BCs for Pass A decile learning (0 = all). Default: 50000.",
+    ),
+    edges_duckdb: bool = typer.Option(
+        True,
+        "--edges-duckdb/--edges-no-duckdb",
+        help="Use DuckDB for Pass A (default: on). Falls back to Python if duckdb unavailable.",
+    ),
+    edges_duckdb_threads: int = typer.Option(
+        4,
+        "--edges-duckdb-threads",
+        help="DuckDB threads for Pass A edge learning (default: 4).",
+    ),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
     resume: bool = typer.Option(True, "--resume/--no-resume"),
 ) -> None:
@@ -471,6 +495,9 @@ def assign(
             edges_workers=edges_workers,
             edges_max_reads=edges_max_reads,
             ecdf_workers=ecdf_workers,
+            edges_subsample=edges_subsample,
+            edges_duckdb=edges_duckdb,
+            edges_duckdb_threads=edges_duckdb_threads,
         )
 
         workdir = Path(str(cfg["workdir"]))
@@ -496,6 +523,10 @@ def assign(
             edges_max_reads_eff = None
         if edges_max_reads_eff is not None:
             edges_max_reads_eff = int(edges_max_reads_eff)
+
+        edges_subsample_eff = int(aconf.get("edges_subsample", 50_000))
+        edges_duckdb_eff = bool(aconf.get("edges_duckdb", True))
+        edges_duckdb_threads_eff = int(aconf.get("edges_duckdb_threads", 4))
 
         # NOTE: sentinel should not gate partial runs; only gate full runs.
         params = {
@@ -551,6 +582,8 @@ def assign(
                 f"[assign] {sample} chunksize={chunksize_val:,} batch_size={batch_size_val} threads={threads_eff} "
                 f"edges_workers={edges_workers_eff} ecdf_workers={ecdf_workers_eff}"
                 + (f" edges_max_reads={int(edges_max_reads_eff):,}" if edges_max_reads_eff is not None else "")
+                + f" edges_subsample={edges_subsample_eff}"
+                + (f" [edges_duckdb threads={edges_duckdb_threads_eff}]" if edges_duckdb_eff else " [edges_python]")
                 + (" [only-score]" if only_score else "")
                 + (" [skip-edges]" if (skip_edges and not only_score) else "")
                 + (" [skip-ecdf]" if (skip_ecdf and not only_score) else "")
@@ -571,6 +604,9 @@ def assign(
                 batch_size=batch_size_val,
                 workers=edges_workers_eff,
                 max_reads_per_genome=edges_max_reads_eff,
+                edges_subsample=edges_subsample_eff,
+                edges_duckdb=edges_duckdb_eff,
+                duckdb_threads=edges_duckdb_threads_eff,
                 verbose=verbose,
             )
         else:
@@ -892,6 +928,9 @@ def run(
     assign_batch_size: Optional[int] = typer.Option(None, "--assign-batch-size"),
     assign_edges_workers: Optional[int] = typer.Option(None, "--assign-edges-workers"),
     assign_edges_max_reads: Optional[int] = typer.Option(None, "--assign-edges-max-reads"),
+    assign_edges_subsample: Optional[int] = typer.Option(None, "--assign-edges-subsample"),
+    assign_edges_duckdb: Optional[bool] = typer.Option(None, "--assign-edges-duckdb/--assign-edges-no-duckdb"),
+    assign_edges_duckdb_threads: Optional[int] = typer.Option(None, "--assign-edges-duckdb-threads"),
     ecdf_workers: Optional[int] = typer.Option(None, "--ecdf-workers"),
     # genotyping overrides
     genotyping_min_reads: Optional[int] = typer.Option(None, "--genotyping-min-reads"),
@@ -998,6 +1037,9 @@ def run(
             edges_workers=assign_edges_workers,
             edges_max_reads=assign_edges_max_reads,
             ecdf_workers=ecdf_workers,
+            edges_subsample=assign_edges_subsample,
+            edges_duckdb=assign_edges_duckdb,
+            edges_duckdb_threads=assign_edges_duckdb_threads,
         )
 
         params = {

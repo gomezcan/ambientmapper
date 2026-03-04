@@ -197,7 +197,7 @@ def _run_chunks(ctx: Ctx) -> None:
     _ = make_barcode_chunks(d["filtered"], d["chunks"], cfg["sample"], int(cfg.get("chunk_size_cells", 5000)))
 
 def _run_assign(ctx: Ctx) -> None:
-    from .assign_streaming import learn_edges_parallel, learn_ecdfs_parallel, score_chunk
+    from .assign_streaming import learn_edges, learn_ecdfs, score_chunk
     cfg = ctx.cfg; d = ctx.dirs
     workdir = Path(cfg["workdir"]); sample = cfg["sample"]
     chunks_dir = d["chunks"]
@@ -228,14 +228,22 @@ def _run_assign(ctx: Ctx) -> None:
         ecdf_workers = threads
     ecdf_workers = max(1, min(int(ecdf_workers), threads))
 
-    learn_edges_parallel(
+    edges_subsample = int(aconf.get("edges_subsample", 50_000))
+    edges_duckdb = bool(aconf.get("edges_duckdb", True))
+    edges_duckdb_threads = int(aconf.get("edges_duckdb_threads", 4))
+
+    learn_edges(
         workdir=workdir, sample=sample, chunks_dir=chunks_dir, out_model=edges_npz,
         mapq_min=parse_int(mapq_min), xa_max=parse_int(xa_max),
         chunksize=parse_int(chunksize_val), k=parse_int(k), batch_size=parse_int(batch_size_val),
-        threads=parse_int(threads), verbose=verbose,
-        edges_workers=edges_workers, edges_max_reads=edges_max_reads
+        workers=parse_int(edges_workers) if edges_workers is not None else parse_int(threads),
+        max_reads_per_genome=edges_max_reads,
+        edges_subsample=parse_int(edges_subsample),
+        edges_duckdb=edges_duckdb,
+        duckdb_threads=parse_int(edges_duckdb_threads),
+        verbose=verbose,
     )
-    learn_ecdfs_parallel(
+    learn_ecdfs(
         workdir=workdir, sample=sample, chunks_dir=chunks_dir, edges_model=edges_npz, out_model=ecdf_npz,
         mapq_min=parse_int(mapq_min), xa_max=parse_int(xa_max),
         chunksize=parse_int(chunksize_val), verbose=verbose, workers=parse_int(ecdf_workers)

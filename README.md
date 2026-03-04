@@ -390,7 +390,12 @@ ambientmapper chunks --config cfg.json
 
 **Code:** `assign_streaming.py`
 
-### Pass A — Learn winner score distributions (`learn_edges_parallel`)
+### Pass A — Learn winner score distributions (`learn_edges`)
+
+**Performance:** By default, Pass A subsamples 50 000 barcodes and uses DuckDB
+to scan each genome file exactly once. This reduces wall time from hours/days to
+minutes for experiments with many genomes. Set `--assign-edges-subsample 0` to
+use all barcodes (legacy behaviour).
 
 For each `(Read, BC)` pair across genomes:
 
@@ -845,8 +850,11 @@ Pass via JSON (`assign` block) or CLI prefix (`--assign-*`) when using `ambientm
 | `assign.xa_max` / `--assign-xa-max` | `2` | Maximum allowed alternative hits (`XAcount`); `-1` to disable |
 | `assign.chunksize` / `--assign-chunksize` | — | Rows per streaming batch (reduces memory at cost of speed) |
 | `assign.batch_size` / `--assign-batch-size` | `32` | Chunk files handled together in batched ECDF learning |
-| `assign.edges_workers` / `--assign-edges-workers` | — | Workers for `learn_edges_parallel` (Pass A) |
-| `assign.edges_max_reads` / `--assign-edges-max-reads` | all | Cap on reads per genome during Pass A model learning |
+| `assign.edges_workers` / `--assign-edges-workers` | — | Workers for `learn_edges` (Pass A, Python fallback only) |
+| `assign.edges_max_reads` / `--assign-edges-max-reads` | all | Cap on reads per genome during Pass A model learning (Python fallback only) |
+| `assign.edges_subsample` / `--assign-edges-subsample` | `50000` | Subsample N barcodes for Pass A decile learning (0 = all). Dramatically reduces I/O for large experiments. |
+| `assign.edges_duckdb` / `--assign-edges-duckdb` | `true` | Use DuckDB for Pass A edge learning. Falls back to Python if duckdb unavailable. |
+| `assign.edges_duckdb_threads` / `--assign-edges-duckdb-threads` | `4` | DuckDB threads for Pass A edge learning. |
 | `--ecdf-workers` | — | Workers for ECDF learning (Pass B) |
 
 **Standalone assign sub-flags** (when calling `ambientmapper assign` directly):
