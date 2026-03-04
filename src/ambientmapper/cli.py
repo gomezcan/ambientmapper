@@ -188,6 +188,9 @@ def _apply_assign_overrides(
     edges_subsample: Optional[int] = None,
     edges_duckdb: Optional[bool] = None,
     edges_duckdb_threads: Optional[int] = None,
+    ecdf_subsample: Optional[int] = None,
+    ecdf_duckdb: Optional[bool] = None,
+    ecdf_duckdb_threads: Optional[int] = None,
 ) -> None:
     """Ensure cfg['assign'] exists and apply CLI overrides if provided."""
     assign = cfg.get("assign")
@@ -220,6 +223,12 @@ def _apply_assign_overrides(
         assign["edges_duckdb"] = bool(edges_duckdb)
     if edges_duckdb_threads is not None:
         assign["edges_duckdb_threads"] = int(edges_duckdb_threads)
+    if ecdf_subsample is not None:
+        assign["ecdf_subsample"] = int(ecdf_subsample)
+    if ecdf_duckdb is not None:
+        assign["ecdf_duckdb"] = bool(ecdf_duckdb)
+    if ecdf_duckdb_threads is not None:
+        assign["ecdf_duckdb_threads"] = int(ecdf_duckdb_threads)
 
 
 def _ensure_minimal_chunk(workdir: Path, sample: str) -> None:
@@ -469,6 +478,21 @@ def assign(
         "--edges-duckdb-threads",
         help="DuckDB threads for Pass A edge learning (default: 4).",
     ),
+    ecdf_subsample: Optional[int] = typer.Option(
+        None,
+        "--ecdf-subsample",
+        help="Subsample N BCs for Pass B ECDF learning (0 = all). Default: 50000.",
+    ),
+    ecdf_duckdb: bool = typer.Option(
+        True,
+        "--ecdf-duckdb/--ecdf-no-duckdb",
+        help="Use DuckDB for Pass B (default: on). Falls back to Python if duckdb unavailable.",
+    ),
+    ecdf_duckdb_threads: int = typer.Option(
+        4,
+        "--ecdf-duckdb-threads",
+        help="DuckDB threads for Pass B ECDF learning (default: 4).",
+    ),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
     resume: bool = typer.Option(True, "--resume/--no-resume"),
 ) -> None:
@@ -498,6 +522,9 @@ def assign(
             edges_subsample=edges_subsample,
             edges_duckdb=edges_duckdb,
             edges_duckdb_threads=edges_duckdb_threads,
+            ecdf_subsample=ecdf_subsample,
+            ecdf_duckdb=ecdf_duckdb,
+            ecdf_duckdb_threads=ecdf_duckdb_threads,
         )
 
         workdir = Path(str(cfg["workdir"]))
@@ -527,6 +554,10 @@ def assign(
         edges_subsample_eff = int(aconf.get("edges_subsample", 50_000))
         edges_duckdb_eff = bool(aconf.get("edges_duckdb", True))
         edges_duckdb_threads_eff = int(aconf.get("edges_duckdb_threads", 4))
+
+        ecdf_subsample_eff = int(aconf.get("ecdf_subsample", 50_000))
+        ecdf_duckdb_eff = bool(aconf.get("ecdf_duckdb", True))
+        ecdf_duckdb_threads_eff = int(aconf.get("ecdf_duckdb_threads", 4))
 
         # NOTE: sentinel should not gate partial runs; only gate full runs.
         params = {
@@ -584,6 +615,8 @@ def assign(
                 + (f" edges_max_reads={int(edges_max_reads_eff):,}" if edges_max_reads_eff is not None else "")
                 + f" edges_subsample={edges_subsample_eff}"
                 + (f" [edges_duckdb threads={edges_duckdb_threads_eff}]" if edges_duckdb_eff else " [edges_python]")
+                + f" ecdf_subsample={ecdf_subsample_eff}"
+                + (f" [ecdf_duckdb threads={ecdf_duckdb_threads_eff}]" if ecdf_duckdb_eff else " [ecdf_python]")
                 + (" [only-score]" if only_score else "")
                 + (" [skip-edges]" if (skip_edges and not only_score) else "")
                 + (" [skip-ecdf]" if (skip_ecdf and not only_score) else "")
@@ -625,6 +658,9 @@ def assign(
                 xa_max=xa_max_eff,
                 chunksize=chunksize_val,
                 workers=ecdf_workers_eff,
+                ecdf_subsample=ecdf_subsample_eff,
+                ecdf_duckdb=ecdf_duckdb_eff,
+                ecdf_duckdb_threads=ecdf_duckdb_threads_eff,
                 verbose=verbose,
             )
         else:
@@ -932,6 +968,9 @@ def run(
     assign_edges_duckdb: Optional[bool] = typer.Option(None, "--assign-edges-duckdb/--assign-edges-no-duckdb"),
     assign_edges_duckdb_threads: Optional[int] = typer.Option(None, "--assign-edges-duckdb-threads"),
     ecdf_workers: Optional[int] = typer.Option(None, "--ecdf-workers"),
+    assign_ecdf_subsample: Optional[int] = typer.Option(None, "--assign-ecdf-subsample"),
+    assign_ecdf_duckdb: Optional[bool] = typer.Option(None, "--assign-ecdf-duckdb/--assign-ecdf-no-duckdb"),
+    assign_ecdf_duckdb_threads: Optional[int] = typer.Option(None, "--assign-ecdf-duckdb-threads"),
     # genotyping overrides
     genotyping_min_reads: Optional[int] = typer.Option(None, "--genotyping-min-reads"),
     genotyping_beta: Optional[float] = typer.Option(None, "--genotyping-beta"),
@@ -1040,6 +1079,9 @@ def run(
             edges_subsample=assign_edges_subsample,
             edges_duckdb=assign_edges_duckdb,
             edges_duckdb_threads=assign_edges_duckdb_threads,
+            ecdf_subsample=assign_ecdf_subsample,
+            ecdf_duckdb=assign_ecdf_duckdb,
+            ecdf_duckdb_threads=assign_ecdf_duckdb_threads,
         )
 
         params = {

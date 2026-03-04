@@ -243,6 +243,143 @@ def _learn_edges_duckdb(
     return as_counts, mq_counts, n_winners
 
 
+def _learn_ecdfs_duckdb(
+    files: list,
+    sampled_bcs: set,
+    mapq_min: int,
+    xa_max: int,
+    duckdb_threads: int,
+    as_edges: np.ndarray,
+    mq_edges: np.ndarray,
+    k: int,
+    lo_das: float,
+    hi_das: float,
+    nb_das: int,
+    lo_dmq: float,
+    hi_dmq: float,
+    nb_dmq: int,
+    verbose: bool,
+) -> tuple:
+    """
+    DuckDB fast path for Pass B: compute per-decile delta histograms in one SQL pass.
+
+    For each (Read, BC), finds best1 and best2 alignments across genomes,
+    computes dAS = best1_as - best2_as and dMQ = best1_mq - best2_mq,
+    then bins deltas by winner decile.
+
+    Returns (dAS_counts, dAS_over, dMQ_counts, dMQ_over, n_pairs).
+    """
+    import pyarrow as pa
+
+    con = _duckdb.connect()
+    con.execute(f"SET threads TO {max(1, duckdb_threads)}")
+
+    con.register(
+        "_bcs",
+        pa.table({"bc": pa.array(sorted(sampled_bcs), type=pa.string())}),
+    )
+
+    union_sql = _build_duckdb_union_sql(files, mapq_min, xa_max, "_bcs")
+
+    sql = f"""
+    WITH all_reads AS (
+        {union_sql}
+    ),
+    deduped AS (
+        SELECT Read, BC, Genome, as_, MAPQ, NM
+        FROM (
+            SELECT *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY Read, BC, Genome
+                    ORDER BY NM ASC, as_ DESC, MAPQ DESC
+                ) AS _rg
+            FROM all_reads
+        ) t WHERE _rg = 1
+    ),
+    ranked AS (
+        SELECT Read, BC, as_, MAPQ, NM,
+            ROW_NUMBER() OVER (
+                PARTITION BY Read, BC
+                ORDER BY NM ASC, as_ DESC, MAPQ DESC
+            ) AS _rn
+        FROM deduped
+    ),
+    best12 AS (
+        SELECT
+            Read, BC,
+            MAX(CASE WHEN _rn = 1 THEN as_ END) AS as1,
+            MAX(CASE WHEN _rn = 1 THEN MAPQ END) AS mq1,
+            MAX(CASE WHEN _rn = 2 THEN as_ END) AS as2,
+            MAX(CASE WHEN _rn = 2 THEN MAPQ END) AS mq2
+        FROM ranked WHERE _rn <= 2
+        GROUP BY Read, BC
+        HAVING COUNT(*) = 2
+    )
+    SELECT as1, mq1, as1 - as2 AS dAS, mq1 - mq2 AS dMQ
+    FROM best12
+    """
+
+    if verbose:
+        _log("[assign/ecdf] DuckDB query running ...", True)
+    df = con.execute(sql).df()
+    con.close()
+
+    n_pairs = len(df)
+    if n_pairs == 0:
+        return (
+            np.zeros((k, nb_das), dtype=np.int64),
+            np.zeros((k,), dtype=np.int64),
+            np.zeros((k, nb_dmq), dtype=np.int64),
+            np.zeros((k,), dtype=np.int64),
+            0,
+        )
+
+    as1 = df["as1"].values.astype(np.float64)
+    mq1 = df["mq1"].values.astype(np.float64)
+    dAS = df["dAS"].values.astype(np.float64)
+    dMQ = df["dMQ"].values.astype(np.float64)
+
+    # Assign winner to deciles (same logic as _ecdf_chunk_worker / score_chunk)
+    if as_edges.size > 0:
+        dec_as = np.clip(
+            np.searchsorted(as_edges, as1, side="left") + 1, 1, k
+        ).astype(np.int64)
+    else:
+        dec_as = np.ones(n_pairs, dtype=np.int64)
+
+    if mq_edges.size > 0:
+        dec_mq = np.clip(
+            np.searchsorted(mq_edges, mq1, side="left") + 1, 1, k
+        ).astype(np.int64)
+    else:
+        dec_mq = np.ones(n_pairs, dtype=np.int64)
+
+    # Per-decile histogram binning
+    dAS_counts = np.zeros((k, nb_das), dtype=np.int64)
+    dAS_over = np.zeros((k,), dtype=np.int64)
+    dMQ_counts = np.zeros((k, nb_dmq), dtype=np.int64)
+    dMQ_over = np.zeros((k,), dtype=np.int64)
+
+    for d in range(1, k + 1):
+        mask_as = dec_as == d
+        vals = dAS[mask_as]
+        if vals.size > 0:
+            dAS_counts[d - 1] = np.histogram(
+                vals, bins=nb_das, range=(lo_das, hi_das)
+            )[0].astype(np.int64)
+            dAS_over[d - 1] = int(np.sum(vals >= hi_das))
+
+        mask_mq = dec_mq == d
+        vals = dMQ[mask_mq]
+        if vals.size > 0:
+            dMQ_counts[d - 1] = np.histogram(
+                vals, bins=nb_dmq, range=(lo_dmq, hi_dmq)
+            )[0].astype(np.int64)
+            dMQ_over[d - 1] = int(np.sum(vals >= hi_dmq))
+
+    return dAS_counts, dAS_over, dMQ_counts, dMQ_over, n_pairs
+
+
 def _score_chunk_duckdb(
     files: list,
     bcs: set,
@@ -972,11 +1109,28 @@ def learn_ecdfs(
     xa_max: int = typer.Option(2, "--xa-max"),
     chunksize: int = typer.Option(500_000, "--chunksize"),
     workers: int = typer.Option(4, "--workers"),
+    ecdf_subsample: int = typer.Option(
+        50_000,
+        "--ecdf-subsample",
+        help="Subsample N BCs for ECDF learning (0 = use all). Default: 50000.",
+    ),
+    ecdf_duckdb: bool = typer.Option(
+        True,
+        "--ecdf-duckdb/--ecdf-no-duckdb",
+        help="Use DuckDB for Pass B (faster). Falls back to Python if duckdb unavailable.",
+    ),
+    ecdf_duckdb_threads: int = typer.Option(
+        4,
+        "--ecdf-duckdb-threads",
+        help="DuckDB threads for Pass B ECDF learning (default: 4).",
+    ),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
 ):
     """
-    Learn per-decile ΔAS/ΔMAPQ hist counts + overflow, in parallel over chunks.
-    Each worker loads all genomes for *one* chunk => stable memory profile.
+    Learn per-decile ΔAS/ΔMAPQ hist counts + overflow.
+
+    By default, subsamples 50 000 barcodes and uses DuckDB to scan each genome
+    file exactly once.  Set --ecdf-subsample 0 to use all barcodes (legacy).
     """
     files = _filtered_files(workdir, sample)
     chunk_files = sorted(Path(chunks_dir).glob("*_cell_map_ref_chunk_*.txt"))
@@ -988,25 +1142,74 @@ def learn_ecdfs(
     mq_edges = dat["mq_edges"]
     k = int(dat["k"])
 
-    # global accumulators
-    Htmp_AS = _new_hist(_DAS_RANGE)
-    Htmp_MQ = _new_hist(_DMQ_RANGE)
-
-    dAS_counts = np.zeros((k, Htmp_AS.nbins), dtype=np.int64)
-    dAS_over = np.zeros((k,), dtype=np.int64)
-
-    dMQ_counts = np.zeros((k, Htmp_MQ.nbins), dtype=np.int64)
-    dMQ_over = np.zeros((k,), dtype=np.int64)
-
-    max_workers = max(1, min(int(workers), len(chunk_files)))
-    _log(f"[assign/ecdf] start: chunks={len(chunk_files)} workers={max_workers}", verbose)
+    lo_das, hi_das, nb_das = _DAS_RANGE
+    lo_dmq, hi_dmq, nb_dmq = _DMQ_RANGE
 
     t0 = time.time()
-    with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        futs = {
-            ex.submit(
-                _ecdf_chunk_worker,
-                str(ch),
+
+    # ---- Collect all BCs and optionally subsample ----
+    all_bcs: set = set()
+    for cf in chunk_files:
+        all_bcs.update(_chunk_bcs(cf))
+
+    if ecdf_subsample > 0 and len(all_bcs) > ecdf_subsample:
+        import random
+        rng = random.Random(42)
+        sampled_bcs = set(rng.sample(sorted(all_bcs), ecdf_subsample))
+        _log(
+            f"[assign/ecdf] subsampled {len(sampled_bcs):,} / {len(all_bcs):,} BCs (seed=42)",
+            verbose,
+        )
+    else:
+        sampled_bcs = all_bcs
+        _log(
+            f"[assign/ecdf] using all {len(all_bcs):,} BCs (no subsampling needed)",
+            verbose,
+        )
+
+    # ---- DuckDB fast path ----
+    if ecdf_duckdb and _HAS_DUCKDB:
+        _log(
+            f"[assign/ecdf] DuckDB fast path: {len(files)} genome files, "
+            f"{ecdf_duckdb_threads} threads, {len(sampled_bcs):,} BCs",
+            verbose,
+        )
+        dAS_counts, dAS_over, dMQ_counts, dMQ_over, n_pairs = _learn_ecdfs_duckdb(
+            files, sampled_bcs, mapq_min, xa_max, ecdf_duckdb_threads,
+            as_edges, mq_edges, k,
+            lo_das, hi_das, nb_das, lo_dmq, hi_dmq, nb_dmq,
+            verbose,
+        )
+        _log_ok(
+            f"[assign/ecdf] DuckDB done: pairs={n_pairs:,} ({time.time()-t0:.1f}s)",
+            verbose,
+        )
+
+    # ---- Python fallback (single batch with sampled BCs) ----
+    else:
+        if ecdf_duckdb and not _HAS_DUCKDB:
+            _log_err(
+                "[assign/ecdf] duckdb not installed — falling back to Python path",
+                True,
+            )
+
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, prefix="ecdf_bcs_",
+        )
+        tmp.write("\n".join(sorted(sampled_bcs)))
+        tmp.close()
+        tf_path = tmp.name
+
+        _log(
+            f"[assign/ecdf] Python path: 1 chunk, {len(files)} genome files, "
+            f"{len(sampled_bcs):,} BCs",
+            verbose,
+        )
+
+        try:
+            _, dAS_counts, dAS_over, dMQ_counts, dMQ_over, n_pairs = _ecdf_chunk_worker(
+                tf_path,
                 [str(p) for p in files],
                 mapq_min,
                 xa_max,
@@ -1015,28 +1218,16 @@ def learn_ecdfs(
                 mq_edges,
                 k,
                 verbose,
-            ): ch
-            for ch in chunk_files
-        }
+            )
+        finally:
+            Path(tf_path).unlink(missing_ok=True)
 
-        done = 0
-        for fut in as_completed(futs):
-            ch = futs[fut]
-            try:
-                _, das, daso, dmq, dmqo, pairs = fut.result()
-            except Exception as e:
-                _log_err(f"[assign/ecdf][ERROR] {ch.name}: {e}", True)
-                raise
+        _log_ok(
+            f"[assign/ecdf] Python done: pairs={n_pairs:,} ({time.time()-t0:.1f}s)",
+            verbose,
+        )
 
-            dAS_counts += das
-            dAS_over += daso
-            dMQ_counts += dmq
-            dMQ_over += dmqo
-
-            done += 1
-            if verbose and (done % 5 == 0 or done == len(chunk_files)):
-                _log(f"[assign/ecdf] {done}/{len(chunk_files)} chunks reduced (last pairs={pairs:,})", True)
-
+    # ---- Save model (same format as before) ----
     exp_dir = Path(workdir) / sample / "ExplorationReadLevel"
     exp_dir.mkdir(parents=True, exist_ok=True)
     model_path = out_model or (exp_dir / "global_ecdf.npz")
@@ -1046,12 +1237,12 @@ def learn_ecdfs(
         k=np.array(k),
         as_edges=as_edges,
         mq_edges=mq_edges,
-        dAS_lo=np.array([Htmp_AS.lo]),
-        dAS_hi=np.array([Htmp_AS.hi]),
-        dAS_nbins=np.array([Htmp_AS.nbins]),
-        dMQ_lo=np.array([Htmp_MQ.lo]),
-        dMQ_hi=np.array([Htmp_MQ.hi]),
-        dMQ_nbins=np.array([Htmp_MQ.nbins]),
+        dAS_lo=np.array([lo_das]),
+        dAS_hi=np.array([hi_das]),
+        dAS_nbins=np.array([nb_das]),
+        dMQ_lo=np.array([lo_dmq]),
+        dMQ_hi=np.array([hi_dmq]),
+        dMQ_nbins=np.array([nb_dmq]),
         dAS_counts=dAS_counts,
         dAS_overflow=dAS_over,
         dMQ_counts=dMQ_counts,
@@ -1524,6 +1715,21 @@ def assign_streaming_pipeline(
         "--edges-duckdb-threads",
         help="DuckDB threads for Pass A edge learning (default: 4).",
     ),
+    ecdf_subsample: int = typer.Option(
+        50_000,
+        "--ecdf-subsample",
+        help="Subsample N BCs for ECDF learning (0 = use all). Default: 50000.",
+    ),
+    ecdf_duckdb: bool = typer.Option(
+        True,
+        "--ecdf-duckdb/--ecdf-no-duckdb",
+        help="Use DuckDB for Pass B (faster). Falls back to Python if duckdb unavailable.",
+    ),
+    ecdf_duckdb_threads: int = typer.Option(
+        4,
+        "--ecdf-duckdb-threads",
+        help="DuckDB threads for Pass B ECDF learning (default: 4).",
+    ),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
 ):
     """
@@ -1571,6 +1777,9 @@ def assign_streaming_pipeline(
             xa_max=xa_max,
             chunksize=chunksize,
             workers=workers,
+            ecdf_subsample=ecdf_subsample,
+            ecdf_duckdb=ecdf_duckdb,
+            ecdf_duckdb_threads=ecdf_duckdb_threads,
             verbose=verbose,
         )
     else:

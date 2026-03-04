@@ -411,7 +411,12 @@ For each `(Read, BC)` pair across genomes:
 ExplorationReadLevel/global_edges.npz
 ```
 
-### Pass B — Learn Δ-score ECDFs (`learn_ecdfs_parallel` or `learn_ecdfs_batched`)
+### Pass B — Learn Δ-score ECDFs (`learn_ecdfs`)
+
+**Performance:** By default, Pass B subsamples 50 000 barcodes and uses DuckDB
+to scan each genome file exactly once. This reduces wall time from days to
+minutes for experiments with many genomes. Set `--assign-ecdf-subsample 0` to
+use all barcodes (legacy behaviour).
 
 Computes:
 
@@ -855,7 +860,10 @@ Pass via JSON (`assign` block) or CLI prefix (`--assign-*`) when using `ambientm
 | `assign.edges_subsample` / `--assign-edges-subsample` | `50000` | Subsample N barcodes for Pass A decile learning (0 = all). Dramatically reduces I/O for large experiments. |
 | `assign.edges_duckdb` / `--assign-edges-duckdb` | `true` | Use DuckDB for Pass A edge learning. Falls back to Python if duckdb unavailable. |
 | `assign.edges_duckdb_threads` / `--assign-edges-duckdb-threads` | `4` | DuckDB threads for Pass A edge learning. |
-| `--ecdf-workers` | — | Workers for ECDF learning (Pass B) |
+| `--ecdf-workers` | — | Workers for ECDF learning (Pass B, Python fallback only) |
+| `assign.ecdf_subsample` / `--assign-ecdf-subsample` | `50000` | Subsample N barcodes for Pass B ECDF learning (0 = all). Dramatically reduces I/O for large experiments. |
+| `assign.ecdf_duckdb` / `--assign-ecdf-duckdb` | `true` | Use DuckDB for Pass B ECDF learning. Falls back to Python if duckdb unavailable. |
+| `assign.ecdf_duckdb_threads` / `--assign-ecdf-duckdb-threads` | `4` | DuckDB threads for Pass B ECDF learning. |
 
 **Standalone assign sub-flags** (when calling `ambientmapper assign` directly):
 

@@ -232,6 +232,10 @@ def _run_assign(ctx: Ctx) -> None:
     edges_duckdb = bool(aconf.get("edges_duckdb", True))
     edges_duckdb_threads = int(aconf.get("edges_duckdb_threads", 4))
 
+    ecdf_subsample = int(aconf.get("ecdf_subsample", 50_000))
+    ecdf_duckdb = bool(aconf.get("ecdf_duckdb", True))
+    ecdf_duckdb_threads = int(aconf.get("ecdf_duckdb_threads", 4))
+
     learn_edges(
         workdir=workdir, sample=sample, chunks_dir=chunks_dir, out_model=edges_npz,
         mapq_min=parse_int(mapq_min), xa_max=parse_int(xa_max),
@@ -246,7 +250,10 @@ def _run_assign(ctx: Ctx) -> None:
     learn_ecdfs(
         workdir=workdir, sample=sample, chunks_dir=chunks_dir, edges_model=edges_npz, out_model=ecdf_npz,
         mapq_min=parse_int(mapq_min), xa_max=parse_int(xa_max),
-        chunksize=parse_int(chunksize_val), verbose=verbose, workers=parse_int(ecdf_workers)
+        chunksize=parse_int(chunksize_val), verbose=verbose, workers=parse_int(ecdf_workers),
+        ecdf_subsample=parse_int(ecdf_subsample),
+        ecdf_duckdb=ecdf_duckdb,
+        ecdf_duckdb_threads=parse_int(ecdf_duckdb_threads),
     )
 
     score_duckdb_eff   = bool(aconf.get("score_duckdb", True))
