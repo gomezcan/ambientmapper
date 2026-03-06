@@ -60,6 +60,14 @@ except ImportError:
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 
+# Environment keys to keep when spawning subprocesses (sort, gzip, zcat, bash).
+# Full SLURM environments can exceed ARG_MAX and cause E2BIG / "Argument list too long".
+_SUBPROCESS_KEEP_ENV_KEYS = frozenset({
+    "PATH", "HOME", "USER", "TMPDIR", "TEMP", "TMP",
+    "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH",
+    "CONDA_PREFIX", "CONDA_DEFAULT_ENV", "CONDA_EXE",
+})
+
 # --------------------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------------------
@@ -301,8 +309,8 @@ def _merge_worker_shards_pass15(
         "-T", str(tmpdir_eff),
     ]
 
-    # Environment: force bytewise collation for sort speed/determinism
-    env = os.environ.copy()
+    # Environment: keep only essential vars to avoid ARG_MAX / E2BIG on HPC (SLURM envs can be huge)
+    env = {k: v for k, v in os.environ.items() if k in _SUBPROCESS_KEEP_ENV_KEYS}
     env["LC_ALL"] = "C"
 
     # Merge each shard id independently
