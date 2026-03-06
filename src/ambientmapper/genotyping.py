@@ -355,15 +355,17 @@ def _merge_worker_shards_pass15(
             raise
 
         # 3) Stream BODY rows (no headers) from all inputs -> sort -> gzip append (member 2)
-        in_list = " ".join(shlex_quote(str(p)) for p in inputs_eff)
+        # Write file list to a temp file to avoid ARG_MAX / E2BIG when there are
+        # thousands of worker shards (one per input file).
+        filelist_path = merged_root / f"_filelist_shard_{sid:02d}.tmp"
+        filelist_path.write_text("\n".join(str(p) for p in inputs_eff) + "\n")
 
-        # IMPORTANT: this cmd outputs ONLY the body lines to stdout
         # NOTE: zcat|tail may get SIGPIPE if downstream finishes early; we tolerate rc1==141
         cmd = f"""
 set -euo pipefail
-for f in {in_list}; do
+while IFS= read -r f; do
   {zcat_bin} "$f" | tail -n +2
-done
+done < {shlex_quote(str(filelist_path))}
 """.strip()
 
         try:
@@ -391,6 +393,9 @@ done
             if out_path.exists():
                 out_path.unlink()
             raise
+        finally:
+            if filelist_path.exists():
+                filelist_path.unlink()
 
     marker.write_text("v1\n")
     return merged_root
