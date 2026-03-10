@@ -330,6 +330,23 @@ def _merge_worker_shards_pass15(
                 out_path.unlink()
             continue
 
+        # Validate gzip integrity — skip corrupt shards with a warning
+        valid_inputs: List[Path] = []
+        for p in inputs_eff:
+            rc = subprocess.call(
+                [gzip_bin, "-t", str(p)], env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            if rc == 0:
+                valid_inputs.append(p)
+            else:
+                typer.echo(f"WARNING: skipping corrupt shard {p} (gzip -t rc={rc})")
+        inputs_eff = valid_inputs
+        if not inputs_eff:
+            if out_path.exists():
+                out_path.unlink()
+            continue
+
         # 1) Read header from first non-empty input
         first = str(inputs_eff[0])
         header_cmd = f'{zcat_bin} {shlex_quote(first)} | head -n 1 || true'
@@ -1134,45 +1151,56 @@ def _pass1_process_one_file(
             sub2 = sub2.sort_values(["barcode", "read_id", "genome"], kind="mergesort")
             sub2.to_csv(h, sep="\t", header=False, index=False)
 
-    if use_duckdb and _HAS_DUCKDB:
-        # --- DuckDB path: single SQL query for read + reduction ---
-        df_reduced = _pass1_read_and_reduce_duckdb(fp)
-        df_reduced = df_reduced.dropna(subset=["barcode", "read_id", "genome"])
+    try:
+        if use_duckdb and _HAS_DUCKDB:
+            # --- DuckDB path: single SQL query for read + reduction ---
+            df_reduced = _pass1_read_and_reduce_duckdb(fp)
+            df_reduced = df_reduced.dropna(subset=["barcode", "read_id", "genome"])
 
-        # Process in memory-safe chunks (no carry-over needed — GROUP BY is complete)
-        chunk_sz = int(cfg.chunk_rows)
-        for start in range(0, len(df_reduced), chunk_sz):
-            block = df_reduced.iloc[start:start + chunk_sz]
-            _posterior_and_shard(block)
-    else:
-        # --- Original pandas chunked path ---
-        carry: Optional[pd.DataFrame] = None
+            # Process in memory-safe chunks (no carry-over needed — GROUP BY is complete)
+            chunk_sz = int(cfg.chunk_rows)
+            for start in range(0, len(df_reduced), chunk_sz):
+                block = df_reduced.iloc[start:start + chunk_sz]
+                _posterior_and_shard(block)
+        else:
+            # --- Original pandas chunked path ---
+            carry: Optional[pd.DataFrame] = None
 
-        def _process_block(df_block: pd.DataFrame) -> None:
-            if df_block is None or df_block.empty:
-                return
-            df = _reduce_alignments_to_per_genome(df_block)
-            df = df.dropna(subset=["barcode", "read_id", "genome"])
-            _posterior_and_shard(df)
+            def _process_block(df_block: pd.DataFrame) -> None:
+                if df_block is None or df_block.empty:
+                    return
+                df = _reduce_alignments_to_per_genome(df_block)
+                df = df.dropna(subset=["barcode", "read_id", "genome"])
+                _posterior_and_shard(df)
 
-        for raw in pd.read_csv(fp, sep="\t", chunksize=int(cfg.chunk_rows), low_memory=False):
-            df0 = _coerce_assign_schema(raw)
+            for raw in pd.read_csv(fp, sep="\t", chunksize=int(cfg.chunk_rows), low_memory=False):
+                df0 = _coerce_assign_schema(raw)
+                if carry is not None and not carry.empty:
+                    df0 = pd.concat([carry, df0], ignore_index=True)
+                if df0.empty:
+                    carry = None
+                    continue
+                last_bc = str(df0["barcode"].iloc[-1])
+                last_rid = str(df0["read_id"].iloc[-1])
+                mask_carry = (df0["barcode"].astype(str) == last_bc) & (df0["read_id"].astype(str) == last_rid)
+                carry = df0.loc[mask_carry].copy()
+                df_main = df0.loc[~mask_carry].copy()
+                _process_block(df_main)
             if carry is not None and not carry.empty:
-                df0 = pd.concat([carry, df0], ignore_index=True)
-            if df0.empty:
-                carry = None
-                continue
-            last_bc = str(df0["barcode"].iloc[-1])
-            last_rid = str(df0["read_id"].iloc[-1])
-            mask_carry = (df0["barcode"].astype(str) == last_bc) & (df0["read_id"].astype(str) == last_rid)
-            carry = df0.loc[mask_carry].copy()
-            df_main = df0.loc[~mask_carry].copy()
-            _process_block(df_main)
-        if carry is not None and not carry.empty:
-            _process_block(carry)
-
-    for h in handles.values():
-        h.close()
+                _process_block(carry)
+    finally:
+        for h in handles.values():
+            try:
+                fpath = h.name
+                h.close()
+                # Force NFS flush so Pass 1.5 reads complete data
+                fd = os.open(fpath, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except Exception:
+                pass
 
     C_out = pd.concat(C_parts, ignore_index=True) if C_parts else pd.DataFrame(columns=["barcode", "genome", "C"])
     N_out = pd.DataFrame(columns=["barcode", "n_reads"])  # placeholder; will be computed exactly post-merge
@@ -1751,6 +1779,21 @@ def _run_genotyping(
     # Pass 1
     # -----------------------
     marker = shard_root / "_SHARD_FORMAT_v2_sorted_by_barcode.txt"
+
+    # Clean stale shards from previous runs when resume is disabled
+    if not resume:
+        for wdir in shard_root.glob("w*"):
+            if wdir.is_dir():
+                shutil.rmtree(wdir)
+        merged_dir = shard_root / "merged"
+        if merged_dir.exists():
+            shutil.rmtree(merged_dir)
+        if marker.exists():
+            marker.unlink()
+        for p in (C_path, N_path):
+            if p.exists():
+                p.unlink()
+
     marker_ok = False
     if marker.exists():
         try:

@@ -899,10 +899,11 @@ def genotyping(
     if not glob.glob(assign_glob, recursive=True):
         raise typer.BadParameter(f"No assign files matched: {assign_glob}")
 
-    kwargs: Dict[str, object] = {"assign": assign_glob, 
-                                 "outdir": outdir_eff, 
+    kwargs: Dict[str, object] = {"assign": assign_glob,
+                                 "outdir": outdir_eff,
                                  "sample": sample_eff,
-                                 "config": config}
+                                 "config": config,
+                                 "resume": resume}
 
     # core
     if threads is not None:
