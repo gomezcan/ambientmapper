@@ -1627,6 +1627,8 @@ def _run_genotyping(
     eta_iters: Optional[int] = None,
     eta_seed_quantile: Optional[float] = None,
     topk_genomes: Optional[int] = None,
+    # fixed-eta override
+    eta_file: Optional[Path] = None,
     # DuckDB acceleration
     pass1_duckdb: Optional[bool] = None,
     pass2_duckdb: Optional[bool] = None,
@@ -1907,13 +1909,35 @@ def _run_genotyping(
     # -----------------------
     # Pass 2
     # -----------------------
-    if resume and eta_out.exists():
+    if eta_file is not None:
+        # Fixed-eta mode: load pre-computed profile, skip learning entirely
+        typer.echo(f"[2/4] Pass 2: fixed-eta mode — loading from {eta_file}")
+        eta_df = pd.read_csv(eta_file, sep="\t")
+        idx_col = eta_df.columns[0]
+        eta = eta_df.set_index(idx_col)["eta"].astype(float)
+        eta.index = eta.index.astype(str)
+        missing = set(all_genomes) - set(eta.index)
+        if missing:
+            raise ValueError(
+                f"--eta-file is missing genomes present in config: {missing}"
+            )
+        extra = set(eta.index) - set(all_genomes)
+        if extra:
+            typer.echo(f"  WARNING: --eta-file has extra genomes (ignored): {extra}", err=True)
+        eta = eta.reindex(all_genomes).fillna(0.0)
+        s = eta.sum()
+        if abs(s - 1.0) > 0.01:
+            typer.echo(f"  WARNING: --eta-file values sum to {s:.4f} (expected 1.0); renormalizing.", err=True)
+        eta = eta / (s + 1e-12)
+        eta.to_frame("eta").to_csv(eta_out, sep="\t", compression="gzip")
+        typer.echo(f"  eta saved: {eta_out.name}")
+    elif resume and eta_out.exists():
         typer.echo("[2/4] Pass 2: resume (found eta)")
         eta_df = pd.read_csv(eta_out, sep="\t", compression="gzip")
         idx_col = eta_df.columns[0]
         eta = eta_df.set_index(idx_col)["eta"]
         eta.index = eta.index.astype(str)
-        eta = eta.astype(float)        
+        eta = eta.astype(float)
         eta = eta / (eta.sum() + 1e-12)
     else:
         typer.echo(

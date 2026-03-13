@@ -851,6 +851,18 @@ def genotyping(
     eta_iters: Optional[int] = typer.Option(None, "--eta-iters"),
     eta_seed_quantile: Optional[float] = typer.Option(None, "--eta-seed-quantile"),
     topk_genomes: Optional[int] = typer.Option(None, "--topk-genomes"),
+    eta_file: Optional[Path] = typer.Option(
+        None,
+        "--eta-file",
+        help=(
+            "Pre-computed eta TSV (columns: genome<TAB>eta, must sum to ~1.0). "
+            "If provided, skips ambient learning (Pass 2) entirely. "
+            "Useful for fixed-eta diagnostic experiments or when prior "
+            "knowledge of ambient composition is available."
+        ),
+        exists=True,
+        readable=True,
+    ),
     # DuckDB acceleration
     pass1_duckdb: Optional[bool] = typer.Option(
         None, "--pass1-duckdb/--pass1-no-duckdb",
@@ -984,6 +996,8 @@ def genotyping(
         kwargs["eta_seed_quantile"] = float(eta_seed_quantile)
     if topk_genomes is not None:
         kwargs["topk_genomes"] = max(1, int(topk_genomes))
+    if eta_file is not None:
+        kwargs["eta_file"] = Path(eta_file)
 
     if pass1_duckdb is not None:
         kwargs["pass1_duckdb"] = bool(pass1_duckdb)
@@ -1096,6 +1110,12 @@ def run(
     genotyping_ratio_top1_top2_min: Optional[float] = typer.Option(None, "--genotyping-ratio-top1-top2-min"),
     genotyping_eta_iters: Optional[int] = typer.Option(None, "--genotyping-eta-iters"),
     genotyping_eta_seed_quantile: Optional[float] = typer.Option(None, "--genotyping-eta-seed-quantile"),
+    genotyping_eta_file: Optional[Path] = typer.Option(
+        None,
+        "--genotyping-eta-file",
+        help="Pre-computed eta TSV for genotyping step. Skips ambient learning if provided.",
+        exists=True, readable=True,
+    ),
     genotyping_empty_bic_margin: Optional[float] = typer.Option(None, "--genotyping-empty-bic-margin"),
     genotyping_empty_top1_max: Optional[float] = typer.Option(None, "--genotyping-empty-top1-max"),
     genotyping_empty_ratio12_max: Optional[float] = typer.Option(None, "--genotyping-empty-ratio12-max"),
@@ -1147,6 +1167,7 @@ def run(
         ("ratio_top1_top2_min", genotyping_ratio_top1_top2_min),
         ("eta_iters", genotyping_eta_iters),
         ("eta_seed_quantile", genotyping_eta_seed_quantile),
+        ("eta_file", genotyping_eta_file),
         ("empty_bic_margin", genotyping_empty_bic_margin),
         ("empty_top1_max", genotyping_empty_top1_max),
         ("empty_ratio12_max", genotyping_empty_ratio12_max),
