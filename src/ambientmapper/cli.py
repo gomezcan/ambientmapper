@@ -872,6 +872,28 @@ def genotyping(
         None, "--pass2-duckdb/--pass2-no-duckdb",
         help="Use DuckDB for Pass 2 eta computation (default: on). Falls back if duckdb unavailable.",
     ),
+    # Cross-mapping-aware singlet (Level 2)
+    xmap_chi_threshold: Optional[float] = typer.Option(
+        None, "--xmap-chi-threshold",
+        help="chi(g1) threshold above which Level 2 cross-mapping-aware singlet activates. Default: 0.05.",
+    ),
+    xmap_phi_min_reads: Optional[int] = typer.Option(
+        None, "--xmap-phi-min-reads",
+        help="Min reads per barcode for phi estimation subset D(g1). Default: 500.",
+    ),
+    xmap_phi_iters: Optional[int] = typer.Option(
+        None, "--xmap-phi-iters",
+        help="Phi refinement iterations. Default: 2.",
+    ),
+    xmap_phi_file: Optional[Path] = typer.Option(
+        None, "--xmap-phi-file",
+        help="Pre-computed phi matrix TSV (skips estimation). Cols=anchors, rows=targets.",
+        exists=True, readable=True,
+    ),
+    no_xmap: bool = typer.Option(
+        False, "--no-xmap",
+        help="Disable Level 2 cross-mapping-aware singlet model entirely.",
+    ),
     resume: bool = typer.Option(True, "--resume/--no-resume"),
 ) -> None:
     """Posterior-aware genotyping (merge → per-cell genotype calls)."""
@@ -1004,6 +1026,18 @@ def genotyping(
     if pass2_duckdb is not None:
         kwargs["pass2_duckdb"] = bool(pass2_duckdb)
 
+    # Cross-mapping (Level 2)
+    if xmap_chi_threshold is not None:
+        kwargs["xmap_chi_threshold"] = float(xmap_chi_threshold)
+    if xmap_phi_min_reads is not None:
+        kwargs["xmap_phi_min_reads"] = int(xmap_phi_min_reads)
+    if xmap_phi_iters is not None:
+        kwargs["xmap_phi_iters"] = max(0, int(xmap_phi_iters))
+    if xmap_phi_file is not None:
+        kwargs["xmap_phi_file"] = Path(xmap_phi_file)
+    if no_xmap:
+        kwargs["xmap_enabled"] = False
+
     # Sentinel for genotyping keyed by actual kwargs (Paths stringified)
     params = {k: (str(v) if isinstance(v, Path) else v) for k, v in kwargs.items()}
     if resume and _has_sentinel(d, "genotyping", cfg, params):
@@ -1130,6 +1164,16 @@ def run(
     # DuckDB acceleration for genotyping
     genotyping_pass1_duckdb: Optional[bool] = typer.Option(None, "--genotyping-pass1-duckdb/--genotyping-pass1-no-duckdb"),
     genotyping_pass2_duckdb: Optional[bool] = typer.Option(None, "--genotyping-pass2-duckdb/--genotyping-pass2-no-duckdb"),
+    # Cross-mapping-aware singlet (Level 2)
+    genotyping_xmap_chi_threshold: Optional[float] = typer.Option(None, "--genotyping-xmap-chi-threshold"),
+    genotyping_xmap_phi_min_reads: Optional[int] = typer.Option(None, "--genotyping-xmap-phi-min-reads"),
+    genotyping_xmap_phi_iters: Optional[int] = typer.Option(None, "--genotyping-xmap-phi-iters"),
+    genotyping_xmap_phi_file: Optional[Path] = typer.Option(
+        None, "--genotyping-xmap-phi-file",
+        help="Pre-computed phi matrix TSV for Level 2 cross-mapping.",
+        exists=True, readable=True,
+    ),
+    genotyping_no_xmap: bool = typer.Option(False, "--genotyping-no-xmap"),
 ) -> None:
     """Run the full pipeline."""
     inline_ready = all([sample, genome, bam, workdir])
@@ -1182,9 +1226,16 @@ def run(
         # DuckDB acceleration
         ("pass1_duckdb", genotyping_pass1_duckdb),
         ("pass2_duckdb", genotyping_pass2_duckdb),
+        # Cross-mapping (Level 2)
+        ("xmap_chi_threshold", genotyping_xmap_chi_threshold),
+        ("xmap_phi_min_reads", genotyping_xmap_phi_min_reads),
+        ("xmap_phi_iters", genotyping_xmap_phi_iters),
+        ("xmap_phi_file", genotyping_xmap_phi_file),
     ]:
         if v2 is not None:
             genotyping_conf[k2] = v2
+    if genotyping_no_xmap:
+        genotyping_conf["xmap_enabled"] = False
 
     if "eta_seed_quantile" in genotyping_conf:
         q = float(genotyping_conf["eta_seed_quantile"])

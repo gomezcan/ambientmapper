@@ -233,6 +233,10 @@ def _is_single_like(call: str, model: str) -> bool:
     return call in {"single_clean", "ambiguous_dirty_singlet"}
 
 
+def _is_weak_doublet(call: str) -> bool:
+    return _norm_str(call) == "weak_doublet"
+
+
 def _is_indist(call: str) -> bool:
     return _norm_str(call) == "indistinguishable"
 
@@ -253,6 +257,7 @@ def _compute_allowed_set(
     ambiguous_policy: str,
     doublet_policy: str,
     indist_policy: str,
+    weak_doublet_policy: str = "top1",
 ) -> Tuple[Set[str], str, str, str]:
     """
     Returns: (AllowedSet, action, reason, flags)
@@ -291,6 +296,15 @@ def _compute_allowed_set(
                 S = indS or {x for x in [g1, g2] if x} or {expected}
                 return S, "keep_cleaned", "indist_top12", ";".join(flags) or ""
             return {expected}, "keep_cleaned", "indist_expected_only", ";".join(flags) or ""
+
+        if _is_weak_doublet(call):
+            if weak_doublet_policy == "drop":
+                return set(), "drop_barcode", "weak_doublet_drop", ";".join(flags) or ""
+            if weak_doublet_policy == "top12":
+                S = {x for x in [g1, g2] if x} or {expected}
+                return S, "keep_cleaned", "weak_doublet_top12", ";".join(flags) or ""
+            # top1 (default)
+            return {expected}, "keep_cleaned", "weak_doublet_expected_only", ";".join(flags) or ""
 
         return {expected}, "keep_cleaned", "design_expected_only", ";".join(flags) or ""
 
@@ -337,6 +351,16 @@ def _compute_allowed_set(
     if _is_single_like(call, model):
         S = {g1} if g1 else set()
         return S, ("keep_cleaned" if S else "drop_barcode"), "single_top1", ""
+
+    if _is_weak_doublet(call):
+        if weak_doublet_policy == "drop":
+            return set(), "drop_barcode", "weak_doublet_drop", ""
+        if weak_doublet_policy == "top12":
+            S = {x for x in [g1, g2] if x}
+            return S, ("keep_cleaned" if S else "drop_barcode"), "weak_doublet_top12", ""
+        # top1 (default)
+        S = {g1} if g1 else set()
+        return S, ("keep_cleaned" if S else "drop_barcode"), "weak_doublet_top1", ""
 
     return set(), "drop_barcode", "unknown_call_drop", ""
 
@@ -891,6 +915,11 @@ def decontam(
         "--indist-policy",
         help="Indistinguishable policy: top12 | expected (design only)",
     ),
+    weak_doublet_policy: str = typer.Option(
+        "top1",
+        "--weak-doublet-policy",
+        help="Weak-doublet policy: top1 (keep g1 only, default) | top12 (keep g1+g2) | drop",
+    ),
 
     # Post-clean barcode gate
     min_reads_post_clean: int = typer.Option(
@@ -942,6 +971,21 @@ def decontam(
     if sample_name is None:
         sample_name = _infer_sample_name_from_cells_calls(cells_calls)
     sample_root = _infer_sample_root_from_cells_calls(cells_calls)
+
+    # Chi advisory warning (Level 2 cross-mapping detection)
+    chi_path = cells_calls.parent / f"{sample_name}_chi.tsv"
+    if chi_path.exists() and safe_keep_delta_as == 0:
+        try:
+            chi_df = pd.read_csv(chi_path, sep="\t")
+            if "level2_activated" in chi_df.columns and chi_df["level2_activated"].any():
+                max_chi = chi_df["chi"].max()
+                typer.echo(
+                    f"[decontam] WARNING: phi matrix detected max_chi={max_chi:.3f}. "
+                    f"High reference redundancy detected. Consider --safe-keep-delta-as 2 "
+                    f"to protect cross-mapping reads from spurious removal."
+                )
+        except Exception:
+            pass  # non-critical; don't block decontam
 
     # Design
     has_design = False
@@ -1027,6 +1071,7 @@ def decontam(
                 ambiguous_policy=ambiguous_policy,
                 doublet_policy=doublet_policy,
                 indist_policy=indist_policy,
+                weak_doublet_policy=weak_doublet_policy,
             )
 
         barcode_to_allowedset[bc_full] = allowed

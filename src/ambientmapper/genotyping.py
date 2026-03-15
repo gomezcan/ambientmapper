@@ -150,6 +150,14 @@ class MergeConfig(BaseModel):
     pass1_duckdb: bool = True   # Use DuckDB for Pass 1 file reading + reduction
     pass2_duckdb: bool = True   # Use DuckDB for Pass 2 eta computation
 
+    # Cross-mapping-aware singlet (Level 2)
+    xmap_chi_threshold: float = 0.05   # χ(g1) above which Level 2 activates
+    xmap_phi_min_reads: int = 500      # min reads for D(g1) subset
+    xmap_phi_iters: int = 2            # φ refinement iterations
+    xmap_phi_iter_eps: float = 0.01    # convergence tolerance
+    xmap_phi_ratio12_min: float = 2.0  # ratio12 gate for D(g1)
+    xmap_enabled: bool = True          # set False via --no-xmap to disable
+
 
 # --------------------------------------------------------------------------------------
 # Config JSON helpers
@@ -651,6 +659,7 @@ def _precompute_per_read_arrays(
     L_block: pd.DataFrame,
     eta: pd.Series,
     candidate_genomes: Sequence[str],
+    all_genomes_for_xmap: Optional[Sequence[str]] = None,
 ) -> Tuple[int, float, np.ndarray, Dict[str, np.ndarray]]:
     """
     Precompute exact per-read aggregates used by the current likelihood functions.
@@ -660,6 +669,7 @@ def _precompute_per_read_arrays(
       n_reads_eff: sum of per-read weights (diagnostic)
       E: shape (n_reads,) where E[r] = sum_g eta[g] * L_{r,g}
       Lg: dict genome->array shape (n_reads,) where Lg[g][r] = sum_{rows with genome==g, read_id==r} L
+           If all_genomes_for_xmap is provided, Lg includes ALL genomes (not just candidates).
     """
     # Factorize read_id once (stable order within this L_block)
     read_codes, _ = pd.factorize(L_block["read_id"], sort=False)
@@ -684,14 +694,24 @@ def _precompute_per_read_arrays(
     eta_row = eta.reindex(pd.Index(gn)).fillna(0.0).to_numpy(dtype=np.float64, copy=False)
     E = np.bincount(read_codes, weights=L * eta_row, minlength=n_reads).astype(np.float64, copy=False)
 
-    # Lg_r for the candidate genomes only (top-k)
+    # Lg_r: per-genome per-read likelihoods
+    # When xmap is active, build for ALL genomes; otherwise only candidates (top-k)
+    genomes_to_build = list(all_genomes_for_xmap) if all_genomes_for_xmap else list(candidate_genomes)
     Lg: Dict[str, np.ndarray] = {}
-    for g in candidate_genomes:
+    for g in genomes_to_build:
         m = (gn == g)
         if not np.any(m):
             Lg[g] = np.zeros(n_reads, dtype=np.float64)
         else:
             Lg[g] = np.bincount(read_codes[m], weights=L[m], minlength=n_reads).astype(np.float64, copy=False)
+    # Ensure candidate genomes are always present (may not be in all_genomes_for_xmap if data is sparse)
+    for g in candidate_genomes:
+        if g not in Lg:
+            m = (gn == g)
+            if not np.any(m):
+                Lg[g] = np.zeros(n_reads, dtype=np.float64)
+            else:
+                Lg[g] = np.bincount(read_codes[m], weights=L[m], minlength=n_reads).astype(np.float64, copy=False)
     return n_reads, n_reads_eff, E, Lg
 
 def _loglik_empty_from_E(E: np.ndarray) -> float:
@@ -704,6 +724,8 @@ def _best_single_from_arrays(
     Lg: Dict[str, np.ndarray],
     cfg: MergeConfig,
     candidate_genomes: Sequence[str],
+    phi_matrix: Optional[pd.DataFrame] = None,
+    chi: Optional[pd.Series] = None,
 ) -> Optional[Dict[str, Any]]:
     if n_reads <= 0 or not candidate_genomes:
         return None
@@ -711,11 +733,37 @@ def _best_single_from_arrays(
     alphas = np.arange(0.0, float(cfg.max_alpha) + 1e-9, float(cfg.alpha_grid), dtype=np.float64)
     logn = math.log(max(n_reads, 1))
 
+    # Pre-build L_wide matrix (n_reads × G_available) for xmap dot product
+    # Only needed if phi_matrix is provided and any candidate has chi > threshold
+    xmap_L_wide: Optional[np.ndarray] = None
+    xmap_genome_order: Optional[List[str]] = None
+    if phi_matrix is not None and chi is not None:
+        xmap_genome_order = list(phi_matrix.index)  # target genomes (rows)
+        xmap_L_wide = np.column_stack([
+            Lg.get(g, np.zeros(n_reads, dtype=np.float64))
+            for g in xmap_genome_order
+        ])  # shape: (n_reads, G)
+
     best: Optional[Dict[str, Any]] = None
     for g1 in candidate_genomes:
-        L1 = Lg[g1]
+        # Decide whether to use Level 2 cross-mapping for this g1
+        use_xmap = (
+            phi_matrix is not None
+            and chi is not None
+            and g1 in chi.index
+            and chi[g1] > cfg.xmap_chi_threshold
+            and g1 in phi_matrix.columns
+            and xmap_L_wide is not None
+            and xmap_genome_order is not None
+        )
+
+        if use_xmap:
+            phi_vec = phi_matrix[g1].reindex(xmap_genome_order).fillna(0.0).to_numpy()
+            L1 = xmap_L_wide @ phi_vec  # L*_g1(r) = Σ_g φ_{g|g1} · L_g(r)
+        else:
+            L1 = Lg[g1]
+
         # Vectorized over alpha: s[a, r] = (1-a)*L1[r] + a*E[r]
-        # This matches the current single model exactly.
         s = (1.0 - alphas)[:, None] * L1[None, :] + alphas[:, None] * E[None, :]
         ll = np.log(np.clip(s, 1e-12, None)).sum(axis=1)  # shape (n_alpha,)
         bic = (-2.0 * ll) + (1.0 * logn)                  # 1 parameter for single
@@ -723,7 +771,11 @@ def _best_single_from_arrays(
         k = int(np.argmin(bic))
         bic_k = float(bic[k])
         if best is None or bic_k < best["bic"]:
-            best = {"model": "single", "g1": g1, "alpha": float(alphas[k]), "bic": bic_k}
+            best = {
+                "model": "single", "g1": g1, "alpha": float(alphas[k]), "bic": bic_k,
+                "xmap_activated": use_xmap,
+                "chi_g1": float(chi[g1]) if (chi is not None and g1 in chi.index) else None,
+            }
 
     return best
 
@@ -781,9 +833,26 @@ def _select_model_for_barcode(
     eta: pd.Series,
     cfg: MergeConfig,
     candidate_genomes: Sequence[str],
+    phi_matrix: Optional[pd.DataFrame] = None,
+    chi: Optional[pd.Series] = None,
 ) -> Dict[str, Any]:
-    # Precompute per-read arrays (exactly preserves loglik math)    
-    n_reads, n_reads_eff, E, Lg = _precompute_per_read_arrays(L_block, eta, candidate_genomes)
+    # Determine if any candidate genome needs xmap (Level 2)
+    need_xmap = (
+        phi_matrix is not None
+        and chi is not None
+        and cfg.xmap_enabled
+        and any(
+            g1 in chi.index and chi[g1] > cfg.xmap_chi_threshold
+            for g1 in candidate_genomes
+        )
+    )
+    all_genomes_for_xmap = list(phi_matrix.index) if need_xmap and phi_matrix is not None else None
+
+    # Precompute per-read arrays (exactly preserves loglik math)
+    n_reads, n_reads_eff, E, Lg = _precompute_per_read_arrays(
+        L_block, eta, candidate_genomes,
+        all_genomes_for_xmap=all_genomes_for_xmap,
+    )
     read_count = int(n_reads)
 
     mass = L_block.groupby("genome", sort=False)["L"].sum().sort_values(ascending=False)
@@ -830,7 +899,11 @@ def _select_model_for_barcode(
         return out
       
     # Best single/doublet using vectorized NumPy grids (same grid, same BIC)
-    best_single = _best_single_from_arrays(read_count, E, Lg, cfg, candidate_genomes)
+    best_single = _best_single_from_arrays(
+        read_count, E, Lg, cfg, candidate_genomes,
+        phi_matrix=phi_matrix if need_xmap else None,
+        chi=chi if need_xmap else None,
+    )
     best_doublet = _best_doublet_from_arrays(read_count, E, Lg, cfg, candidate_genomes)
       
     bic_s = float(best_single["bic"]) if best_single else float("inf")
@@ -907,6 +980,10 @@ def _select_model_for_barcode(
     out["bic_best"] = float(chosen["bic"])
     if chosen.get("alpha") is not None:
         out["purity_best"] = float(1.0 - float(chosen["alpha"]))
+
+    # Level 2 cross-mapping info (from best_single if singlet won, else from best_single anyway for diagnostics)
+    out["xmap_activated"] = best_single.get("xmap_activated", False) if best_single else False
+    out["chi_g1"] = best_single.get("chi_g1") if best_single else None
 
     # --------------------------
     # Purity/strength sublabels
@@ -1214,6 +1291,8 @@ def _pass1_process_one_file(
 _PASS3_ETA: Optional[pd.Series] = None
 _PASS3_TOPK: Optional[Dict[str, List[str]]] = None
 _PASS3_CFG: Optional[MergeConfig] = None
+_PASS3_PHI: Optional[pd.DataFrame] = None
+_PASS3_CHI: Optional[pd.Series] = None
 
 def _write_topk_tsv(topk: Dict[str, List[str]], path: Path) -> None:
     """
@@ -1245,12 +1324,18 @@ def _load_topk_tsv(path: Path) -> Dict[str, List[str]]:
     return topk
 
 
-def _pass3_init_worker(eta_path: str, topk_path: str, cfg_dict: Dict[str, Any]) -> None:
+def _pass3_init_worker(
+    eta_path: str,
+    topk_path: str,
+    cfg_dict: Dict[str, Any],
+    phi_path: Optional[str] = None,
+    chi_path: Optional[str] = None,
+) -> None:
     """
     Initializer run once per worker process.
-    Loads eta + topk into process globals to avoid reloading for every shard.
+    Loads eta + topk + optional phi/chi into process globals to avoid reloading for every shard.
     """
-    global _PASS3_ETA, _PASS3_TOPK, _PASS3_CFG
+    global _PASS3_ETA, _PASS3_TOPK, _PASS3_CFG, _PASS3_PHI, _PASS3_CHI
 
     # eta
     eta_df = pd.read_csv(eta_path, sep="\t", compression="gzip")
@@ -1267,13 +1352,26 @@ def _pass3_init_worker(eta_path: str, topk_path: str, cfg_dict: Dict[str, Any]) 
     # cfg
     _PASS3_CFG = MergeConfig(**cfg_dict)
 
+    # phi / chi (Level 2 cross-mapping)
+    _PASS3_PHI = None
+    _PASS3_CHI = None
+    if phi_path is not None and Path(phi_path).exists():
+        phi_df = pd.read_csv(phi_path, sep="\t", index_col=0, compression="gzip")
+        phi_df.index = phi_df.index.astype(str)
+        phi_df.columns = phi_df.columns.astype(str)
+        _PASS3_PHI = phi_df
+    if chi_path is not None and Path(chi_path).exists():
+        chi_df = pd.read_csv(chi_path, sep="\t")
+        _PASS3_CHI = chi_df.set_index("genome")["chi"].astype(float)
+        _PASS3_CHI.index = _PASS3_CHI.index.astype(str)
+
 
 def _pass3_process_one_shard(shard_path_str: str, out_part_path_str: str) -> Tuple[str, int]:
     """
     Worker job: process one shard file and write a part file (no header).
     Returns (shard_path, called_count).
     """
-    global _PASS3_ETA, _PASS3_TOPK, _PASS3_CFG
+    global _PASS3_ETA, _PASS3_TOPK, _PASS3_CFG, _PASS3_PHI, _PASS3_CHI
     assert _PASS3_ETA is not None and _PASS3_TOPK is not None and _PASS3_CFG is not None
 
     shard_path = Path(shard_path_str)
@@ -1287,6 +1385,8 @@ def _pass3_process_one_shard(shard_path_str: str, out_part_path_str: str) -> Tup
             topk=_PASS3_TOPK,
             cfg=_PASS3_CFG,
             out_handle=oh,
+            phi_matrix=_PASS3_PHI,
+            chi=_PASS3_CHI,
         )
     return (shard_path.name, int(called))
 
@@ -1471,6 +1571,133 @@ def _learn_eta(
 
 
 # --------------------------------------------------------------------------------------
+# Cross-mapping profile (Level 2)
+# --------------------------------------------------------------------------------------
+
+def _compute_phi_matrix(
+    C_all: pd.DataFrame,
+    N_all: pd.DataFrame,
+    all_genomes: Sequence[str],
+    cfg: MergeConfig,
+) -> Tuple[pd.DataFrame, pd.Series]:
+    """
+    Estimate per-genome cross-mapping profiles φ_{g|g1} from step 4 outputs.
+
+    Returns
+    -------
+    phi_df : pd.DataFrame
+        Shape (G, G). Index = target genomes. Columns = anchor genomes.
+        phi_df[g1][g] = φ_{g|g1}.  Each column sums to 1.0.
+    chi : pd.Series
+        Index = anchor genomes. Values = χ(g1) = max_{g≠g1} φ_{g|g1}.
+    """
+    genome_list = list(all_genomes)
+    G = len(genome_list)
+
+    # Step 1: Pivot C_all to wide (barcode × genome)
+    C_wide = C_all.pivot(index="barcode", columns="genome", values="C").fillna(0.0)
+    # Ensure all genomes present as columns
+    for g in genome_list:
+        if g not in C_wide.columns:
+            C_wide[g] = 0.0
+    C_wide = C_wide[genome_list]
+
+    # N_all: barcode → n_reads (may be barcode-only or barcode×genome)
+    if "genome" in N_all.columns:
+        n_reads = N_all.groupby("barcode")["n_reads"].sum()
+    else:
+        n_reads = N_all.set_index("barcode")["n_reads"]
+    n_reads = n_reads.reindex(C_wide.index).fillna(0)
+
+    # Step 2: top_genome and ratio12 from C_wide
+    C_vals = C_wide.to_numpy()
+    top2_idx = np.argsort(-C_vals, axis=1)[:, :2]  # indices of top-2
+    rows = np.arange(len(C_vals))
+    top1_vals = C_vals[rows, top2_idx[:, 0]]
+    top2_vals = C_vals[rows, top2_idx[:, 1]]
+    ratio12 = top1_vals / (top2_vals + 1e-12)
+    top_genome = np.array(genome_list)[top2_idx[:, 0]]
+
+    n_reads_arr = n_reads.to_numpy()
+
+    # Build N_wide for off-diagonal correction (C_g - N_g)
+    # N_wide: barcode × genome with unique-read counts per genome
+    if "genome" in N_all.columns and "n_reads" in N_all.columns:
+        N_wide = N_all.pivot(index="barcode", columns="genome", values="n_reads").fillna(0.0)
+    else:
+        # Fallback: uniform split (rare, only if N_all has no genome column)
+        N_wide = pd.DataFrame(0.0, index=C_wide.index, columns=genome_list)
+    for g in genome_list:
+        if g not in N_wide.columns:
+            N_wide[g] = 0.0
+    N_wide = N_wide.reindex(C_wide.index).fillna(0.0)[genome_list]
+
+    C_np = C_wide.to_numpy()
+    N_np = N_wide.to_numpy()
+
+    # Step 3: Iterative φ estimation
+    phi_cols: Dict[str, Optional[np.ndarray]] = {}
+    for _iteration in range(max(1, cfg.xmap_phi_iters)):
+        phi_cols = {}
+        for gi, g1 in enumerate(genome_list):
+            # Build D(g1): top_genome==g1 AND n_reads>=threshold AND ratio12>=threshold
+            mask = (
+                (top_genome == g1)
+                & (n_reads_arr >= cfg.xmap_phi_min_reads)
+                & (ratio12 >= cfg.xmap_phi_ratio12_min)
+            )
+            n_D = int(mask.sum())
+            if n_D < 10:
+                phi_cols[g1] = None
+                continue
+
+            D_C = C_np[mask]   # (n_D, G)
+            D_N = N_np[mask]   # (n_D, G)
+
+            # Raw scores
+            s = np.zeros(G, dtype=np.float64)
+            for gj in range(G):
+                if gj == gi:
+                    s[gj] = D_C[:, gj].mean()  # diagonal: full C
+                else:
+                    s[gj] = np.maximum(D_C[:, gj] - D_N[:, gj], 0.0).mean()  # off-diag: C-N
+
+            total = s.sum()
+            if total <= 0:
+                phi_cols[g1] = None
+                continue
+            phi_cols[g1] = s / total
+
+    # Step 4: Assemble phi_df and chi
+    phi_data = {}
+    for g1 in genome_list:
+        if phi_cols.get(g1) is not None:
+            phi_data[g1] = pd.Series(phi_cols[g1], index=genome_list)
+        else:
+            # Fallback: identity (all mass on diagonal)
+            identity = np.zeros(G, dtype=np.float64)
+            identity[genome_list.index(g1)] = 1.0
+            phi_data[g1] = pd.Series(identity, index=genome_list)
+
+    phi_df = pd.DataFrame(phi_data, index=genome_list)  # (G × G)
+
+    # Compute chi: max off-diagonal per column
+    chi_vals = {}
+    for g1 in genome_list:
+        col = phi_df[g1].copy()
+        col[g1] = 0.0  # exclude diagonal
+        chi_vals[g1] = col.max()
+    chi = pd.Series(chi_vals)
+
+    # Validation
+    col_sums = phi_df.sum(axis=0)
+    if abs(col_sums - 1.0).max() > 0.01:
+        typer.echo(f"[xmap] WARNING: phi columns do not sum to 1.0 (max deviation={abs(col_sums - 1.0).max():.4f})")
+
+    return phi_df, chi
+
+
+# --------------------------------------------------------------------------------------
 # Calling: per-shard file (call each barcode once)
 # --------------------------------------------------------------------------------------
 
@@ -1480,6 +1707,8 @@ def _call_from_shard_file(
     topk: Dict[str, List[str]],
     cfg: MergeConfig,
     out_handle,
+    phi_matrix: Optional[pd.DataFrame] = None,
+    chi: Optional[pd.Series] = None,
 ) -> int:
     """
     Stream calls from a shard file without materializing all barcodes in memory.
@@ -1498,7 +1727,8 @@ def _call_from_shard_file(
             return
         L_block = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
         cand = topk.get(cur_bc, [])
-        res = _select_model_for_barcode(L_block, eta, cfg, cand)
+        res = _select_model_for_barcode(L_block, eta, cfg, cand,
+                                        phi_matrix=phi_matrix, chi=chi)
 
         out_handle.write(
             "\t".join(
@@ -1525,6 +1755,8 @@ def _call_from_shard_file(
                     "1" if res.get("near_tie_sd") else "0" if res.get("near_tie_sd") is not None else "",
                     f"{float(res.get('doublet_minor_frac', 0.0)):.6g}",
                     f"{float(res.get('purity_best')):.6g}" if res.get("purity_best") is not None else "",
+                    "1" if res.get("xmap_activated") else "0",
+                    f"{float(res.get('chi_g1')):.6g}" if res.get("chi_g1") is not None else "",
                 ]
             )
             + "\n"
@@ -1632,6 +1864,12 @@ def _run_genotyping(
     # DuckDB acceleration
     pass1_duckdb: Optional[bool] = None,
     pass2_duckdb: Optional[bool] = None,
+    # Cross-mapping (Level 2)
+    xmap_chi_threshold: Optional[float] = None,
+    xmap_phi_min_reads: Optional[int] = None,
+    xmap_phi_iters: Optional[int] = None,
+    xmap_phi_file: Optional[Path] = None,
+    xmap_enabled: Optional[bool] = None,
     resume: bool = True,
 ) -> None:
     cfg_json = _read_cfg_json(Path(config))
@@ -1730,6 +1968,16 @@ def _run_genotyping(
         cfg.pass1_duckdb = bool(pass1_duckdb)
     if pass2_duckdb is not None:
         cfg.pass2_duckdb = bool(pass2_duckdb)
+
+    # Cross-mapping (Level 2)
+    if xmap_chi_threshold is not None:
+        cfg.xmap_chi_threshold = float(xmap_chi_threshold)
+    if xmap_phi_min_reads is not None:
+        cfg.xmap_phi_min_reads = int(xmap_phi_min_reads)
+    if xmap_phi_iters is not None:
+        cfg.xmap_phi_iters = int(xmap_phi_iters)
+    if xmap_enabled is not None:
+        cfg.xmap_enabled = bool(xmap_enabled)
 
     files = [Path(f) for f in glob.glob(assign_glob, recursive=True)]
     if not files:
@@ -1949,6 +2197,35 @@ def _run_genotyping(
         typer.echo(f"[2/4] eta saved: {eta_out.name}  seed_sizes={eta_meta.get('seed_sizes')}")
 
     # -----------------------
+    # Pass 2.5: Cross-mapping profile (Level 2)
+    # -----------------------
+    phi_out = outdir_eff / f"{sample_eff}_phi_matrix.tsv.gz"
+    chi_out = outdir_eff / f"{sample_eff}_chi.tsv"
+    phi_path_str: Optional[str] = None
+    chi_path_str: Optional[str] = None
+
+    if cfg.xmap_enabled:
+        if resume and phi_out.exists() and chi_out.exists():
+            typer.echo("[xmap] resume (found phi/chi)")
+            phi_path_str = str(phi_out)
+            chi_path_str = str(chi_out)
+        else:
+            typer.echo("[xmap] estimating cross-mapping profile φ")
+            phi_matrix, chi = _compute_phi_matrix(C_all, N_all, all_genomes, cfg)
+            phi_matrix.to_csv(phi_out, sep="\t", compression="gzip")
+            chi_df = pd.DataFrame({
+                "genome": chi.index,
+                "chi": chi.values,
+                "level2_activated": chi.values > cfg.xmap_chi_threshold,
+            })
+            chi_df.to_csv(chi_out, sep="\t", index=False)
+            phi_path_str = str(phi_out)
+            chi_path_str = str(chi_out)
+            for g1 in all_genomes:
+                act = chi.get(g1, 0) > cfg.xmap_chi_threshold
+                typer.echo(f"[xmap] {g1}: chi={chi.get(g1, 0):.3f} -> Level2={'ON' if act else 'off'}")
+
+    # -----------------------
     # Pass 3 parallelism support (globals per worker process)
     # -----------------------
     
@@ -1992,7 +2269,7 @@ def _run_genotyping(
         with ProcessPoolExecutor(
             max_workers=pass3_workers,
             initializer=_pass3_init_worker,
-            initargs=(str(eta_out), str(topk_path), cfg_dict),
+            initargs=(str(eta_out), str(topk_path), cfg_dict, phi_path_str, chi_path_str),
         ) as ex:
             futs = [ex.submit(_pass3_process_one_shard, shard_str, part_str) for shard_str, part_str in jobs]
             for fut in as_completed(futs):
@@ -2024,6 +2301,8 @@ def _run_genotyping(
                 "near_tie_sd",
                 "doublet_minor_frac",
                 "purity_best",
+                "xmap_activated",
+                "chi_g1",
             ]
         )
         
