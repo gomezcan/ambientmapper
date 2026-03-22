@@ -894,6 +894,15 @@ def genotyping(
         False, "--no-xmap",
         help="Disable Level 2 cross-mapping-aware singlet model entirely.",
     ),
+    # Read quality filters
+    min_mapq_genotyping: Optional[int] = typer.Option(
+        None, "--min-mapq-genotyping",
+        help="Exclude reads with MAPQ below this (default: disabled). Recommended: 30.",
+    ),
+    max_xa_genotyping: Optional[int] = typer.Option(
+        None, "--max-xa-genotyping",
+        help="Exclude reads with XAcount above this (default: disabled, 0 = unique only).",
+    ),
     resume: bool = typer.Option(True, "--resume/--no-resume"),
 ) -> None:
     """Posterior-aware genotyping (merge → per-cell genotype calls)."""
@@ -972,6 +981,10 @@ def genotyping(
         kwargs["max_hits"] = int(max_hits)
     if hits_delta_mapq is not None:
         kwargs["hits_delta_mapq"] = int(hits_delta_mapq)
+    if min_mapq_genotyping is not None:
+        kwargs["min_mapq_genotyping"] = int(min_mapq_genotyping)
+    if max_xa_genotyping is not None:
+        kwargs["max_xa_genotyping"] = int(max_xa_genotyping)
 
     if w_confident is not None:
         kwargs["w_confident"] = float(w_confident)

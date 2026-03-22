@@ -150,6 +150,10 @@ class MergeConfig(BaseModel):
     pass1_duckdb: bool = True   # Use DuckDB for Pass 1 file reading + reduction
     pass2_duckdb: bool = True   # Use DuckDB for Pass 2 eta computation
 
+    # Read quality filters (applied before posterior computation)
+    min_mapq_genotyping: int = 0    # MAPQ < this → exclude row (0 = disabled)
+    max_xa_genotyping: int = -1     # XAcount > this → exclude row (-1 = disabled)
+
     # Cross-mapping-aware singlet (Level 2)
     xmap_chi_threshold: float = 0.05   # χ(g1) above which Level 2 activates
     xmap_phi_min_reads: int = 500      # min reads for D(g1) subset
@@ -240,6 +244,9 @@ def _coerce_assign_schema(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["assigned_class"] = pd.Series(["ambiguous"] * len(out), dtype="string")
 
+    if "XAcount" in out.columns:
+        out["XAcount"] = pd.to_numeric(out["XAcount"], errors="coerce").fillna(0).astype(int)
+
     return out
 
 
@@ -256,6 +263,8 @@ def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
         "NM": "min",
         "assigned_class": _agg_assigned_class,
     }
+    if "XAcount" in df.columns:
+        agg["XAcount"] = "max"
     return df.groupby(keys, observed=True, sort=False).agg(agg).reset_index()
 
 def shlex_quote(s: str) -> str:
@@ -577,6 +586,38 @@ def _filter_promiscuous_ambiguous_reads(df: pd.DataFrame, cfg: MergeConfig) -> T
         "enabled": True,
         "dropped_groups": int(bad_codes.size) + guard_dropped,
         "dropped_rows": int(drop_mask.sum()),
+    }
+
+
+def _filter_read_quality(df: pd.DataFrame, cfg: MergeConfig) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Exclude reads below MAPQ threshold or with within-genome multi-mapping (XA > max)."""
+    if cfg.min_mapq_genotyping <= 0 and cfg.max_xa_genotyping < 0:
+        return df, {"enabled": False}
+
+    n_before = len(df)
+    mask = np.ones(n_before, dtype=bool)
+
+    n_dropped_mapq = 0
+    if cfg.min_mapq_genotyping > 0:
+        mapq = df["MAPQ"].to_numpy(dtype=np.float32)
+        mapq_fail = mapq < cfg.min_mapq_genotyping
+        n_dropped_mapq = int(mapq_fail.sum())
+        mask &= ~mapq_fail
+
+    n_dropped_xa = 0
+    if cfg.max_xa_genotyping >= 0 and "XAcount" in df.columns:
+        xa = df["XAcount"].to_numpy(dtype=np.float32)
+        xa_fail = xa > cfg.max_xa_genotyping
+        n_dropped_xa = int(xa_fail.sum())
+        mask &= ~xa_fail
+
+    n_after = int(mask.sum())
+    return df.loc[mask].copy(), {
+        "enabled": True,
+        "n_before": n_before,
+        "n_after": n_after,
+        "n_dropped_mapq": n_dropped_mapq,
+        "n_dropped_xa": n_dropped_xa,
     }
 
 
@@ -1102,13 +1143,17 @@ class Pass1Outputs:
     N: pd.DataFrame
 
 
-def _pass1_read_and_reduce_duckdb(fp: Path) -> pd.DataFrame:
+def _pass1_read_and_reduce_duckdb(
+    fp: Path,
+    min_mapq: int = 0,
+    max_xa: int = -1,
+) -> pd.DataFrame:
     """
     DuckDB fast path: read an assign output TSV(.gz) and perform the
     _reduce_alignments_to_per_genome() reduction in a single SQL pass.
 
     Returns a DataFrame with columns:
-      barcode, read_id, genome, AS, MAPQ, NM, assigned_class
+      barcode, read_id, genome, AS, MAPQ, NM, assigned_class[, XAcount]
     identical in schema to _coerce_assign_schema() + _reduce_alignments_to_per_genome().
     """
     import duckdb
@@ -1122,9 +1167,20 @@ def _pass1_read_and_reduce_duckdb(fp: Path) -> pd.DataFrame:
     genome_col = '"Genome"' if "Genome" in header else "genome"
     # AS is a SQL keyword — always quote it
     as_col = '"AS"'
+    has_xa = "XAcount" in header
 
     path_str = str(fp).replace("'", "''")
     compression = "'gzip'" if str(fp).endswith(".gz") else "'none'"
+
+    # Build WHERE clause for MAPQ and XA filtering
+    where_parts = []
+    if min_mapq > 0:
+        where_parts.append(f"CAST(MAPQ AS FLOAT) >= {min_mapq}")
+    if max_xa >= 0 and has_xa:
+        where_parts.append(f"CAST(XAcount AS INT) <= {max_xa}")
+    where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+    xa_select = ",\n        MAX(CAST(XAcount AS INT)) AS XAcount" if has_xa else ""
 
     sql = f"""
     SELECT
@@ -1138,7 +1194,7 @@ def _pass1_read_and_reduce_duckdb(fp: Path) -> pd.DataFrame:
             WHEN SUM(CASE WHEN assigned_class = 'ambiguous' THEN 1 ELSE 0 END) > 0
             THEN 'ambiguous'
             ELSE FIRST(assigned_class)
-        END AS assigned_class
+        END AS assigned_class{xa_select}
     FROM read_csv(
         '{path_str}',
         delim='\\t',
@@ -1146,6 +1202,7 @@ def _pass1_read_and_reduce_duckdb(fp: Path) -> pd.DataFrame:
         compression={compression},
         ignore_errors=true
     )
+    {where_clause}
     GROUP BY {bc_col}, {read_col}, {genome_col}
     """
 
@@ -1210,6 +1267,9 @@ def _pass1_process_one_file(
         df, _ = _filter_promiscuous_ambiguous_reads(df, cfg)
         if df.empty:
             return
+        df, _ = _filter_read_quality(df, cfg)
+        if df.empty:
+            return
         Ldf = _compute_read_posteriors(df, cfg)
         if Ldf.empty:
             return
@@ -1231,7 +1291,11 @@ def _pass1_process_one_file(
     try:
         if use_duckdb and _HAS_DUCKDB:
             # --- DuckDB path: single SQL query for read + reduction ---
-            df_reduced = _pass1_read_and_reduce_duckdb(fp)
+            df_reduced = _pass1_read_and_reduce_duckdb(
+                fp,
+                min_mapq=cfg.min_mapq_genotyping,
+                max_xa=cfg.max_xa_genotyping,
+            )
             df_reduced = df_reduced.dropna(subset=["barcode", "read_id", "genome"])
 
             # Process in memory-safe chunks (no carry-over needed — GROUP BY is complete)
@@ -1833,6 +1897,9 @@ def _run_genotyping(
     max_hits: Optional[int] = None,
     hits_delta_mapq: Optional[float] = None,
     max_rows_per_read_guard: Optional[int] = None,
+    # read quality filters
+    min_mapq_genotyping: Optional[int] = None,
+    max_xa_genotyping: Optional[int] = None,
     # fusion
     beta: Optional[float] = None,
     w_as: Optional[float] = None,
@@ -1904,6 +1971,10 @@ def _run_genotyping(
     cfg.hits_delta_mapq = None if (cfg.max_hits is None or hits_delta_mapq is None) else float(hits_delta_mapq)
     if max_rows_per_read_guard is not None:
         cfg.max_rows_per_read_guard = int(max_rows_per_read_guard)
+    if min_mapq_genotyping is not None:
+        cfg.min_mapq_genotyping = int(min_mapq_genotyping)
+    if max_xa_genotyping is not None:
+        cfg.max_xa_genotyping = int(max_xa_genotyping)
 
     if beta is not None:
         cfg.beta = float(beta)
