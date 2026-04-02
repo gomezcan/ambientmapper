@@ -268,6 +268,46 @@ def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
         agg["XAcount"] = "max"
     return df.groupby(keys, observed=True, sort=False).agg(agg).reset_index()
 
+def _reclass_within_topk(df: pd.DataFrame) -> pd.DataFrame:
+    """Re-classify reads as winner/ambiguous within the top-K genome context.
+
+    The original ``assigned_class`` was computed across ALL genomes in the assign
+    step.  After restricting to top-K genomes per barcode, a read that was
+    "ambiguous" (tied between genome #1 and genome #4) may become a clear
+    "winner" if genome #4 is no longer in the candidate set.
+
+    For each read (identified by barcode + read_id), we compare the best AS
+    among the remaining top-K genomes.  If the best strictly exceeds the
+    second-best, the read is re-classified as "winner"; otherwise "ambiguous".
+    """
+    if df.empty or "AS" not in df.columns:
+        return df
+
+    rid = df["barcode"].astype(str) + "::" + df["read_id"].astype(str)
+    codes = rid.astype("category")
+    cat_codes = codes.cat.codes.to_numpy(np.int32)
+    as_arr = df["AS"].to_numpy(np.float32)
+
+    n_reads = int(cat_codes.max()) + 1 if cat_codes.size else 0
+
+    # Find best AS per read
+    best = np.full(n_reads, -np.inf, dtype=np.float32)
+    np.maximum.at(best, cat_codes, as_arr)
+
+    # Count how many genome hits match the best AS per read.
+    # Winner = exactly 1 genome at the best AS (clear winner within top-K).
+    # Ambiguous = 2+ genomes tie at the best AS.
+    at_best = (as_arr == best[cat_codes]).astype(np.int32)
+    n_at_best = np.zeros(n_reads, dtype=np.int32)
+    np.add.at(n_at_best, cat_codes, at_best)
+
+    new_class = np.where(n_at_best[cat_codes] == 1, "winner", "ambiguous")
+
+    df = df.copy()
+    df["assigned_class"] = new_class
+    return df
+
+
 def shlex_quote(s: str) -> str:
     import shlex
     return shlex.quote(s)
@@ -1548,6 +1588,12 @@ def _pass275_reclass_one_file(
         df, _ = _filter_read_quality(df, cfg)
         if df.empty:
             return
+        # --- Re-classify winner/ambiguous within top-K context ---
+        # The original assigned_class was computed across ALL genomes in the
+        # assign step. Now that we've restricted to top-K genomes, re-evaluate:
+        # a read is "winner" within top-K if its best AS strictly exceeds the
+        # second-best AS among the remaining top-K genomes.
+        df = _reclass_within_topk(df)
         Ldf = _compute_read_posteriors(df, cfg)
         if Ldf.empty:
             return
