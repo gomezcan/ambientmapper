@@ -851,6 +851,10 @@ def genotyping(
     eta_iters: Optional[int] = typer.Option(None, "--eta-iters"),
     eta_seed_quantile: Optional[float] = typer.Option(None, "--eta-seed-quantile"),
     topk_genomes: Optional[int] = typer.Option(None, "--topk-genomes"),
+    topk_reclass: Optional[bool] = typer.Option(
+        None, "--topk-reclass/--no-topk-reclass",
+        help="Re-classify reads within top-K genomes per barcode (Pass 2.75).",
+    ),
     eta_file: Optional[Path] = typer.Option(
         None,
         "--eta-file",
@@ -1031,6 +1035,8 @@ def genotyping(
         kwargs["eta_seed_quantile"] = float(eta_seed_quantile)
     if topk_genomes is not None:
         kwargs["topk_genomes"] = max(1, int(topk_genomes))
+    if topk_reclass is not None:
+        kwargs["topk_reclass"] = bool(topk_reclass)
     if eta_file is not None:
         kwargs["eta_file"] = Path(eta_file)
 
@@ -1146,6 +1152,10 @@ def run(
     genotyping_ambient_const: Optional[float] = typer.Option(None, "--genotyping-ambient-const"),
     genotyping_bic_margin: Optional[float] = typer.Option(None, "--genotyping-bic-margin"),
     genotyping_topk_genomes: Optional[int] = typer.Option(None, "--genotyping-topk-genomes"),
+    genotyping_topk_reclass: Optional[bool] = typer.Option(
+        None, "--genotyping-topk-reclass/--no-genotyping-topk-reclass",
+        help="Enable Pass 2.75 top-K re-classification in genotyping.",
+    ),
     genotyping_threads: Optional[int] = typer.Option(None, "--genotyping-threads"),
     genotyping_shards: Optional[int] = typer.Option(None, "--genotyping-shards"),
     genotyping_chunk_rows: Optional[int] = typer.Option(None, "--genotyping-chunk-rows"),
@@ -1213,6 +1223,7 @@ def run(
         ("ambient_const", genotyping_ambient_const),
         ("bic_margin", genotyping_bic_margin),
         ("topk_genomes", genotyping_topk_genomes),
+        ("topk_reclass", genotyping_topk_reclass),
         ("threads", genotyping_threads),
         ("shards", genotyping_shards),
         ("chunk_rows", genotyping_chunk_rows),

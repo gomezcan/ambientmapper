@@ -348,6 +348,7 @@ def _run_genotyping(ctx: Ctx) -> None:
     w_nm = float(gconf.get("w_nm", 1.0))
     ambient_const = float(gconf.get("ambient_const", 1e-3))
     topk_genomes = int(gconf.get("topk_genomes", 3))
+    topk_reclass = bool(gconf.get("topk_reclass", False))
     shards = int(gconf.get("shards", 32))
     chunk_rows = int(gconf.get("chunk_rows", 1_000_000))
     winner_only = bool(gconf.get("winner_only", False))
@@ -394,6 +395,7 @@ def _run_genotyping(ctx: Ctx) -> None:
         ambient_const=ambient_const,        
         bic_margin=bic_margin,
         topk_genomes=topk_genomes,
+        topk_reclass=topk_reclass,
         threads=threads,
         shards=shards,
         chunk_rows=chunk_rows,

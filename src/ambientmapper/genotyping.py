@@ -124,6 +124,7 @@ class MergeConfig(BaseModel):
     rho_grid: float = 0.05
     max_alpha: float = 0.5
     topk_genomes: int = 3
+    topk_reclass: bool = False  # Enable Pass 2.75 top-K re-classification
 
     # System / IO
     sample: str = "sample"
@@ -1349,6 +1350,279 @@ def _pass1_process_one_file(
 
 
 # --------------------------------------------------------------------------------------
+# Pass 2.75: Top-K read re-classification (worker infrastructure)
+# --------------------------------------------------------------------------------------
+
+_PASS275_TOPK: Optional[Dict[str, List[str]]] = None
+_PASS275_CFG: Optional[MergeConfig] = None
+_PASS275_BC_TO_CHUNK: Optional[Dict[str, int]] = None
+_PASS275_USE_DUCKDB: bool = False
+
+
+def _pass275_init_worker(
+    topk_path: str,
+    cfg_dict: Dict[str, Any],
+    bc_to_chunk: Optional[Dict[str, int]],
+    use_duckdb: bool,
+) -> None:
+    """Initializer for Pass 2.75 worker pool — loads topk from disk once."""
+    global _PASS275_TOPK, _PASS275_CFG, _PASS275_BC_TO_CHUNK, _PASS275_USE_DUCKDB
+    _PASS275_TOPK = _load_topk_tsv(Path(topk_path))
+    _PASS275_CFG = MergeConfig(**cfg_dict)
+    _PASS275_BC_TO_CHUNK = bc_to_chunk
+    _PASS275_USE_DUCKDB = use_duckdb
+
+
+def _pass275_worker_job(args) -> pd.DataFrame:
+    """
+    Top-level picklable worker for Pass 2.75.
+    args: (worker_index, filepath_str, shard_root_str)
+    Returns: C_part DataFrame [barcode, genome, C].
+    """
+    i, fp_str, shard_root_str = args
+    global _PASS275_TOPK, _PASS275_CFG, _PASS275_BC_TO_CHUNK, _PASS275_USE_DUCKDB
+    assert _PASS275_TOPK is not None and _PASS275_CFG is not None
+    fp = Path(fp_str)
+    shard_root = Path(shard_root_str)
+    wdir = shard_root / f"w{i:03d}"
+    return _pass275_reclass_one_file(
+        fp, _PASS275_CFG, wdir, _PASS275_BC_TO_CHUNK,
+        _PASS275_TOPK, use_duckdb=_PASS275_USE_DUCKDB,
+    )
+
+
+def _pass275_read_and_reduce_duckdb(
+    fp: Path,
+    topk: Dict[str, List[str]],
+    min_mapq: int = 0,
+    max_xa: int = -1,
+) -> pd.DataFrame:
+    """
+    DuckDB fast path for Pass 2.75: read assign TSV, perform per-genome
+    reduction, and INNER JOIN with topk to keep only top-K rows.
+    Returns DataFrame identical in schema to _pass1_read_and_reduce_duckdb
+    but restricted to top-K genomes per barcode.
+    """
+    import duckdb
+    import pyarrow as pa
+
+    # Build topk long-form table for the JOIN
+    bc_list: List[str] = []
+    gn_list: List[str] = []
+    for bc, genomes in topk.items():
+        for g in genomes:
+            bc_list.append(bc)
+            gn_list.append(g)
+    topk_arrow = pa.table({
+        "tk_barcode": pa.array(bc_list, type=pa.string()),
+        "tk_genome": pa.array(gn_list, type=pa.string()),
+    })
+
+    # Sniff header (same logic as _pass1_read_and_reduce_duckdb)
+    opener = gzip.open if str(fp).endswith(".gz") else open
+    with opener(fp, "rt") as f:
+        header = f.readline().strip().split("\t")
+    bc_col = "BC" if "BC" in header else "barcode"
+    read_col = '"Read"' if "Read" in header else "read_id"
+    genome_col = '"Genome"' if "Genome" in header else "genome"
+    as_col = '"AS"'
+    has_xa = "XAcount" in header
+
+    path_str = str(fp).replace("'", "''")
+    compression = "'gzip'" if str(fp).endswith(".gz") else "'none'"
+
+    where_parts: List[str] = []
+    if min_mapq > 0:
+        where_parts.append(f"CAST(MAPQ AS FLOAT) >= {min_mapq}")
+    if max_xa >= 0 and has_xa:
+        where_parts.append(f"CAST(XAcount AS INT) <= {max_xa}")
+    where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+    xa_select = ",\n        MAX(CAST(XAcount AS INT)) AS XAcount" if has_xa else ""
+
+    sql = f"""
+    SELECT a.*
+    FROM (
+        SELECT
+            CAST({bc_col} AS VARCHAR) AS barcode,
+            CAST({read_col} AS VARCHAR) AS read_id,
+            CAST({genome_col} AS VARCHAR) AS genome,
+            MAX(CAST({as_col} AS FLOAT)) AS "AS",
+            MAX(CAST(MAPQ AS FLOAT)) AS MAPQ,
+            MIN(CAST(NM AS FLOAT)) AS NM,
+            CASE
+                WHEN SUM(CASE WHEN assigned_class = 'ambiguous' THEN 1 ELSE 0 END) > 0
+                THEN 'ambiguous'
+                ELSE FIRST(assigned_class)
+            END AS assigned_class{xa_select}
+        FROM read_csv(
+            '{path_str}',
+            delim='\\t',
+            header=true,
+            compression={compression},
+            ignore_errors=true
+        )
+        {where_clause}
+        GROUP BY {bc_col}, {read_col}, {genome_col}
+    ) a
+    INNER JOIN topk_tbl t
+        ON a.barcode = t.tk_barcode AND a.genome = t.tk_genome
+    """
+
+    con = duckdb.connect()
+    con.execute("SET threads TO 2")
+    con.register("topk_tbl", topk_arrow)
+    result = con.execute(sql).fetchdf()
+    con.close()
+
+    for col in ["barcode", "read_id", "genome", "assigned_class"]:
+        if col in result.columns:
+            result[col] = result[col].astype("string")
+
+    return result
+
+
+def _pass275_reclass_one_file(
+    fp: Path,
+    cfg: MergeConfig,
+    shard_dir: Path,
+    bc_to_chunk: Optional[Dict[str, int]],
+    topk: Dict[str, List[str]],
+    use_duckdb: bool = False,
+) -> pd.DataFrame:
+    """
+    Re-read one assign chunk file, restrict to top-K genomes per barcode,
+    recompute posteriors, write to shards.
+
+    Structurally mirrors _pass1_process_one_file but adds a top-K genome
+    filter before posterior computation.
+
+    Returns: C_part DataFrame [barcode, genome, C].
+    """
+    shard_dir.mkdir(parents=True, exist_ok=True)
+
+    handles: Dict[int, gzip.GzipFile] = {}
+    header_written = np.zeros(cfg.shards, dtype=bool)
+
+    def _get_handle(sid: int) -> gzip.GzipFile:
+        if sid in handles:
+            return handles[sid]
+        h = gzip.open(shard_dir / f"shard_{sid:02d}.tsv.gz", "at")
+        handles[sid] = h
+        return h
+
+    C_parts: List[pd.DataFrame] = []
+
+    def _topk_filter(df: pd.DataFrame) -> pd.DataFrame:
+        """Filter DataFrame to keep only rows where genome is in topk[barcode]."""
+        if df.empty:
+            return df
+        # Build lookup set for barcodes present in this chunk
+        bcs_in_chunk = df["barcode"].astype(str).unique()
+        topk_pairs: set = set()
+        for bc in bcs_in_chunk:
+            for g in topk.get(bc, ()):
+                topk_pairs.add((bc, g))
+        if not topk_pairs:
+            return df.iloc[:0]
+        bc_arr = df["barcode"].astype(str).to_numpy()
+        gn_arr = df["genome"].astype(str).to_numpy()
+        keep = np.array(
+            [(bc_arr[i], gn_arr[i]) in topk_pairs for i in range(len(df))],
+            dtype=bool,
+        )
+        return df.loc[keep].copy()
+
+    def _posterior_and_shard(df: pd.DataFrame) -> None:
+        """Top-K filter, quality filters, compute posteriors, write to shards."""
+        nonlocal C_parts
+        if df is None or df.empty:
+            return
+        # --- Top-K genome filter (the key difference from Pass 1) ---
+        df = _topk_filter(df)
+        if df.empty:
+            return
+        df, _ = _filter_promiscuous_ambiguous_reads(df, cfg)
+        if df.empty:
+            return
+        df, _ = _filter_read_quality(df, cfg)
+        if df.empty:
+            return
+        Ldf = _compute_read_posteriors(df, cfg)
+        if Ldf.empty:
+            return
+        C_parts.append(Ldf.groupby(["barcode", "genome"], sort=False)["L"].sum().rename("C").reset_index())
+        sid = _route_shards_for_barcodes(Ldf["barcode"], cfg, bc_to_chunk)
+        Ldf = Ldf.assign(_sid=sid)
+        for i in range(cfg.shards):
+            sub = Ldf[Ldf["_sid"] == i]
+            if sub.empty:
+                continue
+            h = _get_handle(i)
+            if not header_written[i]:
+                h.write("barcode\tread_id\tgenome\tL\tL_amb\tw_read\n")
+                header_written[i] = True
+            sub2 = sub.drop(columns="_sid")
+            sub2 = sub2.sort_values(["barcode", "read_id", "genome"], kind="mergesort")
+            sub2.to_csv(h, sep="\t", header=False, index=False)
+
+    try:
+        if use_duckdb and _HAS_DUCKDB:
+            # DuckDB path: read + reduce + top-K JOIN in a single SQL query
+            df_reduced = _pass275_read_and_reduce_duckdb(
+                fp, topk,
+                min_mapq=cfg.min_mapq_genotyping,
+                max_xa=cfg.max_xa_genotyping,
+            )
+            df_reduced = df_reduced.dropna(subset=["barcode", "read_id", "genome"])
+            chunk_sz = int(cfg.chunk_rows)
+            for start in range(0, len(df_reduced), chunk_sz):
+                block = df_reduced.iloc[start:start + chunk_sz]
+                _posterior_and_shard(block)
+        else:
+            # Pandas chunked path (mirrors Pass 1)
+            carry: Optional[pd.DataFrame] = None
+
+            def _process_block(df_block: pd.DataFrame) -> None:
+                if df_block is None or df_block.empty:
+                    return
+                df = _reduce_alignments_to_per_genome(df_block)
+                df = df.dropna(subset=["barcode", "read_id", "genome"])
+                _posterior_and_shard(df)
+
+            for raw in pd.read_csv(fp, sep="\t", chunksize=int(cfg.chunk_rows), low_memory=False):
+                df0 = _coerce_assign_schema(raw)
+                if carry is not None and not carry.empty:
+                    df0 = pd.concat([carry, df0], ignore_index=True)
+                if df0.empty:
+                    carry = None
+                    continue
+                last_bc = str(df0["barcode"].iloc[-1])
+                last_rid = str(df0["read_id"].iloc[-1])
+                mask_carry = (df0["barcode"].astype(str) == last_bc) & (df0["read_id"].astype(str) == last_rid)
+                carry = df0.loc[mask_carry].copy()
+                df_main = df0.loc[~mask_carry].copy()
+                _process_block(df_main)
+            if carry is not None and not carry.empty:
+                _process_block(carry)
+    finally:
+        for h in handles.values():
+            try:
+                fpath = h.name
+                h.close()
+                fd = os.open(fpath, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except Exception:
+                pass
+
+    C_out = pd.concat(C_parts, ignore_index=True) if C_parts else pd.DataFrame(columns=["barcode", "genome", "C"])
+    return C_out
+
+
+# --------------------------------------------------------------------------------------
 # Pass 3 parallelism support (globals per worker process)
 # --------------------------------------------------------------------------------------
 
@@ -1926,6 +2200,7 @@ def _run_genotyping(
     eta_iters: Optional[int] = None,
     eta_seed_quantile: Optional[float] = None,
     topk_genomes: Optional[int] = None,
+    topk_reclass: Optional[bool] = None,
     # fixed-eta override
     eta_file: Optional[Path] = None,
     # DuckDB acceleration
@@ -2035,6 +2310,8 @@ def _run_genotyping(
         cfg.eta_seed_quantile = float(eta_seed_quantile)
     if topk_genomes is not None:
         cfg.topk_genomes = int(topk_genomes)
+    if topk_reclass is not None:
+        cfg.topk_reclass = bool(topk_reclass)
     if pass1_duckdb is not None:
         cfg.pass1_duckdb = bool(pass1_duckdb)
     if pass2_duckdb is not None:
@@ -2111,6 +2388,10 @@ def _run_genotyping(
             shutil.rmtree(merged_dir)
         if marker.exists():
             marker.unlink()
+        # Also clean Pass 2.75 reclass shards
+        reclass_dir = tmp_dir / "L_shards_workers_reclass"
+        if reclass_dir.exists():
+            shutil.rmtree(reclass_dir)
         for p in (C_path, N_path):
             if p.exists():
                 p.unlink()
@@ -2297,18 +2578,109 @@ def _run_genotyping(
                 typer.echo(f"[xmap] {g1}: chi={chi.get(g1, 0):.3f} -> Level2={'ON' if act else 'off'}")
 
     # -----------------------
-    # Pass 3 parallelism support (globals per worker process)
+    # Pass 2.75: Top-K read re-classification (optional)
     # -----------------------
-    
+    reclass_merged_root: Optional[Path] = None
+
+    if cfg.topk_reclass and int(cfg.topk_genomes) >= 2:
+        reclass_shard_root = tmp_dir / "L_shards_workers_reclass"
+        reclass_merged_candidate = reclass_shard_root / "merged"
+        reclass_marker = reclass_shard_root / "_RECLASS_v1.txt"
+        reclass_C_path = outdir_eff / f"{sample_eff}_C_all_reclass.tsv.gz"
+        reclass_N_path = outdir_eff / f"{sample_eff}_N_all_reclass.tsv.gz"
+
+        if resume and reclass_marker.exists() and reclass_C_path.exists() and reclass_N_path.exists():
+            typer.echo("[2.75] Pass 2.75: resume (found re-classified shards)")
+            C_all = pd.read_csv(reclass_C_path, sep="\t", compression="gzip",
+                                dtype={"barcode": "string", "genome": "string", "C": "float64"})
+            N_all = pd.read_csv(reclass_N_path, sep="\t", compression="gzip",
+                                dtype={"barcode": "string", "n_reads": "int64"})
+            reclass_merged_root = reclass_merged_candidate
+        else:
+            typer.echo(
+                f"[2.75] Pass 2.75: re-classifying reads with top-K={cfg.topk_genomes} "
+                f"per barcode ({len(files)} assign files, {len(topk):,} barcodes)"
+            )
+            reclass_shard_root.mkdir(parents=True, exist_ok=True)
+
+            # Write topk for workers
+            topk_path_275 = reclass_shard_root / f"{sample_eff}_topk.tsv.gz"
+            _write_topk_tsv(topk, topk_path_275)
+
+            cfg_dict_275 = cfg.model_dump()
+
+            args275 = [
+                (i, str(f), str(reclass_shard_root))
+                for i, f in enumerate(files)
+            ]
+
+            C_list_275: List[pd.DataFrame] = []
+            with ProcessPoolExecutor(
+                max_workers=max(1, int(pass1_workers_eff)),
+                initializer=_pass275_init_worker,
+                initargs=(str(topk_path_275), cfg_dict_275, bc_to_chunk, use_pass1_duckdb),
+            ) as ex:
+                futs = [ex.submit(_pass275_worker_job, a) for a in args275]
+                for fut in as_completed(futs):
+                    C_part = fut.result()
+                    if not C_part.empty:
+                        C_list_275.append(C_part)
+
+            # Aggregate new C_all
+            if C_list_275:
+                C_all = (
+                    pd.concat(C_list_275, ignore_index=True)
+                    .groupby(["barcode", "genome"], sort=False)["C"].sum().reset_index()
+                )
+            else:
+                C_all = pd.DataFrame(columns=["barcode", "genome", "C"])
+
+            if C_all.empty:
+                typer.echo("[2.75] WARNING: re-classification produced no mass. Falling back to original shards.", err=True)
+            else:
+                C_all.to_csv(reclass_C_path, sep="\t", index=False, compression="gzip")
+
+                # Merge re-classified worker shards
+                typer.echo("[2.75] merging re-classified worker shards")
+                reclass_pass15_tmp = tmp_dir / "pass275_sort_tmp"
+                reclass_pass15_tmp.mkdir(parents=True, exist_ok=True)
+                reclass_merged_root = _merge_worker_shards_pass15(
+                    shard_root=reclass_shard_root,
+                    shards=cfg.shards,
+                    force=True,
+                    sort_mem=str(cfg.pass15_sort_mem),
+                    tmpdir=reclass_pass15_tmp,
+                )
+
+                # Recompute N_all from new merged shards
+                typer.echo("[2.75] computing N_all from re-classified shards")
+                N_all = _compute_N_all_from_merged_shards(reclass_merged_root, cfg)
+                N_all.to_csv(reclass_N_path, sep="\t", index=False, compression="gzip")
+
+                reclass_marker.write_text("v1\n")
+                typer.echo(
+                    f"[2.75] done: {len(C_all):,} (barcode, genome) entries, "
+                    f"{N_all['n_reads'].sum():,} total reads"
+                )
+
+    # -----------------------
+    # Pass 3: model selection / calls
+    # -----------------------
+
     if resume and calls_path.exists():
         typer.echo("[3/4] Pass 3: resume (found calls)")
     else:
-        typer.echo("[3/4] Pass 3: model selection / calls from shards (parallel)")        
-        merged_root = shard_root / "merged"        
-        shards_list = sorted((shard_root / "merged").glob("shard_*.tsv.gz"))
+        # Use re-classified shards if Pass 2.75 ran, otherwise original
+        if reclass_merged_root is not None:
+            merged_root = reclass_merged_root
+            typer.echo("[3/4] Pass 3: model selection from re-classified shards (parallel)")
+        else:
+            merged_root = shard_root / "merged"
+            typer.echo("[3/4] Pass 3: model selection / calls from shards (parallel)")
+        shards_list = sorted(merged_root.glob("shard_*.tsv.gz"))
 
         if not shards_list:
-            raise RuntimeError(f"Pass 3: no shard_*.tsv.gz found under {shard_root}")
+            raise RuntimeError(f"Pass 3: no shard_*.tsv.gz found under {merged_root}")
         
         pass3_tmp = tmp_dir / "pass3_parts"
         pass3_tmp.mkdir(parents=True, exist_ok=True)
@@ -2470,6 +2842,11 @@ def genotyping_cmd(
     eta_iters: Optional[int] = typer.Option(None, "--eta-iters"),
     eta_seed_quantile: Optional[float] = typer.Option(None, "--eta-seed-quantile"),
     topk_genomes: Optional[int] = typer.Option(None, "--topk-genomes"),
+    topk_reclass: Optional[bool] = typer.Option(
+        None, "--topk-reclass/--no-topk-reclass",
+        help="Re-classify reads within top-K genomes per barcode (Pass 2.75). "
+             "Improves singlet detection for closely related genomes.",
+    ),
     # DuckDB acceleration
     pass1_duckdb: Optional[bool] = typer.Option(
         None, "--pass1-duckdb/--pass1-no-duckdb",
@@ -2523,6 +2900,7 @@ def genotyping_cmd(
         eta_iters=eta_iters,
         eta_seed_quantile=eta_seed_quantile,
         topk_genomes=topk_genomes,
+        topk_reclass=topk_reclass,
         pass1_duckdb=pass1_duckdb,
         pass2_duckdb=pass2_duckdb,
         resume=resume,

@@ -44,6 +44,7 @@ Ambient contamination–aware multi-genome genotyping for single-cell libraries 
   - [Global run options](#global-run-options)
   - [Assign parameters](#assign-parameters)
   - [Genotyping parameters](#genotyping-parameters)
+  - [Top-K re-classification](#top-k-re-classification)
   - [Decontam parameters](#decontam-parameters)
   - [Environment variables](#environment-variables)
 - [Troubleshooting / FAQ](#troubleshooting--faq)
@@ -900,6 +901,7 @@ Pass via `--genotyping-*` flags on `ambientmapper run`, or use `ambientmapper ge
 | `--genotyping-ratio-top1-top2-min` | `2.0` | Min top1/top2 score ratio to call `single_clean` |
 | `--genotyping-doublet-minor-min` | `0.20` | Min minor fraction to call `doublet` (vs `weak_doublet`) |
 | `--genotyping-topk-genomes` | `3` | Candidate genomes per barcode for Pass 2 |
+| `--genotyping-topk-reclass / --no-genotyping-topk-reclass` | off | Enable Pass 2.75: re-read assign chunks restricted to top-K genomes per barcode and recompute posteriors. Dramatically improves singlet detection for closely related genomes (e.g., F1 31% → 75% on 26-genome maize). See [Top-K re-classification](#top-k-re-classification) below. |
 | `--alpha-grid` | — | Step size for ambient fraction grid search |
 | `--rho-grid` | — | Step size for doublet mixture grid search |
 | `--max-alpha` | — | Maximum ambient fraction in grid search |
@@ -934,6 +936,42 @@ Pass via `--genotyping-*` flags on `ambientmapper run`, or use `ambientmapper ge
 | `--genotyping-shards` | `32` | Temporary shard files for cross-barcode spill |
 | `--genotyping-chunk-rows` | `5000000` | Row batch size for Pass 1 streaming |
 | `--genotyping-threads` | — | Override thread count for the genotyping step |
+
+### Top-K re-classification
+
+When working with many closely related genomes (e.g., 26 NAM maize lines at ~95% sequence identity), the assign step classifies nearly all reads as "ambiguous" because each read ties on at least one pairwise genome comparison. This dilutes posterior mass and prevents the genotyping model from calling singlets.
+
+**Pass 2.75** (`--genotyping-topk-reclass`) fixes this by re-reading the original assign chunks after the top-K candidate genomes have been identified per barcode. For each read, only the barcode's top-K genomes are considered when computing posteriors. A read that was "ambiguous" across 26 genomes may become a clear "winner" when restricted to the 2–3 most likely genomes.
+
+**Usage:**
+
+```bash
+# Recommended for closely related genomes
+ambientmapper run --config cfg.json --threads 16 \
+  --genotyping-topk-genomes 2 --genotyping-topk-reclass
+
+# Standalone genotyping
+ambientmapper genotyping --config cfg.json \
+  --topk-genomes 2 --topk-reclass
+```
+
+**How it works:**
+
+1. Pass 1 runs as normal, computing posteriors over all genomes.
+2. Top-K genomes per barcode are selected from aggregate posterior mass (C\_all).
+3. **Pass 2.75** re-reads assign chunks, restricts each read to top-K genomes, recomputes posteriors, and writes new shards.
+4. Pass 3 (model selection) reads from the re-classified shards.
+
+**When to use:**
+
+| Dataset type | Recommended | Expected improvement |
+|---|---|---|
+| 2 genomes, distant (maize + arabidopsis) | Not needed | Already works well |
+| 2 genomes, related (B73 + Mo17) | `--topk-genomes 2 --topk-reclass` | Moderate |
+| Many genomes, closely related (26 NAM) | `--topk-genomes 2 --topk-reclass` | Major (F1: 31% → 75%) |
+| Many genomes, moderately related | `--topk-genomes 3 --topk-reclass` | Moderate |
+
+**Performance note:** Pass 2.75 re-reads all assign chunk files (same I/O as Pass 1). DuckDB acceleration is used when available to push the top-K filter into SQL. Wall time is comparable to Pass 1.
 
 ### Decontam parameters
 
