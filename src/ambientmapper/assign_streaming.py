@@ -1460,9 +1460,11 @@ def _friend_rescue(df: pd.DataFrame, window: int = 1000) -> pd.DataFrame:
     barcode maps nearby in the same genome's coordinate system.
 
     For each (BC, Genome) group, winner reads define "rescue zones" based on
-    their frag_loc (chr:pos:mate_pos).  Ambiguous reads whose frag_loc falls
-    within ±window of any winner in the same genome get ``assigned_class``
-    changed from 'ambiguous' to 'rescued'.
+    their frag_loc (chr:pos:mate_pos).  Both fragment endpoints (R1 start and
+    mate start) are checked independently — a match on EITHER end counts.
+
+    Ambiguous reads whose frag_loc falls within ±window of any winner endpoint
+    in the same genome get ``assigned_class`` changed to 'rescued'.
 
     Operates on the assembled output DataFrame (winner + ambiguous rows).
     """
@@ -1472,49 +1474,78 @@ def _friend_rescue(df: pd.DataFrame, window: int = 1000) -> pd.DataFrame:
     if not has_loc.any():
         return df
 
-    # Parse frag_loc → (chr, pos) using R1 start only (fast)
+    # Parse frag_loc → (chr, R1_pos, mate_pos)
     parts = df["frag_loc"].str.split(":", n=2, expand=True)
-    if parts.shape[1] < 2:
+    if parts.shape[1] < 3:
         return df
     df = df.copy()
     df["_chr"] = parts[0]
-    df["_pos"] = pd.to_numeric(parts[1], errors="coerce")
+    df["_pos1"] = pd.to_numeric(parts[1], errors="coerce")
+    df["_pos2"] = pd.to_numeric(parts[2], errors="coerce")
 
-    # Build winner lookup: for each (BC, Genome, chr), collect winner positions
-    winners = df[(df["assigned_class"] == "winner") & df["_pos"].notna()]
+    # Build winner lookup: for each (BC, Genome, chr), collect ALL winner
+    # positions (both R1 and mate) in a single sorted array.
+    winners = df[df["assigned_class"] == "winner"]
     if winners.empty:
-        df.drop(columns=["_chr", "_pos"], inplace=True)
+        df.drop(columns=["_chr", "_pos1", "_pos2"], inplace=True)
         return df
 
-    # Group winner positions by (BC, Genome, chr) → sorted arrays
-    win_groups = (
-        winners.groupby(["BC", "Genome", "_chr"])["_pos"]
-        .apply(lambda s: np.sort(s.values))
-        .to_dict()
-    )
+    win_groups: dict = {}
+    for _, row in winners.iterrows():
+        bc, genome, chrom = row["BC"], row["Genome"], row["_chr"]
+        if pd.isna(chrom) or chrom == "*":
+            continue
+        key = (bc, genome, chrom)
+        if key not in win_groups:
+            win_groups[key] = []
+        p1 = row["_pos1"]
+        p2 = row["_pos2"]
+        if pd.notna(p1) and p1 >= 0:
+            win_groups[key].append(p1)
+        if pd.notna(p2) and p2 >= 0:
+            win_groups[key].append(p2)
 
-    # For each ambiguous read: check if any winner is within ±window
-    ambig_mask = (df["assigned_class"] == "ambiguous") & df["_pos"].notna()
+    # Sort winner positions for binary search
+    for key in win_groups:
+        win_groups[key] = np.sort(np.array(win_groups[key], dtype=np.float64))
+
+    # For each ambiguous read: check if EITHER endpoint is within ±window
+    # of any winner endpoint in the same (BC, Genome, chr).
+    ambig_mask = df["assigned_class"] == "ambiguous"
     rescued = np.zeros(len(df), dtype=bool)
+
+    def _near_any(win_pos, pos):
+        """Check if pos is within ±window of any value in sorted win_pos."""
+        if pd.isna(pos) or pos < 0:
+            return False
+        j = np.searchsorted(win_pos, pos)
+        if j < len(win_pos) and abs(win_pos[j] - pos) <= window:
+            return True
+        if j > 0 and abs(win_pos[j - 1] - pos) <= window:
+            return True
+        return False
 
     for idx in df.index[ambig_mask]:
         bc = df.at[idx, "BC"]
         genome = df.at[idx, "Genome"]
         chrom = df.at[idx, "_chr"]
-        pos = df.at[idx, "_pos"]
+        if pd.isna(chrom) or chrom == "*":
+            continue
         key = (bc, genome, chrom)
         if key not in win_groups:
             continue
         win_pos = win_groups[key]
-        # Binary search for nearest winner
-        j = np.searchsorted(win_pos, pos)
-        if (j < len(win_pos) and abs(win_pos[j] - pos) <= window) or \
-           (j > 0 and abs(win_pos[j - 1] - pos) <= window):
+        # Check R1 position
+        if _near_any(win_pos, df.at[idx, "_pos1"]):
+            rescued[idx] = True
+            continue
+        # Check mate position
+        if _near_any(win_pos, df.at[idx, "_pos2"]):
             rescued[idx] = True
 
     df.loc[rescued, "assigned_class"] = "rescued"
 
-    df.drop(columns=["_chr", "_pos"], inplace=True)
+    df.drop(columns=["_chr", "_pos1", "_pos2"], inplace=True)
     return df
 
 
