@@ -28,4 +28,14 @@ def bam_to_qc(bam_path: Path, out_path: Path, sample_name: str | None = None):
                 xa = aln.get_tag("XA")
                 xa_count = xa.count(";") if isinstance(xa, str) else 0
 
-            w.writerow([read, bc, mapq, ascore, nm, xa_count])
+            # Fragment location: chr:R1_start:mate_start
+            chrom = aln.reference_name or "*"
+            pos = aln.reference_start
+            mate_pos = (
+                aln.next_reference_start
+                if aln.is_paired and not aln.mate_is_unmapped
+                else -1
+            )
+            frag_loc = f"{chrom}:{pos}:{mate_pos}"
+
+            w.writerow([read, bc, mapq, ascore, nm, xa_count, frag_loc])

@@ -26,10 +26,10 @@ def filter_qc_file(
                 MAPQ=max, AS=max, NM=min, XAcount=max.
 
     Input format (no header), tab-delimited:
-      Read  BC  MAPQ  AS  NM  XAcount
+      Read  BC  MAPQ  AS  NM  XAcount  [frag_loc]
 
     Output format (WITH header), tab-delimited:
-      Read  BC  MAPQ  AS  NM  XAcount
+      Read  BC  MAPQ  AS  NM  XAcount  frag_loc
 
     Returns:
       number of unique (Read, BC) pairs written (rows in output, excluding header).
@@ -80,7 +80,7 @@ def filter_qc_file(
     if not keep:
         # Write empty file with header, matching previous behavior
         with out_path.open("w") as out:
-            out.write("Read\tBC\tMAPQ\tAS\tNM\tXAcount\n")
+            out.write("Read\tBC\tMAPQ\tAS\tNM\tXAcount\tfrag_loc\n")
         return 0
 
     # Allow GC to reclaim counts dict memory before heavy pass 2
@@ -89,8 +89,8 @@ def filter_qc_file(
     # -------------------------
     # Pass 2: filter + collapse by (Read, BC)
     # -------------------------
-    # key: (Read, BC) -> (MAPQ, AS, NM, XAcount)
-    agg: Dict[Tuple[str, str], Tuple[int, int, int, int]] = {}
+    # key: (Read, BC) -> (MAPQ, AS, NM, XAcount, frag_loc)
+    agg: Dict[Tuple[str, str], Tuple[int, int, int, int, str]] = {}
 
     def _to_int(x: str, default: int) -> int:
         try:
@@ -125,6 +125,7 @@ def filter_qc_file(
             alsc = _to_int(parts[3], 0)
             nm = _to_int(parts[4], 10**9)
             xac = _to_int(parts[5], 0)
+            frag_loc = parts[6] if len(parts) >= 7 else ""
 
             # Intern read too (often repeated), helps memory when collapsing duplicates
             read = sys.intern(read)
@@ -132,10 +133,10 @@ def filter_qc_file(
             key = (read, bc)
             prev = agg.get(key)
             if prev is None:
-                agg[key] = (mapq, alsc, nm, xac)
+                agg[key] = (mapq, alsc, nm, xac, frag_loc)
             else:
-                pm, pa, pn, px = prev
-                # MAPQ=max, AS=max, NM=min, XAcount=max
+                pm, pa, pn, px, pf = prev
+                # MAPQ=max, AS=max, NM=min, XAcount=max, frag_loc=keep first
                 if mapq < pm:
                     mapq = pm
                 if alsc < pa:
@@ -144,14 +145,14 @@ def filter_qc_file(
                     nm = pn
                 if xac < px:
                     xac = px
-                agg[key] = (mapq, alsc, nm, xac)
+                agg[key] = (mapq, alsc, nm, xac, pf)
 
     # -------------------------
     # Write output
     # -------------------------
     with out_path.open("w") as out:
-        out.write("Read\tBC\tMAPQ\tAS\tNM\tXAcount\n")
-        for (read, bc), (mapq, alsc, nm, xac) in agg.items():
-            out.write(f"{read}\t{bc}\t{mapq}\t{alsc}\t{nm}\t{xac}\n")
+        out.write("Read\tBC\tMAPQ\tAS\tNM\tXAcount\tfrag_loc\n")
+        for (read, bc), (mapq, alsc, nm, xac, frag_loc) in agg.items():
+            out.write(f"{read}\t{bc}\t{mapq}\t{alsc}\t{nm}\t{xac}\t{frag_loc}\n")
 
     return int(len(agg))

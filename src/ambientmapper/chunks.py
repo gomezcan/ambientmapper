@@ -9,7 +9,7 @@ import sqlite3
 def _iter_barcodes_from_filtered(path: Path) -> Iterable[str]:
     """
     Stream barcodes from a filtered QCMapping file.
-    Assumes header: Read\tBC\tMAPQ\tAS\tNM\tXAcount
+    Assumes header: Read\tBC\tMAPQ\tAS\tNM\tXAcount[\tfrag_loc]
     """
     with path.open("r") as f:
         header = f.readline()
