@@ -152,7 +152,8 @@ def _build_duckdb_union_sql(
         parts.append(
             f"SELECT Read, BC, CAST(\"AS\" AS FLOAT) AS as_, "
             f"CAST(MAPQ AS FLOAT) AS MAPQ, CAST(NM AS FLOAT) AS NM, "
-            f"CAST(XAcount AS FLOAT) AS XAcount, '{genome}' AS Genome "
+            f"CAST(XAcount AS FLOAT) AS XAcount, '{genome}' AS Genome, "
+            f"COALESCE(frag_loc, '') AS frag_loc "
             f"FROM read_csv('{path}', delim='\\t', header=true) "
             f"WHERE {' AND '.join(where)}"
         )
@@ -412,7 +413,7 @@ def _score_chunk_duckdb(
         {union_sql}
     ),
     deduped AS (
-        SELECT Read, BC, Genome, as_, MAPQ, NM, XAcount
+        SELECT Read, BC, Genome, as_, MAPQ, NM, XAcount, frag_loc
         FROM (
             SELECT *,
                 ROW_NUMBER() OVER (
@@ -433,7 +434,7 @@ def _score_chunk_duckdb(
             COUNT(*) OVER (PARTITION BY Read, BC) AS n_genomes
         FROM deduped
     )
-    SELECT Read, BC, Genome, as_, MAPQ, NM, XAcount, _rn, _rn_worst, n_genomes
+    SELECT Read, BC, Genome, as_, MAPQ, NM, XAcount, frag_loc, _rn, _rn_worst, n_genomes
     FROM ranked
     WHERE _rn <= 2 OR _rn_worst = 1
     """
@@ -443,7 +444,7 @@ def _score_chunk_duckdb(
     def lazy_ambig(ambiguous_bcs: set) -> "pd.DataFrame":
         if not ambiguous_bcs:
             return pd.DataFrame(
-                columns=["Read", "BC", "Genome", "as_", "MAPQ", "NM", "XAcount"]
+                columns=["Read", "BC", "Genome", "as_", "MAPQ", "NM", "XAcount", "frag_loc"]
             )
         con.register(
             "_ambiguous_bcs",
@@ -456,7 +457,7 @@ def _score_chunk_duckdb(
             {ambig_union}
         ),
         deduped AS (
-            SELECT Read, BC, Genome, as_, MAPQ, NM, XAcount
+            SELECT Read, BC, Genome, as_, MAPQ, NM, XAcount, frag_loc
             FROM (
                 SELECT *,
                     ROW_NUMBER() OVER (
@@ -1443,6 +1444,7 @@ def _classify_chunk_top3(
         "assigned_class": "winner",
         "p_as":           p_as_s[win_mask].values.astype(np.float32),
         "p_mq":           p_mq_s[win_mask].values.astype(np.float32),
+        "frag_loc":       wb1["frag_loc"].values if "frag_loc" in wb1.columns else "",
     })
 
     ambiguous_bcs = set(bc_idx[klass_arr == "ambiguous"].tolist())
@@ -1453,6 +1455,69 @@ def _classify_chunk_top3(
     return winner_df, p_as_s, p_mq_s, ambiguous_bcs, n_reads, n_winner, n_ambig
 
 
+def _friend_rescue(df: pd.DataFrame, window: int = 1000) -> pd.DataFrame:
+    """Promote ambiguous reads to 'winner' if a winner read from the same
+    barcode maps nearby in the same genome's coordinate system.
+
+    For each (BC, Genome) group, winner reads define "rescue zones" based on
+    their frag_loc (chr:pos:mate_pos).  Ambiguous reads whose frag_loc falls
+    within ±window of any winner in the same genome get ``assigned_class``
+    changed from 'ambiguous' to 'rescued'.
+
+    Operates on the assembled output DataFrame (winner + ambiguous rows).
+    """
+    if df.empty or "frag_loc" not in df.columns:
+        return df
+    has_loc = df["frag_loc"].fillna("").str.len() > 0
+    if not has_loc.any():
+        return df
+
+    # Parse frag_loc → (chr, pos) using R1 start only (fast)
+    parts = df["frag_loc"].str.split(":", n=2, expand=True)
+    if parts.shape[1] < 2:
+        return df
+    df = df.copy()
+    df["_chr"] = parts[0]
+    df["_pos"] = pd.to_numeric(parts[1], errors="coerce")
+
+    # Build winner lookup: for each (BC, Genome, chr), collect winner positions
+    winners = df[(df["assigned_class"] == "winner") & df["_pos"].notna()]
+    if winners.empty:
+        df.drop(columns=["_chr", "_pos"], inplace=True)
+        return df
+
+    # Group winner positions by (BC, Genome, chr) → sorted arrays
+    win_groups = (
+        winners.groupby(["BC", "Genome", "_chr"])["_pos"]
+        .apply(lambda s: np.sort(s.values))
+        .to_dict()
+    )
+
+    # For each ambiguous read: check if any winner is within ±window
+    ambig_mask = (df["assigned_class"] == "ambiguous") & df["_pos"].notna()
+    rescued = np.zeros(len(df), dtype=bool)
+
+    for idx in df.index[ambig_mask]:
+        bc = df.at[idx, "BC"]
+        genome = df.at[idx, "Genome"]
+        chrom = df.at[idx, "_chr"]
+        pos = df.at[idx, "_pos"]
+        key = (bc, genome, chrom)
+        if key not in win_groups:
+            continue
+        win_pos = win_groups[key]
+        # Binary search for nearest winner
+        j = np.searchsorted(win_pos, pos)
+        if (j < len(win_pos) and abs(win_pos[j] - pos) <= window) or \
+           (j > 0 and abs(win_pos[j - 1] - pos) <= window):
+            rescued[idx] = True
+
+    df.loc[rescued, "assigned_class"] = "rescued"
+
+    df.drop(columns=["_chr", "_pos"], inplace=True)
+    return df
+
+
 def _write_chunk_filtered(
     winner_df: "pd.DataFrame",
     ambig_raw: "pd.DataFrame",
@@ -1461,6 +1526,9 @@ def _write_chunk_filtered(
     filt_out: Path,
 ) -> None:
     """Write filtered output from winner + ambiguous DataFrames."""
+    out_cols = ["Read", "BC", "Genome", "AS", "MAPQ", "NM",
+                "XAcount", "assigned_class", "p_as", "p_mq", "frag_loc"]
+
     if not ambig_raw.empty:
         ambig_idx = pd.MultiIndex.from_arrays(
             [ambig_raw["Read"].values, ambig_raw["BC"].values]
@@ -1469,12 +1537,21 @@ def _write_chunk_filtered(
         ambig_df["assigned_class"] = "ambiguous"
         ambig_df["p_as"] = p_as_s.reindex(ambig_idx).values.astype(np.float32)
         ambig_df["p_mq"] = p_mq_s.reindex(ambig_idx).values.astype(np.float32)
-        ambig_df = ambig_df[["Read", "BC", "Genome", "AS", "MAPQ", "NM",
-                              "XAcount", "assigned_class", "p_as", "p_mq"]]
+        if "frag_loc" not in ambig_df.columns:
+            ambig_df["frag_loc"] = ""
+        ambig_df = ambig_df[out_cols]
     else:
-        ambig_df = pd.DataFrame(columns=winner_df.columns)
+        ambig_df = pd.DataFrame(columns=out_cols)
+
+    if "frag_loc" not in winner_df.columns:
+        winner_df = winner_df.copy()
+        winner_df["frag_loc"] = ""
 
     out_df = pd.concat([winner_df, ambig_df], ignore_index=True)
+
+    # Friend rescue: promote ambiguous reads near winners in the same genome
+    out_df = _friend_rescue(out_df)
+
     out_df.to_csv(filt_out, sep="\t", index=False, compression="gzip")
 
 
@@ -1754,7 +1831,9 @@ def score_chunk(
         "Read": f_read, "BC": f_bc, "Genome": f_genome,
         "AS": f_as, "MAPQ": f_mq, "NM": f_nm, "XAcount": f_xa,
         "assigned_class": f_klass, "p_as": f_pas, "p_mq": f_pmq,
+        "frag_loc": "",  # Python fallback: frag_loc not available in this path
     })
+    out_df = _friend_rescue(out_df)
     out_df.to_csv(filt_out, sep="\t", index=False, compression="gzip")
 
     n_reads = len(col_klass)
