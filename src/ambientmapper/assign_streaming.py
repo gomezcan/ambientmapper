@@ -1455,7 +1455,7 @@ def _classify_chunk_top3(
     return winner_df, p_as_s, p_mq_s, ambiguous_bcs, n_reads, n_winner, n_ambig
 
 
-def _friend_rescue(df: pd.DataFrame, window: int = 1000) -> pd.DataFrame:
+def _friend_rescue(df: pd.DataFrame, window: int = 500) -> pd.DataFrame:
     """Promote ambiguous reads to 'winner' if a winner read from the same
     barcode maps nearby in the same genome's coordinate system.
 
