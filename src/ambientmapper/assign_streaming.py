@@ -1629,6 +1629,12 @@ def score_chunk(
     raw_out = out_raw_dir / f"{base}_raw.tsv.gz"
     filt_out = out_filtered_dir / f"{base}_filtered.tsv.gz"
 
+    # Resume: skip if output already exists
+    if filt_out.exists() and filt_out.stat().st_size > 64:
+        _log(f"[assign/score] ● skip {chunk_file.name} (output exists)", verbose)
+        return {"chunk": chunk_file.name, "reads": -1, "winner": -1,
+                "ambig": -1, "ambig_bcs": -1, "elapsed": 0.0, "resumed": True}
+
     bcs = _chunk_bcs(chunk_file)
     rb_map: dict[tuple[str, str], ReadAcc] = {}
 
@@ -1917,6 +1923,27 @@ def score_chunks_batched(
     out_raw_dir.mkdir(parents=True, exist_ok=True)
     out_filtered_dir.mkdir(parents=True, exist_ok=True)
 
+    # Resume: skip chunks whose filtered output already exists
+    done_stats: list = []
+    pending: list = []
+    for chf in chunk_files:
+        tag = chf.stem
+        suff = tag.split("_cell_map_ref_chunk_")[-1] if "_cell_map_ref_chunk_" in tag else tag
+        base = f"{sample}_chunk{suff}"
+        filt_out = out_filtered_dir / f"{base}_filtered.tsv.gz"
+        if filt_out.exists() and filt_out.stat().st_size > 64:
+            done_stats.append({"chunk": chf.name, "reads": -1, "winner": -1,
+                               "ambig": -1, "ambig_bcs": -1, "elapsed": 0.0,
+                               "resumed": True})
+            _log(f"[assign/score] ● skip {chf.name} (output exists)", verbose)
+        else:
+            pending.append(chf)
+
+    if not pending:
+        return done_stats
+
+    chunk_files = pending
+
     # Collect BCs per chunk, build union set
     chunk_bc_map: dict[Path, set] = {}
     all_bcs: set = set()
@@ -1950,7 +1977,7 @@ def score_chunks_batched(
             stats.append({"chunk": chf.name, "reads": 0, "winner": 0,
                           "ambig": 0, "ambig_bcs": 0, "elapsed": 0.0})
         _log_ok(f"[assign/score-batch] ■ empty batch → wrote empty outputs", verbose)
-        return stats
+        return done_stats + stats
 
     # Index top3_df by BC for fast per-chunk filtering
     top3_bc_values = top3_df["BC"].values
@@ -2044,7 +2071,7 @@ def score_chunks_batched(
         f"{len(chunk_files)} chunks, {sum(s['reads'] for s in stats):,} reads",
         verbose,
     )
-    return stats
+    return done_stats + stats
 
 
 # -----------------------------
