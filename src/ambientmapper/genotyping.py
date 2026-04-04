@@ -268,40 +268,74 @@ def _reduce_alignments_to_per_genome(df: pd.DataFrame) -> pd.DataFrame:
         agg["XAcount"] = "max"
     return df.groupby(keys, observed=True, sort=False).agg(agg).reset_index()
 
-def _reclass_within_topk(df: pd.DataFrame) -> pd.DataFrame:
+def _reclass_within_topk(df: pd.DataFrame, cfg: MergeConfig) -> pd.DataFrame:
     """Re-classify reads as winner/ambiguous within the top-K genome context.
 
-    The original ``assigned_class`` was computed across ALL genomes in the assign
-    step.  After restricting to top-K genomes per barcode, a read that was
-    "ambiguous" (tied between genome #1 and genome #4) may become a clear
-    "winner" if genome #4 is no longer in the candidate set.
+    Uses a three-tier priority system:
 
-    For each read (identified by barcode + read_id), we compare the best AS
-    among the remaining top-K genomes.  If the best strictly exceeds the
-    second-best, the read is re-classified as "winner"; otherwise "ambiguous".
+    Tier 1 — Original winner:  If a read has exactly 1 genome with
+        ``assigned_class == "winner"`` in the top-K set, preserve it.
+        The assign step already proved this read belongs to that genome.
+
+    Tier 2 — Rescued flag:  For reads not resolved by Tier 1, count genomes
+        with ``assigned_class == "rescued"`` (spatial proximity to a winner
+        in the same barcode/genome, set by ``_friend_rescue`` in assign).
+        If exactly 1 top-K genome is rescued → promote to winner.
+        If 0 or 2+ → fall through (non-discriminative).
+
+    Tier 3 — Composite score:  For remaining reads, compute
+        ``score = AS * w_as + MAPQ * w_mapq - NM * w_nm``
+        (same formula as ``_compute_read_posteriors``).
+        If exactly 1 genome has the best score → winner; ties → ambiguous.
     """
-    if df.empty or "AS" not in df.columns:
+    if df.empty or not all(c in df.columns for c in ("AS", "MAPQ", "NM")):
         return df
 
     rid = df["barcode"].astype(str) + "::" + df["read_id"].astype(str)
     codes = rid.astype("category")
     cat_codes = codes.cat.codes.to_numpy(np.int32)
-    as_arr = df["AS"].to_numpy(np.float32)
 
     n_reads = int(cat_codes.max()) + 1 if cat_codes.size else 0
+    if n_reads == 0:
+        return df
 
-    # Find best AS per read
-    best = np.full(n_reads, -np.inf, dtype=np.float32)
-    np.maximum.at(best, cat_codes, as_arr)
+    orig_class = df["assigned_class"].fillna("ambiguous").astype(str).to_numpy()
 
-    # Count how many genome hits match the best AS per read.
-    # Winner = exactly 1 genome at the best AS (clear winner within top-K).
-    # Ambiguous = 2+ genomes tie at the best AS.
-    at_best = (as_arr == best[cat_codes]).astype(np.int32)
+    # --- Tier 1: Original winner status ---
+    is_winner = (orig_class == "winner").astype(np.int32)
+    n_winner = np.zeros(n_reads, dtype=np.int32)
+    np.add.at(n_winner, cat_codes, is_winner)
+    tier1_resolved = (n_winner[cat_codes] == 1)
+
+    # --- Tier 2: Rescued flag (per-genome spatial proximity evidence) ---
+    is_rescued = (orig_class == "rescued").astype(np.int32)
+    n_rescued = np.zeros(n_reads, dtype=np.int32)
+    np.add.at(n_rescued, cat_codes, is_rescued)
+    tier2_resolved = ~tier1_resolved & (n_rescued[cat_codes] == 1)
+
+    # --- Tier 3: Composite score (AS + MAPQ - NM) ---
+    as_arr = df["AS"].to_numpy(np.float32)
+    mq_arr = df["MAPQ"].to_numpy(np.float32)
+    nm_arr = df["NM"].to_numpy(np.float32)
+    score = as_arr * float(cfg.w_as) + mq_arr * float(cfg.w_mapq) - nm_arr * float(cfg.w_nm)
+
+    needs_tier3 = ~(tier1_resolved | tier2_resolved)
+    t3_score = np.where(needs_tier3, score, -np.inf)
+    best_score = np.full(n_reads, -np.inf, dtype=np.float32)
+    np.maximum.at(best_score, cat_codes, t3_score)
+
+    at_best = (needs_tier3 & (score == best_score[cat_codes])).astype(np.int32)
     n_at_best = np.zeros(n_reads, dtype=np.int32)
     np.add.at(n_at_best, cat_codes, at_best)
+    tier3_winner = needs_tier3 & (score == best_score[cat_codes]) & (n_at_best[cat_codes] == 1)
 
-    new_class = np.where(n_at_best[cat_codes] == 1, "winner", "ambiguous")
+    # --- Combine all tiers ---
+    is_final_winner = (
+        (tier1_resolved & (is_winner == 1))        # Tier 1: original winner row
+        | (tier2_resolved & (is_rescued == 1))      # Tier 2: single rescued row
+        | tier3_winner                               # Tier 3: unique best score
+    )
+    new_class = np.where(is_final_winner, "winner", "ambiguous")
 
     df = df.copy()
     df["assigned_class"] = new_class
@@ -1589,11 +1623,8 @@ def _pass275_reclass_one_file(
         if df.empty:
             return
         # --- Re-classify winner/ambiguous within top-K context ---
-        # The original assigned_class was computed across ALL genomes in the
-        # assign step. Now that we've restricted to top-K genomes, re-evaluate:
-        # a read is "winner" within top-K if its best AS strictly exceeds the
-        # second-best AS among the remaining top-K genomes.
-        df = _reclass_within_topk(df)
+        # Three-tier: (1) original winner, (2) rescued flag, (3) composite score
+        df = _reclass_within_topk(df, cfg)
         Ldf = _compute_read_posteriors(df, cfg)
         if Ldf.empty:
             return
