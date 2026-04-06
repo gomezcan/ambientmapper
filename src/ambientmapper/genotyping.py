@@ -2151,10 +2151,14 @@ def _call_from_shard_file(
         # data-driven discount factor based on the "winner concentration" signal:
         #   mode="winner_ratio" (V1): d(g) = winner_mass(g) / winner_mass(top1)
         #   mode="total_ratio"  (V2): d(g) = min(1, total_mass(g) / winner_mass(top1))
-        # Top1 stays at factor 1.0. The discount is multiplied into L and L_amb
-        # for rows of non-top1 genomes. This biases BIC away from false doublet
-        # calls driven by cross-mapping noise while preserving real doublets
+        # Top1 stays at factor 1.0. The discount is multiplied into L for rows
+        # of non-top1 genomes. This biases BIC away from false doublet calls
+        # driven by cross-mapping noise while preserving real doublets
         # (where the secondary genome has its own substantial winner support).
+        # Note: L_amb is not present in this L_block (Pass 3 only propagates
+        # ["read_id","genome","L","w_read"] from the shard reader), so we only
+        # need to scale L. _select_model_for_barcode and
+        # _precompute_per_read_arrays do not consume L_amb at this stage.
         if cfg.winner_discount and "w_read" in L_block.columns:
             _w_is_winner = L_block["w_read"].to_numpy(dtype=np.float32) >= 0.5
             if _w_is_winner.any():
@@ -2184,9 +2188,6 @@ def _call_from_shard_file(
                         L_block = L_block.copy()
                         L_block["L"] = (
                             L_block["L"].to_numpy(dtype=np.float32) * _d_row
-                        )
-                        L_block["L_amb"] = (
-                            L_block["L_amb"].to_numpy(dtype=np.float32) * _d_row
                         )
         # --- end winner-mass discount ---
 
