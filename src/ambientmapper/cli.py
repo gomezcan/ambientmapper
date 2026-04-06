@@ -855,6 +855,17 @@ def genotyping(
         None, "--topk-reclass/--no-topk-reclass",
         help="Re-classify reads within top-K genomes per barcode (Pass 2.75).",
     ),
+    winner_discount: Optional[bool] = typer.Option(
+        None, "--winner-discount/--no-winner-discount",
+        help="Apply data-driven per-barcode discount on non-top1 genomes in Pass 3, "
+             "based on winner-mass concentration. Suppresses false doublet calls from "
+             "cross-mapping while preserving real doublets. No global parameter required.",
+    ),
+    winner_discount_mode: Optional[str] = typer.Option(
+        None, "--winner-discount-mode",
+        help="Discount formula: 'winner_ratio' (V1, d=winner(g)/winner(top1)) or "
+             "'total_ratio' (V2, d=min(1, total(g)/winner(top1))). Default: winner_ratio.",
+    ),
     eta_file: Optional[Path] = typer.Option(
         None,
         "--eta-file",
@@ -1037,6 +1048,10 @@ def genotyping(
         kwargs["topk_genomes"] = max(1, int(topk_genomes))
     if topk_reclass is not None:
         kwargs["topk_reclass"] = bool(topk_reclass)
+    if winner_discount is not None:
+        kwargs["winner_discount"] = bool(winner_discount)
+    if winner_discount_mode is not None:
+        kwargs["winner_discount_mode"] = str(winner_discount_mode)
     if eta_file is not None:
         kwargs["eta_file"] = Path(eta_file)
 
