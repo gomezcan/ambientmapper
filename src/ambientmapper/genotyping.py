@@ -125,6 +125,8 @@ class MergeConfig(BaseModel):
     max_alpha: float = 0.5
     topk_genomes: int = 3
     topk_reclass: bool = False  # Enable Pass 2.75 top-K re-classification
+    winner_discount: bool = False  # Enable Pass 3 data-driven winner-mass discount on non-top1 genomes
+    winner_discount_mode: str = "winner_ratio"  # "winner_ratio" (V1) or "total_ratio" (V2)
 
     # System / IO
     sample: str = "sample"
@@ -2142,6 +2144,52 @@ def _call_from_shard_file(
             return
         L_block = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
         cand = topk.get(cur_bc, [])
+
+        # --- Winner-mass data-driven discount (Pass 3 pre-BIC) ---
+        # For each barcode, compute winner_mass per genome from (L, w_read).
+        # Find top1 = argmax(winner_mass). For each non-top1 genome g, compute a
+        # data-driven discount factor based on the "winner concentration" signal:
+        #   mode="winner_ratio" (V1): d(g) = winner_mass(g) / winner_mass(top1)
+        #   mode="total_ratio"  (V2): d(g) = min(1, total_mass(g) / winner_mass(top1))
+        # Top1 stays at factor 1.0. The discount is multiplied into L and L_amb
+        # for rows of non-top1 genomes. This biases BIC away from false doublet
+        # calls driven by cross-mapping noise while preserving real doublets
+        # (where the secondary genome has its own substantial winner support).
+        if cfg.winner_discount and "w_read" in L_block.columns:
+            _w_is_winner = L_block["w_read"].to_numpy(dtype=np.float32) >= 0.5
+            if _w_is_winner.any():
+                _wmass = (
+                    L_block.loc[_w_is_winner]
+                    .groupby("genome", sort=False)["L"].sum()
+                )
+                if len(_wmass) > 0:
+                    _top1 = _wmass.idxmax()
+                    _top1_wm = float(_wmass.loc[_top1])
+                    if _top1_wm > 0.0:
+                        if str(cfg.winner_discount_mode) == "total_ratio":
+                            _tmass = (
+                                L_block.groupby("genome", sort=False)["L"].sum()
+                            )
+                            _num = _tmass.reindex(_wmass.index).fillna(0.0)
+                        else:
+                            _num = _wmass
+                        _disc = (_num / _top1_wm).clip(upper=1.0)
+                        _disc.loc[_top1] = 1.0
+                        # Map discount per-row by genome; default 0.0 for genomes
+                        # missing from winner_mass (should be rare but safe).
+                        _d_row = (
+                            L_block["genome"].astype(str).map(_disc).fillna(0.0)
+                            .to_numpy(dtype=np.float32)
+                        )
+                        L_block = L_block.copy()
+                        L_block["L"] = (
+                            L_block["L"].to_numpy(dtype=np.float32) * _d_row
+                        )
+                        L_block["L_amb"] = (
+                            L_block["L_amb"].to_numpy(dtype=np.float32) * _d_row
+                        )
+        # --- end winner-mass discount ---
+
         res = _select_model_for_barcode(L_block, eta, cfg, cand,
                                         phi_matrix=phi_matrix, chi=chi)
 
@@ -2278,6 +2326,8 @@ def _run_genotyping(
     eta_seed_quantile: Optional[float] = None,
     topk_genomes: Optional[int] = None,
     topk_reclass: Optional[bool] = None,
+    winner_discount: Optional[bool] = None,
+    winner_discount_mode: Optional[str] = None,
     # fixed-eta override
     eta_file: Optional[Path] = None,
     # DuckDB acceleration
@@ -2389,6 +2439,15 @@ def _run_genotyping(
         cfg.topk_genomes = int(topk_genomes)
     if topk_reclass is not None:
         cfg.topk_reclass = bool(topk_reclass)
+    if winner_discount is not None:
+        cfg.winner_discount = bool(winner_discount)
+    if winner_discount_mode is not None:
+        _wdm = str(winner_discount_mode)
+        if _wdm not in ("winner_ratio", "total_ratio"):
+            raise ValueError(
+                f"--winner-discount-mode must be 'winner_ratio' or 'total_ratio', got {_wdm!r}"
+            )
+        cfg.winner_discount_mode = _wdm
     if pass1_duckdb is not None:
         cfg.pass1_duckdb = bool(pass1_duckdb)
     if pass2_duckdb is not None:
@@ -2754,6 +2813,10 @@ def _run_genotyping(
         else:
             merged_root = shard_root / "merged"
             typer.echo("[3/4] Pass 3: model selection / calls from shards (parallel)")
+        if cfg.winner_discount:
+            typer.echo(
+                f"[3/4] Pass 3: winner-mass discount ENABLED (mode={cfg.winner_discount_mode})"
+            )
         shards_list = sorted(merged_root.glob("shard_*.tsv.gz"))
 
         if not shards_list:
@@ -2924,6 +2987,17 @@ def genotyping_cmd(
         help="Re-classify reads within top-K genomes per barcode (Pass 2.75). "
              "Improves singlet detection for closely related genomes.",
     ),
+    winner_discount: Optional[bool] = typer.Option(
+        None, "--winner-discount/--no-winner-discount",
+        help="Apply data-driven per-barcode discount on non-top1 genomes in Pass 3, "
+             "based on winner-mass concentration. Suppresses false doublet calls from "
+             "cross-mapping while preserving real doublets. No global parameter required.",
+    ),
+    winner_discount_mode: Optional[str] = typer.Option(
+        None, "--winner-discount-mode",
+        help="Discount formula: 'winner_ratio' (V1, d=winner(g)/winner(top1)) or "
+             "'total_ratio' (V2, d=min(1, total(g)/winner(top1))). Default: winner_ratio.",
+    ),
     # DuckDB acceleration
     pass1_duckdb: Optional[bool] = typer.Option(
         None, "--pass1-duckdb/--pass1-no-duckdb",
@@ -2978,6 +3052,8 @@ def genotyping_cmd(
         eta_seed_quantile=eta_seed_quantile,
         topk_genomes=topk_genomes,
         topk_reclass=topk_reclass,
+        winner_discount=winner_discount,
+        winner_discount_mode=winner_discount_mode,
         pass1_duckdb=pass1_duckdb,
         pass2_duckdb=pass2_duckdb,
         resume=resume,
