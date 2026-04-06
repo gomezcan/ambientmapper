@@ -45,6 +45,7 @@ Ambient contamination–aware multi-genome genotyping for single-cell libraries 
   - [Assign parameters](#assign-parameters)
   - [Genotyping parameters](#genotyping-parameters)
   - [Top-K re-classification](#top-k-re-classification)
+  - [Winner-mass discount](#winner-mass-discount)
   - [Decontam parameters](#decontam-parameters)
   - [Environment variables](#environment-variables)
 - [Troubleshooting / FAQ](#troubleshooting--faq)
@@ -902,6 +903,8 @@ Pass via `--genotyping-*` flags on `ambientmapper run`, or use `ambientmapper ge
 | `--genotyping-doublet-minor-min` | `0.20` | Min minor fraction to call `doublet` (vs `weak_doublet`) |
 | `--genotyping-topk-genomes` | `3` | Candidate genomes per barcode for Pass 2 |
 | `--genotyping-topk-reclass / --no-genotyping-topk-reclass` | off | Enable Pass 2.75: re-read assign chunks restricted to top-K genomes per barcode and recompute posteriors. Dramatically improves singlet detection for closely related genomes (e.g., F1 31% → 75% on 26-genome maize). See [Top-K re-classification](#top-k-re-classification) below. |
+| `--winner-discount / --no-winner-discount` | off | Enable Pass 3 data-driven winner-mass discount. For each barcode, compute `winner_mass(g)` per genome from `w_read >= 0.5` rows; for non-top1 genomes, scale `L *= winner_mass(g) / winner_mass(top1)` (clipped to ≤ 1). Suppresses false doublet calls from cross-mapping while preserving real doublets. No global tuning parameter — the discount strength is set per barcode by its own winner concentration. See [Winner-mass discount](#winner-mass-discount) below. |
+| `--winner-discount-mode` | `winner_ratio` | Discount formula: `winner_ratio` (V1, `d=winner(g)/winner(top1)`) or `total_ratio` (V2, `d=min(1, total(g)/winner(top1))`). V1 is stricter; V2 is more forgiving when the secondary genome has substantial ambiguous mass. |
 | `--alpha-grid` | — | Step size for ambient fraction grid search |
 | `--rho-grid` | — | Step size for doublet mixture grid search |
 | `--max-alpha` | — | Maximum ambient fraction in grid search |
@@ -972,6 +975,56 @@ ambientmapper genotyping --config cfg.json \
 | Many genomes, moderately related | `--topk-genomes 3 --topk-reclass` | Moderate |
 
 **Performance note:** Pass 2.75 re-reads all assign chunk files (same I/O as Pass 1). DuckDB acceleration is used when available to push the top-K filter into SQL. Wall time is comparable to Pass 1.
+
+### Winner-mass discount
+
+`--winner-discount` is a Pass 3 modification that addresses a side effect of `--topk-reclass`: when reads are restricted to the top-K candidate genomes and re-classified, the secondary genome's signal can be amplified by cross-mapping artifacts (reads that align almost equally well to the top1 and a closely related genome). BIC then sees a clean 80:20 mass split and calls these as `weak_doublet`/`doublet` even though the cell is a singlet with cross-mapping noise.
+
+The discount uses each barcode's **own winner-mass concentration** as a confidence signal that the call is a singlet, and scales down the mass of non-top1 genomes accordingly. There is no global tuning parameter — the discount strength comes entirely from the data.
+
+**Mechanism (V1, default):**
+
+For each barcode, just before BIC model selection:
+
+1. Compute `winner_mass(g) = sum of L for rows where w_read >= 0.5` per genome.
+2. Find `top1 = argmax_g(winner_mass(g))`.
+3. For each non-top1 genome `g`, compute `d(g) = winner_mass(g) / winner_mass(top1)`.
+4. Multiply `L` for rows of genome `g` by `d(g)` (clipped to `≤ 1.0`). Top1 stays at `d=1.0`.
+5. Pass the modified `L_block` into the BIC model selection step as usual.
+
+For a true singlet with cross-mapping (e.g., 90% B73 winners + 10% Il14H pseudo-winners): `d(Il14H) ≈ 0.11`, so the apparent Il14H mass shrinks by ~9× and BIC tips back to singlet+alpha.
+
+For a real 50/50 doublet: `d(top2) ≈ 1.0`, so no discount is applied and the doublet call is preserved.
+
+For a 70/30 real doublet: `d(top2) ≈ 0.43`, mass shrinks moderately. BIC still sees enough secondary signal to call doublet (validated on synthetic Track B-disc with rho 0.5–0.8 doublets — preservation rate ~100%).
+
+**Usage:**
+
+```bash
+# Recommended companion to --topk-reclass for closely related genomes
+ambientmapper run --config cfg.json --threads 16 \
+  --genotyping-topk-genomes 2 --genotyping-topk-reclass \
+  --winner-discount
+
+# Standalone genotyping
+ambientmapper genotyping --config cfg.json \
+  --topk-genomes 2 --topk-reclass \
+  --winner-discount
+```
+
+**Modes:**
+
+| Mode | Formula | When to use |
+|---|---|---|
+| `winner_ratio` (default) | `d(g) = winner_mass(g) / winner_mass(top1)` | Stricter — only counts confident reads. Best when reads are discriminative (clear AS gaps). |
+| `total_ratio` | `d(g) = min(1, total_mass(g) / winner_mass(top1))` | Gentler — includes ambiguous mass on top2 as evidence. Best when secondary genomes legitimately receive ambiguous reads. |
+
+**When NOT to use:**
+
+- Real datasets with expected high-fraction doublets (>30% of cells are true doublets) — the discount may be too aggressive on extreme-asymmetry doublets (e.g., 95/5 cell pairs).
+- Datasets where read alignments are not discriminative (no MAPQ/AS separation between genomes) — the discount has no signal to work with and is essentially a no-op.
+
+**Performance note:** The discount adds a per-barcode `groupby` and one column scaling inside the existing Pass 3 loop. Negligible overhead — typically < 5% wall-time increase.
 
 ### Decontam parameters
 

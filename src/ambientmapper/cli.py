@@ -1171,6 +1171,14 @@ def run(
         None, "--genotyping-topk-reclass/--no-genotyping-topk-reclass",
         help="Enable Pass 2.75 top-K re-classification in genotyping.",
     ),
+    genotyping_winner_discount: Optional[bool] = typer.Option(
+        None, "--genotyping-winner-discount/--no-genotyping-winner-discount",
+        help="Enable Pass 3 data-driven winner-mass discount in genotyping.",
+    ),
+    genotyping_winner_discount_mode: Optional[str] = typer.Option(
+        None, "--genotyping-winner-discount-mode",
+        help="Discount formula in genotyping: 'winner_ratio' (V1) or 'total_ratio' (V2).",
+    ),
     genotyping_threads: Optional[int] = typer.Option(None, "--genotyping-threads"),
     genotyping_shards: Optional[int] = typer.Option(None, "--genotyping-shards"),
     genotyping_chunk_rows: Optional[int] = typer.Option(None, "--genotyping-chunk-rows"),
@@ -1239,6 +1247,8 @@ def run(
         ("bic_margin", genotyping_bic_margin),
         ("topk_genomes", genotyping_topk_genomes),
         ("topk_reclass", genotyping_topk_reclass),
+        ("winner_discount", genotyping_winner_discount),
+        ("winner_discount_mode", genotyping_winner_discount_mode),
         ("threads", genotyping_threads),
         ("shards", genotyping_shards),
         ("chunk_rows", genotyping_chunk_rows),
