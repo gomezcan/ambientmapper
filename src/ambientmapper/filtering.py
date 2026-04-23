@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 import sys
 
 from .normalization import canonicalize_bc_seq_sample_force
@@ -21,9 +21,8 @@ def filter_qc_file(
       Pass 1) Count barcodes (after optional normalization to '<seq>-<sample>'),
               build keep-set of barcodes with count >= min_freq.
 
-      Pass 2) Re-stream file, keep only rows whose barcode is in keep-set,
-              and collapse duplicates by (Read, BC) with:
-                MAPQ=max, AS=max, NM=min, XAcount=max.
+      Pass 2) Re-stream file, emit rows whose barcode is in keep-set
+              directly to output. No in-memory aggregation.
 
     Input format (no header), tab-delimited:
       Read  BC  MAPQ  AS  NM  XAcount  [frag_loc]
@@ -32,13 +31,11 @@ def filter_qc_file(
       Read  BC  MAPQ  AS  NM  XAcount  frag_loc
 
     Returns:
-      number of unique (Read, BC) pairs written (rows in output, excluding header).
+      total rows written (excluding header). May include duplicate
+      (Read, BC) pairs from input; downstream stages (assign, chunks)
+      handle dedup independently.
 
-    Notes on memory:
-      - Pass 1 stores counts per unique barcode.
-      - Pass 2 stores an aggregation dict per unique (Read, BC) that survives filtering.
-        If min_freq is too low, this dict can still become large; for extreme datasets,
-        implement sharded aggregation or external sort.
+    Memory: O(unique_barcodes) for the keep-set, typically 100-200 MB.
     """
     in_path = Path(in_path)
     out_path = Path(out_path)
@@ -87,18 +84,19 @@ def filter_qc_file(
     bc_counts.clear()
 
     # -------------------------
-    # Pass 2: filter + collapse by (Read, BC)
+    # Pass 2: stream-filter and emit
     # -------------------------
-    # key: (Read, BC) -> (MAPQ, AS, NM, XAcount, frag_loc)
-    agg: Dict[Tuple[str, str], Tuple[int, int, int, int, str]] = {}
-
     def _to_int(x: str, default: int) -> int:
         try:
             return int(x)
         except Exception:
             return default
 
-    with in_path.open("r") as f:
+    n_written = 0
+
+    with in_path.open("r") as f, out_path.open("w") as out:
+        out.write("Read\tBC\tMAPQ\tAS\tNM\tXAcount\tfrag_loc\n")
+
         for line in f:
             if not line:
                 continue
@@ -110,49 +108,21 @@ def filter_qc_file(
             if len(parts) < 6:
                 continue
 
-            read = parts[0]
             bc = parts[1]
             if do_norm:
                 bc = canonicalize_bc_seq_sample_force(bc or "", sample_name)  # type: ignore[arg-type]
 
-            # Quick reject if BC not kept
-            bc = sys.intern(bc)
             if bc not in keep:
                 continue
 
-            # Parse metrics
+            # Sanitize metrics (robustness against malformed values)
             mapq = _to_int(parts[2], 0)
             alsc = _to_int(parts[3], 0)
-            nm = _to_int(parts[4], 10**9)
-            xac = _to_int(parts[5], 0)
+            nm   = _to_int(parts[4], 10**9)
+            xac  = _to_int(parts[5], 0)
             frag_loc = parts[6] if len(parts) >= 7 else ""
 
-            # Intern read too (often repeated), helps memory when collapsing duplicates
-            read = sys.intern(read)
+            out.write(f"{parts[0]}\t{bc}\t{mapq}\t{alsc}\t{nm}\t{xac}\t{frag_loc}\n")
+            n_written += 1
 
-            key = (read, bc)
-            prev = agg.get(key)
-            if prev is None:
-                agg[key] = (mapq, alsc, nm, xac, frag_loc)
-            else:
-                pm, pa, pn, px, pf = prev
-                # MAPQ=max, AS=max, NM=min, XAcount=max, frag_loc=keep first
-                if mapq < pm:
-                    mapq = pm
-                if alsc < pa:
-                    alsc = pa
-                if nm > pn:
-                    nm = pn
-                if xac < px:
-                    xac = px
-                agg[key] = (mapq, alsc, nm, xac, pf)
-
-    # -------------------------
-    # Write output
-    # -------------------------
-    with out_path.open("w") as out:
-        out.write("Read\tBC\tMAPQ\tAS\tNM\tXAcount\tfrag_loc\n")
-        for (read, bc), (mapq, alsc, nm, xac, frag_loc) in agg.items():
-            out.write(f"{read}\t{bc}\t{mapq}\t{alsc}\t{nm}\t{xac}\t{frag_loc}\n")
-
-    return int(len(agg))
+    return n_written
