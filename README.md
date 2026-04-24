@@ -28,7 +28,7 @@ Ambient contamination–aware multi-genome genotyping for single-cell libraries 
   - [Resumable runs and targeted re-runs](#resumable-runs-and-targeted-re-runs)
 - [Step-by-step reference](#step-by-step-reference)
   - [1. extract](#1-extract--per-genome-qc-tables)
-  - [2. filter](#2-filter--barcode-filtering--duplicate-collapse)
+  - [2. filter](#2-filter--barcode-frequency-filtering)
   - [3. chunks](#3-chunks--barcode-chunking)
   - [4. assign](#4-assign--ecdf-based-dominance-filter--per-read-winners)
   - [5. genotyping](#5-genotyping--ambient-aware-per-cell-calls)
@@ -337,7 +337,7 @@ ambientmapper extract --config cfg.json --threads 8
 
 ---
 
-### 2. filter — barcode filtering + duplicate collapse
+### 2. filter — barcode frequency filtering
 
 **Code:** `filtering.py → filter_qc_file`
 
@@ -345,12 +345,8 @@ For each QC file:
 
 * Re-normalizes barcode to `"<BCseq>-<sample>"`.
 * Counts reads per barcode and **keeps only barcodes with frequency ≥ min_barcode_freq**.
-* Collapses duplicate `(Read, BC)` pairs using:
-
-  * `MAPQ = max`
-  * `AS = max`
-  * `NM = min`
-  * `XAcount = max`
+* Streams surviving rows directly to output (no in-memory aggregation).
+  Downstream stages (assign, chunks) handle `(Read, BC)` deduplication independently.
 
 **Writes:**
 
@@ -778,7 +774,7 @@ Typical layout for a completed run including decontamination:
 ├─ qc/                                   # per-genome raw QC (extract)
 │   ├─ <genome1>_QCMapping.txt
 │   └─ <genome2>_QCMapping.txt
-├─ filtered_QCFiles/                     # per-genome filtered/collapsed QC (filter)
+├─ filtered_QCFiles/                     # per-genome filtered QC (filter)
 │   ├─ filtered_<genome1>_QCMapping.txt
 │   └─ filtered_<genome2>_QCMapping.txt
 ├─ cell_map_ref_chunks/                  # barcode chunk files + per-chunk assign outputs
