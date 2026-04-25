@@ -421,6 +421,44 @@ def chunks(
 
 
 @app.command()
+def prepare(
+    config: Optional[Path] = typer.Option(None, "-c", "--config", exists=True, readable=True),
+    configs: Optional[Path] = typer.Option(None, "--configs", exists=True, readable=True),
+    mapq_min: int = typer.Option(0, "--mapq-min", help="Pre-filter: min MAPQ (0 = no filter)."),
+    xa_max: int = typer.Option(-1, "--xa-max", help="Pre-filter: max XAcount (-1 = no filter)."),
+    row_group_size: int = typer.Option(100_000, "--row-group-size"),
+    duckdb_threads: int = typer.Option(4, "--duckdb-threads"),
+    verbose: bool = typer.Option(True, "--verbose/--quiet"),
+) -> None:
+    """Convert filtered QCMapping TSVs to sorted Parquet (one-time preparation).
+
+    Produces co-located .parquet files alongside existing .txt files in
+    filtered_QCFiles/. The assign step auto-detects and prefers Parquet.
+    """
+    from .assign_streaming import _convert_to_parquet
+
+    cfgs = _load_one_or_many_configs(config=config, configs=configs)
+    for cfg in cfgs:
+        workdir = Path(str(cfg["workdir"]))
+        sample = str(cfg["sample"])
+        typer.echo(f"[prepare] {sample}: converting filtered TSVs to Parquet ...")
+        t0 = time.time()
+        pq_files = _convert_to_parquet(
+            workdir=workdir,
+            sample=sample,
+            mapq_min=mapq_min,
+            xa_max=xa_max,
+            row_group_size=row_group_size,
+            duckdb_threads=duckdb_threads,
+            verbose=verbose,
+        )
+        typer.echo(
+            f"[prepare] {sample}: {len(pq_files)} Parquet files ready "
+            f"({time.time() - t0:.1f}s)"
+        )
+
+
+@app.command()
 def assign(
     config: Optional[Path] = typer.Option(None, "-c", "--config", exists=True, readable=True),
     configs: Optional[Path] = typer.Option(None, "--configs", exists=True, readable=True),
@@ -500,7 +538,13 @@ def assign(
     score_batch_size: Optional[int] = typer.Option(
         None,
         "--score-batch-size",
-        help="Batch N chunks per DuckDB scan in Pass C (default: 50). Reduces file I/O by ~Nx. 0 = no batching.",
+        help="Batch N chunks per DuckDB scan in Pass C (default: 200). Reduces file I/O by ~Nx. 0 = no batching.",
+    ),
+    prepare: bool = typer.Option(
+        True,
+        "--prepare/--no-prepare",
+        help="Convert filtered QCMapping TSVs to sorted Parquet before scoring (default: on). "
+             "One-time cost; dramatically speeds up scoring by enabling row-group skipping.",
     ),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
     resume: bool = typer.Option(True, "--resume/--no-resume"),
@@ -569,7 +613,7 @@ def assign(
         ecdf_duckdb_eff = bool(aconf.get("ecdf_duckdb", True))
         ecdf_duckdb_threads_eff = int(aconf.get("ecdf_duckdb_threads", 4))
 
-        score_batch_size_eff = int(aconf.get("score_batch_size", 50))
+        score_batch_size_eff = int(aconf.get("score_batch_size", 200))
 
         # NOTE: sentinel should not gate partial runs; only gate full runs.
         params = {
@@ -614,8 +658,8 @@ def assign(
                 f"Run without --skip-ecdf at least once."
             )
 
-        # scoring workers is independent of --threads; default 2
-        score_workers_eff = 2 if score_workers is None else max(1, int(score_workers))
+        # scoring workers is independent of --threads; default 4
+        score_workers_eff = 4 if score_workers is None else max(1, int(score_workers))
         pool_n = min(score_workers_eff, len(chunk_files))
         score_duckdb_eff   = bool(aconf.get("score_duckdb", score_duckdb))
         duckdb_threads_eff = int(aconf.get("duckdb_threads", duckdb_threads))
@@ -679,6 +723,24 @@ def assign(
         else:
             if verbose:
                 typer.echo(f"[assign/ecdf] skip: reuse {ecdf_npz}")
+
+        # (2.5) Prepare: convert filtered TSVs to Parquet for fast scoring
+        #        Don't pre-filter: scoring step applies mapq/xa via _build_duckdb_union_sql.
+        #        This keeps Parquet files reusable across different filter thresholds.
+        if prepare and score_duckdb_eff:
+            from .assign_streaming import _convert_to_parquet
+            t_prep = time.time()
+            pq_files = _convert_to_parquet(
+                workdir=workdir,
+                sample=sample,
+                duckdb_threads=max(1, duckdb_threads_eff),
+                verbose=verbose,
+            )
+            if verbose:
+                typer.echo(
+                    f"[assign/prepare] {sample}: {len(pq_files)} Parquet files ready "
+                    f"({time.time() - t_prep:.1f}s)"
+                )
 
         # (3) score chunks
         from .assign_streaming import _batched

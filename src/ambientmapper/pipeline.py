@@ -256,9 +256,20 @@ def _run_assign(ctx: Ctx) -> None:
         ecdf_duckdb_threads=parse_int(ecdf_duckdb_threads),
     )
 
+    # Prepare: convert filtered TSVs to Parquet (idempotent, speeds up scoring)
     score_duckdb_eff   = bool(aconf.get("score_duckdb", True))
     duckdb_threads_eff = int(aconf.get("duckdb_threads", 2))
-    score_batch_size   = int(aconf.get("score_batch_size", 50))
+    # Don't pre-filter: scoring step applies mapq/xa via _build_duckdb_union_sql.
+    if score_duckdb_eff:
+        from .assign_streaming import _convert_to_parquet
+        _convert_to_parquet(
+            workdir=workdir,
+            sample=sample,
+            duckdb_threads=max(1, duckdb_threads_eff),
+            verbose=verbose,
+        )
+
+    score_batch_size   = int(aconf.get("score_batch_size", 200))
 
     pool_n = max(1, min(threads, len(chunk_files)))
     use_batch = score_duckdb_eff and score_batch_size > 0

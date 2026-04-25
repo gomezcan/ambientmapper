@@ -113,8 +113,9 @@ def _chunk_bcs(chunk_file: Path) -> set[str]:
 
 def _genome_from_filename(p: Path) -> str:
     n = p.name
-    if n.startswith("filtered_") and n.endswith("_QCMapping.txt"):
-        return n[len("filtered_") : -len("_QCMapping.txt")]
+    for suffix in ("_QCMapping.parquet", "_QCMapping.txt"):
+        if n.startswith("filtered_") and n.endswith(suffix):
+            return n[len("filtered_") : -len(suffix)]
     return n
 
 
@@ -122,10 +123,123 @@ def _filtered_files(workdir: Path, sample: str) -> list[Path]:
     d = Path(workdir) / sample / "filtered_QCFiles"
     if not d.exists():
         raise FileNotFoundError(f"Not found: {d}")
-    files = sorted(d.glob("filtered_*_QCMapping.txt"))
-    if not files:
+    # Prefer Parquet if all genomes are covered
+    pq_files = sorted(d.glob("filtered_*_QCMapping.parquet"))
+    tsv_files = sorted(d.glob("filtered_*_QCMapping.txt"))
+    if pq_files:
+        pq_genomes = {_genome_from_filename(p) for p in pq_files}
+        tsv_genomes = {_genome_from_filename(p) for p in tsv_files}
+        if tsv_genomes and pq_genomes >= tsv_genomes:
+            return pq_files
+    if not tsv_files:
         raise FileNotFoundError(f"No filtered_* files under {d}")
-    return files
+    return tsv_files
+
+
+def _convert_to_parquet(
+    workdir: Path,
+    sample: str,
+    mapq_min: int = 0,
+    xa_max: int = -1,
+    row_group_size: int = 100_000,
+    duckdb_threads: int = 4,
+    verbose: bool = True,
+) -> list[Path]:
+    """Convert filtered QCMapping TSVs to sorted Parquet files.
+
+    For each ``filtered_*_QCMapping.txt``, produces a co-located
+    ``filtered_*_QCMapping.parquet`` with:
+
+    * Columns: Read, BC, MAPQ, as_, NM, XAcount, frag_loc
+      (AS renamed to as_ to avoid the SQL reserved-word)
+    * Sorted by BC  (enables row-group predicate pushdown)
+    * Snappy compression, *row_group_size* rows per group
+
+    Idempotent: skips files whose ``.parquet`` already exists and is
+    newer than the TSV source.
+
+    Returns the list of Parquet paths (created or reused).
+    """
+    import shutil
+    import tempfile
+
+    if not _HAS_DUCKDB:
+        _log("[prepare] skip: duckdb not installed", verbose)
+        return []
+
+    d = Path(workdir) / sample / "filtered_QCFiles"
+    tsv_files = sorted(d.glob("filtered_*_QCMapping.txt"))
+    if not tsv_files:
+        raise FileNotFoundError(f"No filtered_*_QCMapping.txt under {d}")
+
+    pq_paths: list[Path] = []
+    for fp in tsv_files:
+        genome = _genome_from_filename(fp)
+        pq_path = fp.with_name(f"filtered_{genome}_QCMapping.parquet")
+
+        # Resume: skip if Parquet is newer than TSV and non-empty
+        if pq_path.exists() and pq_path.stat().st_size > 0 and pq_path.stat().st_mtime >= fp.stat().st_mtime:
+            _log(f"[prepare] {genome}: skip (parquet up to date)", verbose)
+            pq_paths.append(pq_path)
+            continue
+
+        t0 = time.time()
+        tsv_str = str(fp).replace("'", "''")
+        pq_str = str(pq_path).replace("'", "''")
+
+        # Build optional WHERE clause for pre-filtering
+        where_parts: list[str] = []
+        if mapq_min > 0:
+            where_parts.append(f"MAPQ >= {mapq_min}")
+        if xa_max >= 0:
+            where_parts.append(f"XAcount <= {xa_max}")
+        where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+        # Detect whether the TSV has a frag_loc column
+        con = _duckdb.connect()
+        con.execute(f"SET threads TO {max(1, duckdb_threads)}")
+        cols_df = con.execute(
+            f"SELECT * FROM read_csv('{tsv_str}', delim='\\t', header=true) LIMIT 0"
+        ).df()
+        has_frag_loc = "frag_loc" in cols_df.columns
+        frag_loc_expr = "COALESCE(frag_loc, '') AS frag_loc" if has_frag_loc else "'' AS frag_loc"
+
+        # Write to a temp file first (avoids NFS file-lock issues), then move
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
+            tmp_str = tmp.name.replace("'", "''")
+        try:
+            con.execute(f"""
+                COPY (
+                    SELECT Read, BC,
+                           CAST(MAPQ AS FLOAT)    AS MAPQ,
+                           CAST("AS" AS FLOAT)     AS as_,
+                           CAST(NM AS FLOAT)       AS NM,
+                           CAST(XAcount AS FLOAT)  AS XAcount,
+                           {frag_loc_expr}
+                    FROM read_csv('{tsv_str}', delim='\\t', header=true)
+                    {where_sql}
+                    ORDER BY BC
+                ) TO '{tmp_str}' (FORMAT PARQUET, COMPRESSION SNAPPY,
+                                  ROW_GROUP_SIZE {row_group_size})
+            """)
+            con.close()
+            shutil.move(tmp.name, str(pq_path))
+        except Exception:
+            con.close()
+            Path(tmp.name).unlink(missing_ok=True)
+            raise
+
+        tsv_gb = fp.stat().st_size / (1024 ** 3)
+        pq_gb = pq_path.stat().st_size / (1024 ** 3)
+        elapsed = time.time() - t0
+        _log(
+            f"[prepare] {genome}: {tsv_gb:.1f} GB TSV → {pq_gb:.1f} GB Parquet "
+            f"({elapsed:.1f}s, {pq_gb / tsv_gb * 100:.0f}%)",
+            verbose,
+        )
+        pq_paths.append(pq_path)
+
+    return pq_paths
 
 
 def _build_duckdb_union_sql(
@@ -136,27 +250,41 @@ def _build_duckdb_union_sql(
 ) -> str:
     """
     Build a UNION ALL SQL fragment over all genome files.
-    AS is a SQL reserved word — aliased to as_ throughout.
+    Auto-detects Parquet vs TSV and uses the appropriate reader.
     Filters are applied inside each SELECT for DuckDB pushdown.
     xa_max < 0 means no XAcount filter.
     """
     parts = []
     for fp in files:
+        fp = Path(fp)
         genome = _genome_from_filename(fp).replace("'", "''")
         path   = str(fp).replace("'", "''")
+        is_parquet = fp.suffix == ".parquet"
+
         where  = [f"BC IN (SELECT bc FROM {bc_table})"]
         if mapq_min > 0:
             where.append(f"MAPQ >= {mapq_min}")
         if xa_max >= 0:
             where.append(f"XAcount <= {xa_max}")
-        parts.append(
-            f"SELECT Read, BC, CAST(\"AS\" AS FLOAT) AS as_, "
-            f"CAST(MAPQ AS FLOAT) AS MAPQ, CAST(NM AS FLOAT) AS NM, "
-            f"CAST(XAcount AS FLOAT) AS XAcount, '{genome}' AS Genome, "
-            f"COALESCE(frag_loc, '') AS frag_loc "
-            f"FROM read_csv('{path}', delim='\\t', header=true) "
-            f"WHERE {' AND '.join(where)}"
-        )
+
+        if is_parquet:
+            # Parquet: columns already typed, AS renamed to as_
+            parts.append(
+                f"SELECT Read, BC, as_, MAPQ, NM, XAcount, "
+                f"'{genome}' AS Genome, frag_loc "
+                f"FROM read_parquet('{path}') "
+                f"WHERE {' AND '.join(where)}"
+            )
+        else:
+            # TSV: need CAST and reserved-word quoting
+            parts.append(
+                f"SELECT Read, BC, CAST(\"AS\" AS FLOAT) AS as_, "
+                f"CAST(MAPQ AS FLOAT) AS MAPQ, CAST(NM AS FLOAT) AS NM, "
+                f"CAST(XAcount AS FLOAT) AS XAcount, '{genome}' AS Genome, "
+                f"COALESCE(frag_loc, '') AS frag_loc "
+                f"FROM read_csv('{path}', delim='\\t', header=true) "
+                f"WHERE {' AND '.join(where)}"
+            )
     return "\n    UNION ALL\n    ".join(parts)
 
 
@@ -1456,17 +1584,14 @@ def _classify_chunk_top3(
 
 
 def _friend_rescue(df: pd.DataFrame, window: int = 500) -> pd.DataFrame:
-    """Promote ambiguous reads to 'winner' if a winner read from the same
+    """Promote ambiguous reads to 'rescued' if a winner read from the same
     barcode maps nearby in the same genome's coordinate system.
 
-    For each (BC, Genome) group, winner reads define "rescue zones" based on
-    their frag_loc (chr:pos:mate_pos).  Both fragment endpoints (R1 start and
-    mate start) are checked independently — a match on EITHER end counts.
+    For each (BC, Genome, chr) group, winner reads define rescue zones from
+    their frag_loc (chr:pos:mate_pos).  Both fragment endpoints are checked
+    independently -- a match on EITHER end counts.
 
-    Ambiguous reads whose frag_loc falls within ±window of any winner endpoint
-    in the same genome get ``assigned_class`` changed to 'rescued'.
-
-    Operates on the assembled output DataFrame (winner + ambiguous rows).
+    Uses vectorized groupby + numpy searchsorted instead of per-row iteration.
     """
     if df.empty or "frag_loc" not in df.columns:
         return df
@@ -1474,7 +1599,6 @@ def _friend_rescue(df: pd.DataFrame, window: int = 500) -> pd.DataFrame:
     if not has_loc.any():
         return df
 
-    # Parse frag_loc → (chr, R1_pos, mate_pos)
     parts = df["frag_loc"].str.split(":", n=2, expand=True)
     if parts.shape[1] < 3:
         return df
@@ -1483,68 +1607,81 @@ def _friend_rescue(df: pd.DataFrame, window: int = 500) -> pd.DataFrame:
     df["_pos1"] = pd.to_numeric(parts[1], errors="coerce")
     df["_pos2"] = pd.to_numeric(parts[2], errors="coerce")
 
-    # Build winner lookup: for each (BC, Genome, chr), collect ALL winner
-    # positions (both R1 and mate) in a single sorted array.
+    # ── Build winner position lookup (vectorized via groupby) ──
     winners = df[df["assigned_class"] == "winner"]
     if winners.empty:
         df.drop(columns=["_chr", "_pos1", "_pos2"], inplace=True)
         return df
 
-    win_groups: dict = {}
-    for _, row in winners.iterrows():
-        bc, genome, chrom = row["BC"], row["Genome"], row["_chr"]
-        if pd.isna(chrom) or chrom == "*":
-            continue
-        key = (bc, genome, chrom)
-        if key not in win_groups:
-            win_groups[key] = []
-        p1 = row["_pos1"]
-        p2 = row["_pos2"]
-        if pd.notna(p1) and p1 >= 0:
-            win_groups[key].append(p1)
-        if pd.notna(p2) and p2 >= 0:
-            win_groups[key].append(p2)
+    valid_chr = winners["_chr"].notna() & (winners["_chr"] != "*")
+    winners = winners[valid_chr]
+    if winners.empty:
+        df.drop(columns=["_chr", "_pos1", "_pos2"], inplace=True)
+        return df
 
-    # Sort winner positions for binary search
-    for key in win_groups:
-        win_groups[key] = np.sort(np.array(win_groups[key], dtype=np.float64))
+    # Melt both endpoints into a single positions table, drop invalid
+    w_pos1 = winners[["BC", "Genome", "_chr", "_pos1"]].rename(columns={"_pos1": "_pos"})
+    w_pos2 = winners[["BC", "Genome", "_chr", "_pos2"]].rename(columns={"_pos2": "_pos"})
+    w_all = pd.concat([w_pos1, w_pos2], ignore_index=True)
+    w_all = w_all[w_all["_pos"].notna() & (w_all["_pos"] >= 0)]
 
-    # For each ambiguous read: check if EITHER endpoint is within ±window
-    # of any winner endpoint in the same (BC, Genome, chr).
+    if w_all.empty:
+        df.drop(columns=["_chr", "_pos1", "_pos2"], inplace=True)
+        return df
+
+    win_groups: dict[tuple, np.ndarray] = {}
+    for key, grp in w_all.groupby(["BC", "Genome", "_chr"]):
+        win_groups[key] = np.sort(grp["_pos"].values.astype(np.float64))
+
+    # ── Check ambiguous reads (vectorized per group) ──
     ambig_mask = df["assigned_class"] == "ambiguous"
+    ambig = df[ambig_mask]
+    if ambig.empty:
+        df.drop(columns=["_chr", "_pos1", "_pos2"], inplace=True)
+        return df
+
+    valid_ambig = ambig["_chr"].notna() & (ambig["_chr"] != "*")
+    ambig_valid = ambig[valid_ambig]
     rescued = np.zeros(len(df), dtype=bool)
 
-    def _near_any(win_pos, pos):
-        """Check if pos is within ±window of any value in sorted win_pos."""
-        if pd.isna(pos) or pos < 0:
-            return False
-        j = np.searchsorted(win_pos, pos)
-        if j < len(win_pos) and abs(win_pos[j] - pos) <= window:
-            return True
-        if j > 0 and abs(win_pos[j - 1] - pos) <= window:
-            return True
-        return False
-
-    for idx in df.index[ambig_mask]:
-        bc = df.at[idx, "BC"]
-        genome = df.at[idx, "Genome"]
-        chrom = df.at[idx, "_chr"]
-        if pd.isna(chrom) or chrom == "*":
-            continue
-        key = (bc, genome, chrom)
+    for key, grp in ambig_valid.groupby(["BC", "Genome", "_chr"]):
         if key not in win_groups:
             continue
         win_pos = win_groups[key]
-        # Check R1 position
-        if _near_any(win_pos, df.at[idx, "_pos1"]):
-            rescued[idx] = True
-            continue
-        # Check mate position
-        if _near_any(win_pos, df.at[idx, "_pos2"]):
-            rescued[idx] = True
+        n_win = len(win_pos)
+        idx = grp.index
+
+        # Vectorized searchsorted on pos1
+        pos1 = grp["_pos1"].values.astype(np.float64)
+        valid1 = np.isfinite(pos1) & (pos1 >= 0)
+        near1 = np.zeros(len(grp), dtype=bool)
+        if valid1.any():
+            j = np.searchsorted(win_pos, pos1[valid1])
+            j_hi = np.clip(j, 0, n_win - 1)
+            j_lo = np.clip(j - 1, 0, n_win - 1)
+            near1[valid1] = (
+                (np.abs(win_pos[j_hi] - pos1[valid1]) <= window)
+                | (np.abs(win_pos[j_lo] - pos1[valid1]) <= window)
+            )
+
+        # Vectorized searchsorted on pos2 (only un-rescued rows)
+        remaining = ~near1
+        if remaining.any():
+            pos2 = grp["_pos2"].values.astype(np.float64)
+            valid2 = np.isfinite(pos2) & (pos2 >= 0) & remaining
+            if valid2.any():
+                j = np.searchsorted(win_pos, pos2[valid2])
+                j_hi = np.clip(j, 0, n_win - 1)
+                j_lo = np.clip(j - 1, 0, n_win - 1)
+                near2 = (
+                    (np.abs(win_pos[j_hi] - pos2[valid2]) <= window)
+                    | (np.abs(win_pos[j_lo] - pos2[valid2]) <= window)
+                )
+                near1[valid2] = near2
+
+        rescued[idx] = near1
 
     df.loc[rescued, "assigned_class"] = "rescued"
-
     df.drop(columns=["_chr", "_pos1", "_pos2"], inplace=True)
     return df
 
