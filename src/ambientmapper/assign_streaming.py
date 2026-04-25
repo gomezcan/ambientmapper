@@ -198,6 +198,10 @@ def _convert_to_parquet(
         # Detect whether the TSV has a frag_loc column
         con = _duckdb.connect()
         con.execute(f"SET threads TO {max(1, duckdb_threads)}")
+        # Cap memory so DuckDB uses disk-based external sort for large files
+        con.execute("SET memory_limit='16GB'")
+        con.execute(f"SET temp_directory='{tempfile.gettempdir()}'")
+        con.execute("SET preserve_insertion_order=false")
         cols_df = con.execute(
             f"SELECT * FROM read_csv('{tsv_str}', delim='\\t', header=true) LIMIT 0"
         ).df()
