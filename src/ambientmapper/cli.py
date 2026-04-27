@@ -540,6 +540,12 @@ def assign(
         "--score-batch-size",
         help="Batch N chunks per DuckDB scan in Pass C (default: 200). Reduces file I/O by ~Nx. 0 = no batching.",
     ),
+    score_chunk_range: Optional[str] = typer.Option(
+        None,
+        "--score-chunk-range",
+        help="Process only chunks START:END (0-based, exclusive end). "
+             "Implies --only-score. For SLURM array parallelism.",
+    ),
     prepare: bool = typer.Option(
         True,
         "--prepare/--no-prepare",
@@ -555,6 +561,20 @@ def assign(
     if only_score:
         skip_edges = True
         skip_ecdf = True
+
+    _cr_start: int = 0
+    _cr_end: int = 0
+    if score_chunk_range is not None:
+        only_score = True
+        skip_edges = True
+        skip_ecdf = True
+        try:
+            _s, _e = score_chunk_range.split(":")
+            _cr_start, _cr_end = int(_s), int(_e)
+        except (ValueError, AttributeError):
+            raise typer.BadParameter(
+                f"--score-chunk-range must be START:END (got {score_chunk_range!r})"
+            )
 
     cfgs = _load_one_or_many_configs(config=config, configs=configs)
     for cfg in cfgs:
@@ -641,6 +661,18 @@ def assign(
         if not chunk_files:
             _ensure_minimal_chunk(workdir, sample)
             chunk_files = sorted(chunks_dir.glob("*_cell_map_ref_chunk_*.txt"))
+
+        if score_chunk_range is not None:
+            n_total = len(chunk_files)
+            chunk_files = chunk_files[_cr_start:_cr_end]
+            if verbose:
+                typer.echo(
+                    f"[assign/score] {sample}: chunk range {_cr_start}:{_cr_end} "
+                    f"-> {len(chunk_files)}/{n_total} chunks"
+                )
+            if not chunk_files:
+                typer.echo(f"[assign] {sample}: no chunks in range {_cr_start}:{_cr_end}, skipping")
+                continue
 
         exp_dir = workdir / sample / "ExplorationReadLevel"
         exp_dir.mkdir(parents=True, exist_ok=True)
