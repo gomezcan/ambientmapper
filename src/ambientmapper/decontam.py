@@ -504,6 +504,79 @@ def _pick_winner_using_assigned_class_or_scores(
     return _pick_winner_per_read(tmp, rid_col).rename(columns={"genome": "winner_genome"})
 
 
+# ============================================================
+# Worker-process global state, populated by _init_decontam_worker via
+# ProcessPoolExecutor(initializer=...). Reading these from globals (instead
+# of pickling them on every ex.submit) cuts per-chunk overhead from
+# O(|policy|) to O(|chunk|) and enables decontam on multi-million-barcode
+# datasets in reasonable wall time.
+# ============================================================
+_G_VALID_BC: Optional[Set[str]] = None
+_G_POLICY_AS_MAP: Optional[Dict[str, str]] = None
+_G_POLICY_ACTION_MAP: Optional[Dict[str, str]] = None
+_G_BARCODES_DROP: Optional[Set[str]] = None
+_G_ALLOWED_PAIRS_DF: Optional[pd.DataFrame] = None
+
+
+def _init_decontam_worker(
+    valid_bc: Set[str],
+    pas_map: Dict[str, str],
+    pac_map: Dict[str, str],
+    bc_drop: Set[str],
+    ap_df: Optional[pd.DataFrame],
+) -> None:
+    global _G_VALID_BC, _G_POLICY_AS_MAP, _G_POLICY_ACTION_MAP, _G_BARCODES_DROP, _G_ALLOWED_PAIRS_DF
+    _G_VALID_BC = valid_bc
+    _G_POLICY_AS_MAP = pas_map
+    _G_POLICY_ACTION_MAP = pac_map
+    _G_BARCODES_DROP = bc_drop
+    _G_ALLOWED_PAIRS_DF = ap_df
+
+
+def _worker_one_assign_file(
+    fp: Path,
+    out_part: Path,
+    bc_key_mode: str,
+    bc_key_n: int,
+    has_design: bool,
+    chunksize: int,
+    read_id_col: str,
+    barcode_col: str,
+    genome_col: str,
+    class_col: str,
+    p_as_col: str,
+    decontam_alpha: Optional[float],
+    require_p_as: bool,
+    safe_keep_delta_as: int,
+    safe_keep_mapq_min: Optional[int],
+    safe_keep_nm_max: Optional[int],
+) -> Tuple[Counter, Counter, int]:
+    """Worker entry that reads heavy state from process-global vars."""
+    return _process_one_assign_file(
+        fp,
+        out_part=out_part,
+        valid_barcodes=_G_VALID_BC,
+        bc_key_mode=bc_key_mode,
+        bc_key_n=bc_key_n,
+        allowed_pairs_df=_G_ALLOWED_PAIRS_DF,
+        policy_as_map=_G_POLICY_AS_MAP,
+        policy_action_map=_G_POLICY_ACTION_MAP,
+        barcodes_to_drop=_G_BARCODES_DROP,
+        has_design=has_design,
+        chunksize=chunksize,
+        read_id_col=read_id_col,
+        barcode_col=barcode_col,
+        genome_col=genome_col,
+        class_col=class_col,
+        p_as_col=p_as_col,
+        decontam_alpha=decontam_alpha,
+        require_p_as=require_p_as,
+        safe_keep_delta_as=safe_keep_delta_as,
+        safe_keep_mapq_min=safe_keep_mapq_min,
+        safe_keep_nm_max=safe_keep_nm_max,
+    )
+
+
 def _process_one_assign_file(
     fp: Path,
     *,
@@ -512,7 +585,8 @@ def _process_one_assign_file(
     bc_key_mode: str,
     bc_key_n: int,
     allowed_pairs_df: Optional[pd.DataFrame],  # optional debug only
-    policy_df: pd.DataFrame,                  # must include: barcode, allowed_set, action
+    policy_as_map: Dict[str, str],             # barcode -> allowed_set (csv string)
+    policy_action_map: Dict[str, str],         # barcode -> action
     barcodes_to_drop: Set[str],
     has_design: bool,
     chunksize: int,
@@ -558,26 +632,12 @@ def _process_one_assign_file(
         ap = ap[["bc_key", "genome", "is_allowed"]].drop_duplicates().copy()
 
     # -------------------------
-    # Policy table
+    # Policy table — passed in as precomputed dict lookups
+    # (barcode -> allowed_set, barcode -> action) to avoid pickling a multi-
+    # million-row DataFrame per chunk. See _init_decontam_worker.
     # -------------------------
-    if policy_df is None or policy_df.empty:
-        raise ValueError("policy_df is required and cannot be empty.")
-
-    need_pol = {"barcode", "allowed_set", "action"}
-    miss_pol = need_pol - set(policy_df.columns)
-    if miss_pol:
-        raise ValueError(f"policy_df missing required columns: {sorted(miss_pol)}")
-
-    pol = (
-        policy_df[["barcode", "allowed_set", "action"]]
-        .drop_duplicates(subset=["barcode"], keep="first")
-        .copy()
-    )
-    pol["barcode"] = pol["barcode"].astype(str)
-    pol["allowed_set"] = pol["allowed_set"].fillna("").astype(str)
-    pol["action"] = pol["action"].fillna("keep_cleaned").astype(str)
-
-    pol_action = pol[["barcode", "action"]].copy()
+    if not policy_as_map or not policy_action_map:
+        raise ValueError("policy_as_map / policy_action_map are required and cannot be empty.")
 
     # exact-token membership for comma-separated allowed_set
     def _token_in_allowed_set(genome: str, aset: str) -> bool:
@@ -608,9 +668,8 @@ def _process_one_assign_file(
             chunk["bc_key"] = chunk["barcode"].map(lambda x: _design_key(x, bc_key_mode, bc_key_n))
             chunk["_rid"] = chunk["barcode"] + "::" + chunk["read_id"]
 
-            # ---- PATCH: attach allowed_set onto CHUNK (propagates into win) ----
-            chunk = chunk.merge(pol[["barcode", "allowed_set"]], on="barcode", how="left")
-            chunk["allowed_set"] = chunk["allowed_set"].fillna("").astype(str)
+            # ---- PATCH: attach allowed_set onto CHUNK via dict lookup (propagates into win) ----
+            chunk["allowed_set"] = chunk["barcode"].map(policy_as_map).fillna("").astype(str)
 
             # optional debug: bc_key x genome membership (not used for decisions)
             if has_design and ap is not None:
@@ -664,9 +723,8 @@ def _process_one_assign_file(
             win["_p_as_val"] = pd.to_numeric(win["p_as"], errors="coerce")
             win["p_as"] = win["p_as"].fillna("").astype(str)
 
-            # ---- PATCH: merge ACTION only (avoid allowed_set collisions) ----
-            win = win.merge(pol_action, on="barcode", how="left", validate="m:1")
-            win["action"] = win["action"].fillna("keep_cleaned").astype(str)
+            # ---- PATCH: attach ACTION onto WIN via dict lookup (avoid allowed_set collisions) ----
+            win["action"] = win["barcode"].map(policy_action_map).fillna("keep_cleaned").astype(str)
 
             # -------------------------
             # Confidence ON WINNER
@@ -827,6 +885,22 @@ def _process_one_assign_file(
                 n_drop_rows += n_this
                 out.to_csv(fh, sep="\t", header=False, index=False)
 
+    # ---- meta sidecar (resume sentinel) ----
+    # Written ONLY after the gzip part file is fully closed. tmp + atomic
+    # rename guarantees an interrupted run never produces a meta file
+    # without a completed part. See decontam() resume-load loop.
+    meta_path = out_part.parent / (out_part.name + ".meta.json")
+    meta_tmp = out_part.parent / (out_part.name + ".meta.json.tmp")
+    meta_obj = {
+        "version": 1,
+        "n_drop_rows": int(n_drop_rows),
+        "pre_counts": [[str(bc), str(g), int(n)] for (bc, g), n in pre_counts.items()],
+        "post_counts": [[str(bc), str(g), int(n)] for (bc, g), n in post_counts.items()],
+    }
+    with open(meta_tmp, "w") as fh:
+        json.dump(meta_obj, fh)
+    meta_tmp.replace(meta_path)
+
     return pre_counts, post_counts, n_drop_rows
 
 
@@ -889,6 +963,15 @@ def decontam(
     # Parallelism
     threads: int = typer.Option(1, "--threads", help="Parallel workers across assignment chunk files."),
     tmp_dir: Optional[Path] = typer.Option(None, "--tmp-dir", help="Temp directory for drop parts (default: out_dir/tmp_decontam)."),
+
+    # Resume
+    resume: bool = typer.Option(
+        True,
+        "--resume/--no-resume",
+        help="Skip chunks whose drop_part + meta sidecar already exist. Sidecars "
+             "are written by patched decontam only; pre-patch partial runs without "
+             "sidecars are always reprocessed.",
+    ),
 
     # Design / Layout
     design_file: Optional[Path] = typer.Option(None, "--design-file", readable=True, help="Optional design file. Enables design-aware mode."),
@@ -1097,6 +1180,18 @@ def decontam(
     df_policy = pd.DataFrame.from_records(policy_rows)
     df_policy.to_csv(out_dir / f"{sample_name}_barcode_policy.tsv.gz", sep="\t", index=False, compression="gzip")
 
+    # Precompute dict lookups for worker processes. Built once in main rather
+    # than per-chunk (which was the dominant cost on multi-million-BC datasets).
+    _pol_dedup = (
+        df_policy[["barcode", "allowed_set", "action"]]
+        .drop_duplicates(subset=["barcode"], keep="first")
+    )
+    _pol_bc = _pol_dedup["barcode"].astype(str).to_numpy()
+    _pol_as = _pol_dedup["allowed_set"].fillna("").astype(str).to_numpy()
+    _pol_ac = _pol_dedup["action"].fillna("keep_cleaned").astype(str).to_numpy()
+    policy_as_map: Dict[str, str] = dict(zip(_pol_bc, _pol_as))
+    policy_action_map: Dict[str, str] = dict(zip(_pol_bc, _pol_ac))
+
     # Optional debug table (bc_key x allowed genome)
     allowed_pairs: List[Tuple[str, str]] = []
     for bc, bc_key, allowed_str, action in df_policy[["barcode", "bc_key", "allowed_set", "action"]].itertuples(index=False):
@@ -1143,10 +1238,43 @@ def decontam(
     post_counts: Counter = Counter()
     drop_total = 0
 
-    typer.echo(f"[decontam] Processing {len(input_files)} assignment files (threads={threads})")
+    # ---- Resume pre-pass ----
+    # A chunk is resumable iff its drop-part .tsv.gz exists with size > 64 AND
+    # a sibling .meta.json sidecar (written by the patched worker) loads as
+    # valid v1 JSON. Cached counters are folded into the running totals and
+    # the chunk is removed from the submission list.
+    pending_files: List[Path] = []
+    n_resumed = 0
+    for fp in input_files:
+        part = _part_path(fp)
+        meta_path = part.parent / (part.name + ".meta.json")
+        cached: Optional[Dict[str, Any]] = None
+        if resume and part.exists() and part.stat().st_size > 64 and meta_path.exists():
+            try:
+                with open(meta_path) as fh:
+                    cached = json.load(fh)
+            except (json.JSONDecodeError, OSError):
+                cached = None
+            if cached is not None and cached.get("version") != 1:
+                cached = None
+        if cached is not None:
+            part_paths.append(part)
+            for bc, g, n in cached.get("pre_counts", []):
+                pre_counts[(str(bc), str(g))] += int(n)
+            for bc, g, n in cached.get("post_counts", []):
+                post_counts[(str(bc), str(g))] += int(n)
+            drop_total += int(cached.get("n_drop_rows", 0))
+            n_resumed += 1
+        else:
+            pending_files.append(fp)
+
+    if resume and n_resumed > 0:
+        typer.echo(f"[decontam] Resuming {n_resumed}/{len(input_files)} chunks from prior run")
+
+    typer.echo(f"[decontam] Processing {len(pending_files)} assignment files (threads={threads})")
 
     if threads == 1:
-        for fp in input_files:
+        for fp in pending_files:
             part = _part_path(fp)
             part_paths.append(part)
             pc, qc, nd = _process_one_assign_file(
@@ -1156,9 +1284,10 @@ def decontam(
                 bc_key_mode=design_bc_mode,
                 bc_key_n=design_bc_n,
                 allowed_pairs_df=allowed_pairs_df,
-                policy_df=df_policy,
-                barcodes_to_drop=barcodes_to_drop,  # PATCH: pass required arg
-                has_design=has_design,              # PATCH: pass required arg
+                policy_as_map=policy_as_map,
+                policy_action_map=policy_action_map,
+                barcodes_to_drop=barcodes_to_drop,
+                has_design=has_design,
                 chunksize=chunksize,
                 read_id_col=read_id_col,
                 barcode_col=barcode_col,
@@ -1176,33 +1305,33 @@ def decontam(
             drop_total += nd
             typer.echo(f"  done: {fp.name} (drop_rows={nd})")
     else:
-        with ProcessPoolExecutor(max_workers=threads) as ex:
+        with ProcessPoolExecutor(
+            max_workers=threads,
+            initializer=_init_decontam_worker,
+            initargs=(valid_barcodes, policy_as_map, policy_action_map, barcodes_to_drop, allowed_pairs_df),
+        ) as ex:
             futs = {}
-            for fp in input_files:
+            for fp in pending_files:
                 part = _part_path(fp)
                 part_paths.append(part)
                 fut = ex.submit(
-                    _process_one_assign_file,
+                    _worker_one_assign_file,
                     fp,
-                    out_part=part,
-                    valid_barcodes=valid_barcodes,
-                    bc_key_mode=design_bc_mode,
-                    bc_key_n=design_bc_n,
-                    allowed_pairs_df=allowed_pairs_df,
-                    policy_df=df_policy,
-                    barcodes_to_drop=barcodes_to_drop,  # PATCH
-                    has_design=has_design,              # PATCH
-                    chunksize=chunksize,
-                    read_id_col=read_id_col,
-                    barcode_col=barcode_col,
-                    genome_col=genome_col,
-                    class_col=class_col,
-                    p_as_col=p_as_col,
-                    decontam_alpha=decontam_alpha,
-                    require_p_as=require_p_as,
-                    safe_keep_delta_as=safe_keep_delta_as,
-                    safe_keep_mapq_min=safe_keep_mapq_min,
-                    safe_keep_nm_max=safe_keep_nm_max,
+                    part,
+                    design_bc_mode,
+                    design_bc_n,
+                    has_design,
+                    chunksize,
+                    read_id_col,
+                    barcode_col,
+                    genome_col,
+                    class_col,
+                    p_as_col,
+                    decontam_alpha,
+                    require_p_as,
+                    safe_keep_delta_as,
+                    safe_keep_mapq_min,
+                    safe_keep_nm_max,
                 )
                 futs[fut] = fp
 
