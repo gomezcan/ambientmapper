@@ -25,6 +25,76 @@ The rollout is three staged PRs (see `plans/parquet-native-refactor.md`):
   `_convert_to_parquet`; deprecate the `--prepare/--no-prepare` flag on
   `assign`.
 
+### PR3 — Parquet-native `extract` + retire implicit `_convert_to_parquet`
+
+Completes the parquet-native pipeline. Extract writes Parquet by default;
+the implicit txt→parquet conversion previously fired at assign time is
+removed from `pipeline.run`; the `--prepare` flag on `assign` is
+deprecated.
+
+#### Added
+
+- `extract._bam_to_qc_parquet`: streams a BAM to typed Parquet conforming
+  to `QC_PARQUET_SCHEMA`. Maintains 7 per-column accumulators flushed as
+  a `pa.RecordBatch` every `row_group_size` rows (default 100,000).
+  Atomic write via `.tmp` + `os.replace`. Empty-BAM case writes a valid
+  schema-conformant empty parquet.
+- `extract.bam_to_qc` now returns `int` (rows written). Backwards-
+  compatible: existing callers ignore the return value.
+- `extract --format {parquet,txt}` CLI flag (default `parquet`). `txt`
+  selects the legacy header-less TSV writer.
+- `tests/test_extract_parquet.py` (7 cases): schema conformance,
+  empty-BAM, missing AS/NM tags → nulls, unmapped/secondary/supplementary
+  filtering, row-group flush size, legacy TSV preserved, extension
+  dispatch precedence.
+- `tests/test_e2e_parquet.py`: load-bearing equivalence test — extract
+  parquet → filter parquet vs. extract txt → filter parquet (same input
+  BAM, same min_freq) must produce bit-equivalent filtered Parquet.
+
+#### Changed
+
+- `extract.bam_to_qc`: thin dispatcher on `out_path.suffix`. Old
+  implementation preserved as `_bam_to_qc_tsv`.
+- `cli.py extract`: defaults to Parquet output; `--format` flag added;
+  sentinel `outputs` field records the chosen format. Sentinel hash
+  unchanged (matches PR2 filter convention).
+- `cli.py prepare`: docstring rewritten to flag it as a **MIGRATION TOOL**
+  for pre-0.2 TSVs; echo message changed from "converting" to "migrating
+  legacy".
+- `cli.py assign --prepare/--no-prepare`: default flipped `True` → `False`.
+  When `--prepare=True`, emits a yellow deprecation notice on stderr.
+  The inline conversion now only fires if legacy TSV-only inputs are
+  detected (via `discover_filtered_files`); on parquet-native pools the
+  flag is a no-op with a "no legacy TSV detected" log.
+- `pipeline.py _run_assign`: the implicit `_convert_to_parquet` call is
+  **removed**. Replaced with a defensive warning that fires only when
+  legacy TSV-only inputs are detected, pointing the user at
+  `ambientmapper prepare` or `filter --no-resume`.
+- `README.md`:
+  - Disk-requirements blurb updated for ~25% smaller QC files.
+  - `extract` reference section: output `.parquet`, typed columns
+    documented, AS→`as_` rename explained, `--format txt` escape-hatch.
+  - Directory tree shows `qc/<G>_QCMapping.parquet`.
+  - New troubleshooting entry for the "legacy TSV inputs detected"
+    warning + the `--prepare` deprecation.
+
+#### Migration
+
+- New pipelines run extract → filter → assign cleanly with no extra
+  steps; no manual conversion needed.
+- Pre-0.2 pools with TSV outputs: run `ambientmapper prepare` once to
+  produce co-located Parquet, then continue with the new pipeline.
+  Alternatively, `filter --no-resume` rewrites the TSV inputs from
+  whatever extract left behind.
+- Disk reclaim after migration:
+  ```bash
+  find <workdir>/<sample> \( -name '*_QCMapping.txt' -o -name 'filtered_*_QCMapping.txt' \) -delete
+  ```
+- `--prepare` survives one minor release for back-compat; will be removed
+  in 0.3.
+
+---
+
 ### PR2 — Parquet-native `filter` + parquet-aware `chunks`
 
 Resolves the production segfault triggered when `_convert_to_parquet`

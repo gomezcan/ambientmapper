@@ -314,16 +314,36 @@ def _has_sentinel(d: Dict[str, Path], step: str, cfg: Dict[str, object], params:
 def extract(
     config: Path = typer.Option(..., "--config", "-c", exists=True, readable=True),
     threads: int = typer.Option(4, "--threads", "-t", min=1),
+    format: str = typer.Option(
+        "parquet", "--format",
+        help="Output format: 'parquet' (default, recommended in 0.2+) or 'txt' "
+             "(legacy header-less TSV). Parquet is ~25%% the size of TSV and "
+             "avoids the txt→parquet conversion at assign time.",
+    ),
     resume: bool = typer.Option(True, "--resume/--no-resume"),
 ) -> None:
-    """Extract per-genome QCMapping files from BAMs."""
+    """Extract per-genome QCMapping Parquet files from BAMs (sorted in BAM order).
+
+    Output is typed, snappy-compressed Parquet conforming to
+    ``ambientmapper.extract.QC_PARQUET_SCHEMA``. Pass ``--format txt`` to
+    reproduce the pre-0.2 header-less TSV (useful only for legacy workflows
+    or when downstream code grep/awk's the file).
+    """
     from .extract import bam_to_qc
+
+    fmt = str(format).lower()
+    if fmt not in ("parquet", "txt"):
+        raise typer.BadParameter(f"--format must be 'parquet' or 'txt' (got {format!r})")
+    ext = fmt
 
     cfg = _load_config(config)
     d = _cfg_dirs(cfg)
     _ensure_dirs(d)
 
     genomes = sorted(dict(cfg["genomes"]).items())
+    # NOTE: `format` is intentionally NOT in the sentinel hash so existing
+    # sentinels stay valid across the 0.2 transition. To switch formats on a
+    # previously-extracted pool, pass `--no-resume`.
     params = {"threads": int(threads), "genomes": [g for g, _ in genomes]}
 
     if resume and _has_sentinel(d, "extract", cfg, params):
@@ -332,7 +352,7 @@ def extract(
 
     with ProcessPoolExecutor(max_workers=_clamp(int(threads), 1, len(genomes))) as ex:
         futs = [
-            ex.submit(bam_to_qc, Path(bam), d["qc"] / f"{g}_QCMapping.txt", str(cfg["sample"]))
+            ex.submit(bam_to_qc, Path(bam), d["qc"] / f"{g}_QCMapping.{ext}", str(cfg["sample"]))
             for g, bam in genomes
         ]
         for f in as_completed(futs):
@@ -340,10 +360,11 @@ def extract(
 
     outputs = {
         "qc_dir": str(d["qc"]),
-        "qc_files": [str(d["qc"] / f"{g}_QCMapping.txt") for g, _ in genomes],
+        "qc_files": [str(d["qc"] / f"{g}_QCMapping.{ext}") for g, _ in genomes],
+        "format": fmt,
     }
     sp = _write_sentinel(d, step="extract", cfg=cfg, params=params, outputs=outputs)
-    typer.echo(f"[extract] done ({cfg['sample']}) sentinel={sp.name}")
+    typer.echo(f"[extract] done ({cfg['sample']}) format={fmt} sentinel={sp.name}")
 
 
 @app.command()
@@ -460,10 +481,19 @@ def prepare(
     duckdb_threads: int = typer.Option(4, "--duckdb-threads"),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
 ) -> None:
-    """Convert filtered QCMapping TSVs to sorted Parquet (one-time preparation).
+    """MIGRATION TOOL. Convert legacy filtered QCMapping TSVs (pre-0.2) to sorted Parquet.
 
-    Produces co-located .parquet files alongside existing .txt files in
-    filtered_QCFiles/. The assign step auto-detects and prefers Parquet.
+    In 0.2+ the `filter` step writes Parquet directly, so this command is
+    only needed for:
+
+    - Pools left over from a pre-0.2 run that wrote `.txt` outputs.
+    - Pools where `extract --format txt` or `filter --format txt` was used
+      and you now want the typed parquet (e.g. for faster `assign`).
+
+    Produces co-located ``.parquet`` files alongside existing ``.txt`` files
+    in ``filtered_QCFiles/``. Idempotent: skips genomes whose ``.parquet`` is
+    already newer than the source ``.txt``. The ``assign`` step auto-detects
+    and prefers Parquet via the all-or-nothing precedence rule.
     """
     from .assign_streaming import _convert_to_parquet
 
@@ -471,7 +501,7 @@ def prepare(
     for cfg in cfgs:
         workdir = Path(str(cfg["workdir"]))
         sample = str(cfg["sample"])
-        typer.echo(f"[prepare] {sample}: converting filtered TSVs to Parquet ...")
+        typer.echo(f"[prepare] {sample}: migrating legacy filtered TSVs to Parquet ...")
         t0 = time.time()
         pq_files = _convert_to_parquet(
             workdir=workdir,
@@ -577,10 +607,13 @@ def assign(
              "Implies --only-score. For SLURM array parallelism.",
     ),
     prepare: bool = typer.Option(
-        True,
+        False,
         "--prepare/--no-prepare",
-        help="Convert filtered QCMapping TSVs to sorted Parquet before scoring (default: on). "
-             "One-time cost; dramatically speeds up scoring by enabling row-group skipping.",
+        help="DEPRECATED in 0.2; will be removed in 0.3. The filter step now writes "
+             "Parquet directly. The new default is --no-prepare. Pass --prepare only "
+             "if you have legacy TSV-only filtered_QCFiles/ from a pre-0.2 run; in "
+             "that case use `ambientmapper prepare` as an explicit migration step "
+             "instead of relying on this implicit conversion.",
     ),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
     resume: bool = typer.Option(True, "--resume/--no-resume"),
@@ -786,22 +819,42 @@ def assign(
             if verbose:
                 typer.echo(f"[assign/ecdf] skip: reuse {ecdf_npz}")
 
-        # (2.5) Prepare: convert filtered TSVs to Parquet for fast scoring
-        #        Don't pre-filter: scoring step applies mapq/xa via _build_duckdb_union_sql.
-        #        This keeps Parquet files reusable across different filter thresholds.
+        # (2.5) Prepare: convert filtered TSVs to Parquet for fast scoring.
+        # DEPRECATED in 0.2. Filter now writes Parquet directly; this is only
+        # useful for pools migrated from a pre-0.2 ambientmapper. When
+        # --prepare is True we emit a deprecation notice and skip the call
+        # entirely if no legacy TSV inputs are present.
         if prepare and score_duckdb_eff:
+            from ._filtered_io import discover_filtered_files
             from .assign_streaming import _convert_to_parquet
-            t_prep = time.time()
-            pq_files = _convert_to_parquet(
-                workdir=workdir,
-                sample=sample,
-                duckdb_threads=max(1, duckdb_threads_eff),
-                verbose=verbose,
+            filtered_dir = workdir / sample / "filtered_QCFiles"
+            try:
+                _detected = discover_filtered_files(filtered_dir)
+            except FileNotFoundError:
+                _detected = []
+            _has_tsv_inputs = any(p.suffix == ".txt" for p in _detected)
+            typer.secho(
+                "[deprecation] --prepare is deprecated in 0.2 and will be removed in 0.3. "
+                "Filter writes Parquet directly; use `ambientmapper prepare` as an explicit "
+                "migration step for legacy TSV-only pools instead.",
+                fg="yellow", err=True,
             )
-            if verbose:
+            if _has_tsv_inputs:
+                t_prep = time.time()
+                pq_files = _convert_to_parquet(
+                    workdir=workdir,
+                    sample=sample,
+                    duckdb_threads=max(1, duckdb_threads_eff),
+                    verbose=verbose,
+                )
+                if verbose:
+                    typer.echo(
+                        f"[assign/prepare] {sample}: {len(pq_files)} Parquet files ready "
+                        f"({time.time() - t_prep:.1f}s)"
+                    )
+            elif verbose:
                 typer.echo(
-                    f"[assign/prepare] {sample}: {len(pq_files)} Parquet files ready "
-                    f"({time.time() - t_prep:.1f}s)"
+                    f"[assign/prepare] {sample}: no legacy TSV inputs detected, skipping conversion"
                 )
 
         # (3) score chunks

@@ -168,8 +168,13 @@ def _run_extract(ctx: Ctx) -> None:
     genomes = sorted(cfg["genomes"].items())
     threads = int(ctx.params.get("threads", 4))
     nprocs = max(1, min(threads, len(genomes)))
+    # Output format: parquet by default (0.2+); honors top-level "format" param.
+    # Matches cli.py extract dispatch and _run_filter below.
+    fmt = str(ctx.params.get("format", "parquet")).lower()
+    if fmt not in ("parquet", "txt"):
+        raise ValueError(f"params.format must be 'parquet' or 'txt' (got {fmt!r})")
     with ProcessPoolExecutor(max_workers=nprocs) as ex:
-        futs = [ex.submit(bam_to_qc, Path(bam), d["qc"] / f"{g}_QCMapping.txt", cfg["sample"])
+        futs = [ex.submit(bam_to_qc, Path(bam), d["qc"] / f"{g}_QCMapping.{fmt}", cfg["sample"])
                 for g, bam in genomes]
         for f in as_completed(futs):
             f.result()
@@ -263,18 +268,25 @@ def _run_assign(ctx: Ctx) -> None:
         ecdf_duckdb_threads=parse_int(ecdf_duckdb_threads),
     )
 
-    # Prepare: convert filtered TSVs to Parquet (idempotent, speeds up scoring)
+    # Retired in 0.2: the implicit txt→parquet conversion previously fired
+    # here regardless of input format. With filter now writing Parquet
+    # directly, this is dead weight on parquet-native pools. We keep a
+    # defensive log for legacy TSV-only pools that still need migration.
     score_duckdb_eff   = bool(aconf.get("score_duckdb", True))
     duckdb_threads_eff = int(aconf.get("duckdb_threads", 2))
-    # Don't pre-filter: scoring step applies mapq/xa via _build_duckdb_union_sql.
     if score_duckdb_eff:
-        from .assign_streaming import _convert_to_parquet
-        _convert_to_parquet(
-            workdir=workdir,
-            sample=sample,
-            duckdb_threads=max(1, duckdb_threads_eff),
-            verbose=verbose,
-        )
+        from ._filtered_io import discover_filtered_files
+        filtered_dir = workdir / sample / "filtered_QCFiles"
+        try:
+            _detected = discover_filtered_files(filtered_dir)
+        except FileNotFoundError:
+            _detected = []
+        if any(p.suffix == ".txt" for p in _detected):
+            typer.echo(
+                "[pipeline] legacy TSV inputs detected in filtered_QCFiles/. "
+                "Run `ambientmapper prepare --config <cfg>` to migrate, or "
+                "re-run `filter --no-resume` to rewrite as Parquet."
+            )
 
     score_batch_size   = int(aconf.get("score_batch_size", 200))
 
