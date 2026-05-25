@@ -86,7 +86,8 @@ Optional QC utilities (run separately; summary is Python API only):
 
 * Needs space for:
 
-  * Per-genome QC TSVs (`qc/`, `filtered_QCFiles/`),
+  * Per-genome QC Parquet files (`qc/`, `filtered_QCFiles/`) — ~25% the
+    size of pre-0.2 TSVs at the same fidelity.
   * Chunk barcode lists and assign outputs,
   * Genotyping outputs under `final/`.
 * Expect 10s–100s of GB for large experiments.
@@ -317,23 +318,30 @@ For each genome BAM:
 * Reads per alignment:
 
   * **Read** — read name (`query_name`).
-  * **MAPQ** — mapping quality.
-  * **AS** — alignment score (`AS` tag if present, else empty).
-  * **NM** — mismatches/edits (`NM` tag if present, else empty).
+  * **MAPQ** — mapping quality (int16).
+  * **AS** — alignment score (`AS` tag if present, else null). Stored as
+    column `as_` to avoid the SQL reserved word.
+  * **NM** — mismatches/edits (`NM` tag if present, else null).
   * **XAcount** — number of alternative alignments from the `XA` tag (0 if absent).
   * **BC** — barcode from `CB` or `BC`.
 * Normalizes barcodes to `"<BCseq>-<sample>"` via `canonicalize_bc_seq_sample_force`.
 
-**Writes:**
+**Writes (0.2+):**
 
 ```
-qc/<genome>_QCMapping.txt
-# Columns: Read, BC, MAPQ, AS, NM, XAcount
+qc/<genome>_QCMapping.parquet
+# Columns: Read, BC, MAPQ, as_, NM, XAcount, frag_loc
+# Schema: ambientmapper.extract.QC_PARQUET_SCHEMA
+# Row groups: 100,000 rows, snappy-compressed
 ```
 
 ```bash
 ambientmapper extract --config cfg.json --threads 8
 ```
+
+**Legacy text output** — pass `--format txt` for the pre-0.2 header-less
+TSV. Useful only when reproducing old runs bit-exactly. New users should
+not need this flag.
 
 ---
 
@@ -782,9 +790,9 @@ Typical layout for a completed run including decontamination:
 
 ```
 <workdir>/<sample>/
-├─ qc/                                   # per-genome raw QC (extract)
-│   ├─ <genome1>_QCMapping.txt
-│   └─ <genome2>_QCMapping.txt
+├─ qc/                                   # per-genome raw QC (extract; 0.2+ Parquet, BAM-order)
+│   ├─ <genome1>_QCMapping.parquet
+│   └─ <genome2>_QCMapping.parquet
 ├─ filtered_QCFiles/                     # per-genome filtered QC (filter; 0.2+ Parquet, sorted by BC)
 │   ├─ filtered_<genome1>_QCMapping.parquet
 │   └─ filtered_<genome2>_QCMapping.parquet
@@ -1066,6 +1074,18 @@ If `--ambiguous-policy drop` is set, all ambiguous barcodes are dropped entirely
 **`clean-bams` crashes with a htslib / pysam error**
 
 Ensure each BAM is coordinate-sorted and indexed (`.bam.bai` present). On Apple Silicon, install `pysam` via `mamba install -c bioconda pysam` instead of `pip`.
+
+**`pipeline` warns "legacy TSV inputs detected" / `assign --prepare` deprecation notice**
+
+Your `filtered_QCFiles/` has `.txt` files from a pre-0.2 run. In 0.2+ the `filter` step writes Parquet directly; the implicit txt→parquet conversion at assign time was retired. Either:
+
+- Re-run `filter --no-resume` to overwrite the TSVs with Parquet (recommended), or
+- Run `ambientmapper prepare --config <cfg>` to migrate in-place (keeps both `.txt` and `.parquet` co-located; assign's precedence rule prefers Parquet).
+
+After migration, reclaim TSV disk:
+```bash
+find <workdir>/<sample> \( -name '*_QCMapping.txt' -o -name 'filtered_*_QCMapping.txt' \) -delete
+```
 
 **Pipeline re-runs completed steps unexpectedly**
 
