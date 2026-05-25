@@ -353,10 +353,26 @@ def filter(
     threads: int = typer.Option(4, "--threads", "-t", min=1),
     min_barcode_freq: Optional[int] = typer.Option(None, "--min-barcode-freq", min=1),
     normalize_bc: bool = typer.Option(False, "--normalize-bc/--no-normalize-bc"),
+    format: str = typer.Option(
+        "parquet", "--format",
+        help="Output format: 'parquet' (default, recommended) or 'txt' (legacy, pre-0.2). "
+             "Parquet output is sorted by BC, enabling row-group skipping in `assign`.",
+    ),
     resume: bool = typer.Option(True, "--resume/--no-resume"),
 ) -> None:
-    """Filter QCMapping files by barcode frequency."""
+    """Filter QCMapping files by barcode frequency.
+
+    Output is sorted-by-BC Parquet by default (use ``--format txt`` for the
+    legacy text writer). Input format is auto-detected per genome: an existing
+    ``<G>_QCMapping.parquet`` from extract is preferred over a co-located
+    ``<G>_QCMapping.txt``.
+    """
     from .filtering import filter_qc_file
+
+    fmt = str(format).lower()
+    if fmt not in ("parquet", "txt"):
+        raise typer.BadParameter(f"--format must be 'parquet' or 'txt' (got {format!r})")
+    ext = fmt  # output file suffix without leading dot
 
     cfgs = _load_one_or_many_configs(config=config, configs=configs, min_barcode_freq=min_barcode_freq)
     for cfg in cfgs:
@@ -368,6 +384,9 @@ def filter(
         sample_for_norm = str(cfg["sample"]) if normalize_bc else None
         pool_n = _clamp(int(threads), 1, len(genomes))
 
+        # NOTE: `format` is intentionally NOT part of the sentinel hash so that
+        # existing sentinels stay valid across the 0.2 transition. To switch
+        # formats on a previously-filtered pool, pass `--no-resume`.
         params = {
             "threads": int(threads),
             "min_barcode_freq": minf,
@@ -379,17 +398,28 @@ def filter(
             typer.echo(f"[filter] skip (sentinel): {cfg['sample']}")
             continue
 
+        outputs_paths: list[str] = []
         with ProcessPoolExecutor(max_workers=pool_n) as ex:
             futs = []
             for g in genomes:
-                ip = d["qc"] / f"{g}_QCMapping.txt"
-                op = d["filtered"] / f"filtered_{g}_QCMapping.txt"
+                # Input format: prefer existing parquet, fall back to txt.
+                pq_in = d["qc"] / f"{g}_QCMapping.parquet"
+                txt_in = d["qc"] / f"{g}_QCMapping.txt"
+                ip = pq_in if pq_in.exists() else txt_in
+                op = d["filtered"] / f"filtered_{g}_QCMapping.{ext}"
+                outputs_paths.append(str(op))
                 futs.append(ex.submit(filter_qc_file, ip, op, minf, sample_for_norm))
             rows = [int(f.result()) for f in as_completed(futs)]
 
-        outputs = {"filtered_dir": str(d["filtered"]), "n_genomes": len(genomes), "rows_per_genome": rows}
+        outputs = {
+            "filtered_dir": str(d["filtered"]),
+            "n_genomes": len(genomes),
+            "rows_per_genome": rows,
+            "format": fmt,
+            "files": outputs_paths,
+        }
         sp = _write_sentinel(d, step="filter", cfg=cfg, params=params, outputs=outputs)
-        typer.echo(f"[filter] done ({cfg['sample']}) sentinel={sp.name}")
+        typer.echo(f"[filter] done ({cfg['sample']}) format={fmt} sentinel={sp.name}")
 
 
 @app.command()

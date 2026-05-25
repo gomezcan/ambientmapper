@@ -181,11 +181,18 @@ def _run_filter(ctx: Ctx) -> None:
     minf = int(cfg.get("min_barcode_freq", 10))
     threads = int(ctx.params.get("threads", 4))
     nprocs = max(1, min(threads, len(genomes)))
+    # Output format: parquet by default (0.2+); honors top-level "format" param.
+    fmt = str(ctx.params.get("format", "parquet")).lower()
+    if fmt not in ("parquet", "txt"):
+        raise ValueError(f"params.format must be 'parquet' or 'txt' (got {fmt!r})")
     with ProcessPoolExecutor(max_workers=nprocs) as ex:
         futs = []
         for g in genomes:
-            ip = d["qc"] / f"{g}_QCMapping.txt"
-            op = d["filtered"] / f"filtered_{g}_QCMapping.txt"
+            # Input: prefer existing parquet from extract, fall back to txt.
+            pq_in = d["qc"] / f"{g}_QCMapping.parquet"
+            txt_in = d["qc"] / f"{g}_QCMapping.txt"
+            ip = pq_in if pq_in.exists() else txt_in
+            op = d["filtered"] / f"filtered_{g}_QCMapping.{fmt}"
             futs.append(ex.submit(filter_qc_file, ip, op, minf, cfg["sample"]))
         for f in as_completed(futs):
             f.result()

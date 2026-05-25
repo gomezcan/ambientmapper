@@ -345,18 +345,29 @@ For each QC file:
 
 * Re-normalizes barcode to `"<BCseq>-<sample>"`.
 * Counts reads per barcode and **keeps only barcodes with frequency ≥ min_barcode_freq**.
-* Streams surviving rows directly to output (no in-memory aggregation).
-  Downstream stages (assign, chunks) handle `(Read, BC)` deduplication independently.
+* Sorts surviving rows by `BC` (enables row-group skipping in `assign`).
+* Writes a typed, snappy-compressed Parquet file conforming to
+  `ambientmapper.extract.QC_PARQUET_SCHEMA`. Downstream stages (assign,
+  chunks) handle `(Read, BC)` deduplication independently.
 
-**Writes:**
+**Writes (0.2+):**
 
 ```
-filtered_QCFiles/filtered_<genome>_QCMapping.txt
+filtered_QCFiles/filtered_<genome>_QCMapping.parquet
 ```
+
+The input is auto-detected per genome: an existing
+`qc/<genome>_QCMapping.parquet` from extract is preferred over a co-located
+`qc/<genome>_QCMapping.txt`.
 
 ```bash
 ambientmapper filter --config cfg.json --threads 8
 ```
+
+**Legacy text output** — pass `--format txt` for the pre-0.2 behavior
+(plain TSV with header). Useful only when reproducing old runs bit-exactly
+or staging inputs for `ambientmapper prepare`. New users should not need
+this flag.
 
 ---
 
@@ -774,9 +785,9 @@ Typical layout for a completed run including decontamination:
 ├─ qc/                                   # per-genome raw QC (extract)
 │   ├─ <genome1>_QCMapping.txt
 │   └─ <genome2>_QCMapping.txt
-├─ filtered_QCFiles/                     # per-genome filtered QC (filter)
-│   ├─ filtered_<genome1>_QCMapping.txt
-│   └─ filtered_<genome2>_QCMapping.txt
+├─ filtered_QCFiles/                     # per-genome filtered QC (filter; 0.2+ Parquet, sorted by BC)
+│   ├─ filtered_<genome1>_QCMapping.parquet
+│   └─ filtered_<genome2>_QCMapping.parquet
 ├─ cell_map_ref_chunks/                  # barcode chunk files + per-chunk assign outputs
 │   ├─ <sample>_cell_map_ref_chunk_1.txt
 │   ├─ <sample>_cell_map_ref_chunk_2.txt
