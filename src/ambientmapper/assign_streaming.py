@@ -111,29 +111,17 @@ def _chunk_bcs(chunk_file: Path) -> set[str]:
         return {ln.strip() for ln in f if ln.strip()}
 
 
-def _genome_from_filename(p: Path) -> str:
-    n = p.name
-    for suffix in ("_QCMapping.parquet", "_QCMapping.txt"):
-        if n.startswith("filtered_") and n.endswith(suffix):
-            return n[len("filtered_") : -len(suffix)]
-    return n
+# Lifted to ambientmapper._filtered_io so chunks.py can share the precedence rule.
+# Re-imported under the original private names to keep the internal API stable.
+from ._filtered_io import (
+    genome_from_filename as _genome_from_filename,
+    discover_filtered_files,
+)
 
 
 def _filtered_files(workdir: Path, sample: str) -> list[Path]:
-    d = Path(workdir) / sample / "filtered_QCFiles"
-    if not d.exists():
-        raise FileNotFoundError(f"Not found: {d}")
-    # Prefer Parquet if all genomes are covered
-    pq_files = sorted(d.glob("filtered_*_QCMapping.parquet"))
-    tsv_files = sorted(d.glob("filtered_*_QCMapping.txt"))
-    if pq_files:
-        pq_genomes = {_genome_from_filename(p) for p in pq_files}
-        tsv_genomes = {_genome_from_filename(p) for p in tsv_files}
-        if tsv_genomes and pq_genomes >= tsv_genomes:
-            return pq_files
-    if not tsv_files:
-        raise FileNotFoundError(f"No filtered_* files under {d}")
-    return tsv_files
+    """Discover filtered per-genome QC files for a sample (parquet preferred)."""
+    return discover_filtered_files(Path(workdir) / sample / "filtered_QCFiles")
 
 
 def _convert_to_parquet(
