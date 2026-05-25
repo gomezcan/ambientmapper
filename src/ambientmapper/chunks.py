@@ -5,12 +5,32 @@ from typing import Iterable, Optional
 import os
 import sqlite3
 
+import pyarrow.parquet as pq
+
+from ._filtered_io import discover_filtered_files
+
 
 def _iter_barcodes_from_filtered(path: Path) -> Iterable[str]:
     """
     Stream barcodes from a filtered QCMapping file.
-    Assumes header: Read\tBC\tMAPQ\tAS\tNM\tXAcount[\tfrag_loc]
+
+    Format is dispatched by ``path.suffix``:
+      ``.parquet`` — streamed via ``pyarrow.parquet.ParquetFile.iter_batches``
+                     reading only the ``BC`` column (constant-memory).
+      ``.txt``     — line reader (preserved verbatim from the pre-0.2 path).
+                     Assumes header: ``Read\\tBC\\tMAPQ\\tAS\\tNM\\tXAcount[\\tfrag_loc]``.
     """
+    if path.suffix == ".parquet":
+        # Single-column, row-group-streamed read. Avoids materializing the
+        # full BC column in memory.
+        pf = pq.ParquetFile(path)
+        for batch in pf.iter_batches(batch_size=100_000, columns=["BC"]):
+            for bc in batch.column("BC").to_pylist():
+                if bc:
+                    yield bc
+        return
+
+    # Legacy TSV path (preserved verbatim).
     with path.open("r") as f:
         header = f.readline()
         # If file is headerless for some reason, treat first line as data
@@ -60,9 +80,11 @@ def make_barcode_chunks(
     Create barcode chunk files from filtered QCMapping files.
 
     Memory-safe implementation:
-      - Streams BCs from all filtered_*_QCMapping.txt
-      - Deduplicates using a SQLite table with PRIMARY KEY
-      - Iterates barcodes in sorted order and writes chunk files
+      - Streams BCs from all ``filtered_*_QCMapping.{parquet,txt}`` files
+        in ``filtered_dir``. The shared :func:`_filtered_io.discover_filtered_files`
+        precedence rule prefers Parquet when it covers every genome.
+      - Deduplicates using a SQLite table with PRIMARY KEY.
+      - Iterates barcodes in sorted order and writes chunk files.
 
     Returns number of chunk files written.
     """
@@ -70,8 +92,9 @@ def make_barcode_chunks(
     chunks_dir = Path(chunks_dir)
     chunks_dir.mkdir(parents=True, exist_ok=True)
 
-    paths = sorted(filtered_dir.glob("filtered_*_QCMapping.txt"))
-    if not paths:
+    try:
+        paths = discover_filtered_files(filtered_dir)
+    except FileNotFoundError:
         return 0
 
     n = int(chunk_size)
