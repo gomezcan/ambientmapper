@@ -115,6 +115,11 @@ def _bam_to_qc_parquet(
     col_frags:    list[str]          = []
 
     def _build_batch() -> pa.RecordBatch:
+        # Pass schema= (not names=) so the resulting RecordBatch inherits the
+        # nullability flags from QC_PARQUET_SCHEMA. Without this, pa.array()
+        # defaults to nullable=True for every column, which the ParquetWriter
+        # (opened with QC_PARQUET_SCHEMA) refuses with:
+        #   ValueError: Table schema does not match schema used to create file
         return pa.RecordBatch.from_arrays(
             [
                 pa.array(col_reads,    type=pa.string()),
@@ -125,7 +130,7 @@ def _bam_to_qc_parquet(
                 pa.array(col_xacounts, type=pa.int16()),
                 pa.array(col_frags,    type=pa.string()),
             ],
-            names=QC_PARQUET_SCHEMA.names,
+            schema=QC_PARQUET_SCHEMA,
         )
 
     def _flush(writer: pq.ParquetWriter) -> None:
