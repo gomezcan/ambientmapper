@@ -139,9 +139,12 @@ def _filter_qc_file_parquet(
             _sample = sample_name  # capture for closure
             def _norm_bc(bc):
                 return canonicalize_bc_seq_sample_force(bc or "", _sample)
+            # Use string type names (portable across DuckDB 0.9+).
+            # `duckdb.typing.*` constants only exist on 0.10+ and pyproject
+            # allows older.
             con.create_function(
                 "normalize_bc", _norm_bc,
-                [_duckdb.typing.VARCHAR], _duckdb.typing.VARCHAR,
+                ["VARCHAR"], "VARCHAR",
             )
             bc_expr = "normalize_bc(BC) AS BC"
         else:

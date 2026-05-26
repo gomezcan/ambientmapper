@@ -39,14 +39,20 @@ from .normalization import canonicalize_bc_seq_sample_force
 #     reserved word in DuckDB queries.
 #   - `frag_loc` is `chrom:pos:mate_pos`; empty string when the source has
 #     no chrom/mate.
+# All fields nullable: DuckDB's `COPY TO PARQUET` (used by the new filter)
+# always emits nullable columns, and pyarrow's ParquetWriter defaults also
+# lean nullable. Marking `Read/BC/MAPQ/XAcount/frag_loc` as non-null at the
+# schema level created cross-writer friction (DuckDB-emitted parquet failed
+# `Table.schema.equals(QC_PARQUET_SCHEMA)`) with no real safety benefit —
+# the writers in this package already guarantee these columns are populated.
 QC_PARQUET_SCHEMA: pa.Schema = pa.schema([
-    pa.field("Read",     pa.string(),  nullable=False),
-    pa.field("BC",       pa.string(),  nullable=False),
-    pa.field("MAPQ",     pa.int16(),   nullable=False),
-    pa.field("as_",      pa.int32(),   nullable=True),   # BAM AS tag is optional
-    pa.field("NM",       pa.int32(),   nullable=True),   # BAM NM tag is optional
-    pa.field("XAcount",  pa.int16(),   nullable=False),
-    pa.field("frag_loc", pa.string(),  nullable=False),
+    ("Read",     pa.string()),
+    ("BC",       pa.string()),
+    ("MAPQ",     pa.int16()),
+    ("as_",      pa.int32()),    # BAM AS tag is optional
+    ("NM",       pa.int32()),    # BAM NM tag is optional
+    ("XAcount",  pa.int16()),
+    ("frag_loc", pa.string()),
 ])
 
 
