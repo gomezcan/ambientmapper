@@ -42,14 +42,14 @@ def test_qc_parquet_schema_types():
         assert got.equals(want), f"{name}: got {got}, want {want}"
 
 
-def test_qc_parquet_schema_nullability():
-    # AS and NM are tag-dependent (may be missing from a read); rest are required.
-    nullable = {"as_", "NM"}
+def test_qc_parquet_schema_all_fields_nullable():
+    # All fields are nullable in 0.2 — DuckDB's COPY TO PARQUET emits nullable
+    # columns and pyarrow's ParquetWriter defaults also lean nullable, so
+    # marking required fields as non-null at the schema level created
+    # cross-writer friction with no safety benefit (writers already control
+    # which columns are populated).
     for field in QC_PARQUET_SCHEMA:
-        if field.name in nullable:
-            assert field.nullable, f"{field.name} should be nullable"
-        else:
-            assert not field.nullable, f"{field.name} should NOT be nullable"
+        assert field.nullable, f"{field.name} should be nullable (0.2 contract)"
 
 
 # --- genome_from_filename ----------------------------------------------------
