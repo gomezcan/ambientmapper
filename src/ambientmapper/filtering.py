@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import tempfile
 from collections import defaultdict
@@ -126,11 +127,19 @@ def _filter_qc_file_parquet(
     if tmp_out.exists():
         tmp_out.unlink()
 
+    # Per-PID DuckDB spill subdir under $TMPDIR. Without this, multiple
+    # ProcessPoolExecutor workers in _run_filter all set temp_directory to
+    # the same value (tempfile.gettempdir()), and DuckDB uses a fixed spill
+    # filename (duckdb_temp_storage_S64K-1.tmp), so workers race-collide on
+    # the same file → "IO Error: Could not read enough bytes".
+    _duckdb_tmpdir = Path(tempfile.gettempdir()) / f"am_duckdb_{os.getpid()}"
+    _duckdb_tmpdir.mkdir(parents=True, exist_ok=True)
+
     con = _duckdb.connect()
     try:
         con.execute(f"SET threads TO {max(1, int(duckdb_threads))}")
         con.execute(f"SET memory_limit='{duckdb_memory_limit}'")
-        con.execute(f"SET temp_directory='{_sql_quote(tempfile.gettempdir())}'")
+        con.execute(f"SET temp_directory='{_sql_quote(str(_duckdb_tmpdir))}'")
         con.execute("SET preserve_insertion_order=false")
 
         # BC normalization via Python UDF (if sample_name provided).
@@ -193,6 +202,7 @@ def _filter_qc_file_parquet(
         raise
     finally:
         con.close()
+        shutil.rmtree(_duckdb_tmpdir, ignore_errors=True)
 
     # Atomic rename.
     os.replace(tmp_out, out_path)
