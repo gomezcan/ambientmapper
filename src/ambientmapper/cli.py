@@ -193,6 +193,7 @@ def _apply_assign_overrides(
     ecdf_duckdb: Optional[bool] = None,
     ecdf_duckdb_threads: Optional[int] = None,
     score_batch_size: Optional[int] = None,
+    duckdb_memory_limit: Optional[str] = None,
 ) -> None:
     """Ensure cfg['assign'] exists and apply CLI overrides if provided."""
     assign = cfg.get("assign")
@@ -233,6 +234,8 @@ def _apply_assign_overrides(
         assign["ecdf_duckdb_threads"] = int(ecdf_duckdb_threads)
     if score_batch_size is not None:
         assign["score_batch_size"] = int(score_batch_size)
+    if duckdb_memory_limit is not None:
+        assign["duckdb_memory_limit"] = str(duckdb_memory_limit)
 
 
 def _ensure_minimal_chunk(workdir: Path, sample: str) -> None:
@@ -600,6 +603,14 @@ def assign(
         "--score-batch-size",
         help="Batch N chunks per DuckDB scan in Pass C (default: 200). Reduces file I/O by ~Nx. 0 = no batching.",
     ),
+    duckdb_memory_limit: Optional[str] = typer.Option(
+        None,
+        "--duckdb-memory-limit",
+        help=(
+            "Per-DuckDB-connection memory cap (e.g. '8G', '32G'). Default: 16GB. "
+            "Critical when multiple ProcessPoolExecutor workers run concurrently."
+        ),
+    ),
     score_chunk_range: Optional[str] = typer.Option(
         None,
         "--score-chunk-range",
@@ -662,6 +673,7 @@ def assign(
             ecdf_duckdb=ecdf_duckdb,
             ecdf_duckdb_threads=ecdf_duckdb_threads,
             score_batch_size=score_batch_size,
+            duckdb_memory_limit=duckdb_memory_limit,
         )
 
         workdir = Path(str(cfg["workdir"]))
@@ -1330,6 +1342,16 @@ def run(
     assign_ecdf_duckdb: Optional[bool] = typer.Option(None, "--assign-ecdf-duckdb/--assign-ecdf-no-duckdb"),
     assign_ecdf_duckdb_threads: Optional[int] = typer.Option(None, "--assign-ecdf-duckdb-threads"),
     assign_score_batch_size: Optional[int] = typer.Option(None, "--assign-score-batch-size"),
+    duckdb_memory_limit: Optional[str] = typer.Option(
+        None,
+        "--duckdb-memory-limit",
+        help=(
+            "Per-DuckDB-connection memory cap (e.g. '8G', '32G'). Applies to assign "
+            "Pass A/B/C and genotyping Pass 1/2.75. Default: 16GB. Critical when "
+            "multiple ProcessPoolExecutor workers run concurrently: DuckDB's default "
+            "is ~80%% of system RAM per connection, oversubscribing SLURM allocations."
+        ),
+    ),
     # genotyping overrides
     genotyping_min_reads: Optional[int] = typer.Option(None, "--genotyping-min-reads"),
     genotyping_beta: Optional[float] = typer.Option(None, "--genotyping-beta"),
@@ -1487,6 +1509,7 @@ def run(
             ecdf_duckdb=assign_ecdf_duckdb,
             ecdf_duckdb_threads=assign_ecdf_duckdb_threads,
             score_batch_size=assign_score_batch_size,
+            duckdb_memory_limit=duckdb_memory_limit,
         )
 
         params = {

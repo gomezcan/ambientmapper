@@ -58,6 +58,8 @@ Scored chunk outputs to:
 from __future__ import annotations
 
 import math
+import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,6 +79,28 @@ try:
 except ImportError:
     _duckdb = None  # type: ignore
     _HAS_DUCKDB = False
+
+
+# ---------------------------------------------------------------------------
+# DuckDB connection setup
+# ---------------------------------------------------------------------------
+# Per-PID DuckDB spill subdir + bounded memory_limit prevent two failure modes
+# when multiple ProcessPoolExecutor workers (e.g. score_chunks_batched) open
+# concurrent DuckDB connections:
+#
+#   1. Race on shared temp_directory: DuckDB writes spill files with fixed
+#      names ('duckdb_temp_storage_<TAG>-<N>.tmp'), so workers sharing
+#      tempfile.gettempdir() collide → "IO Error: Could not read enough bytes".
+#      The per-PID subdir isolates each worker's spill files.
+#   2. Unbounded memory_limit: DuckDB defaults to ~80% of system RAM. Four
+#      workers each thinking they own 80% → severe SLURM-cgroup pressure,
+#      aggressive spilling to NFS, 10–100× slowdown. memory_limit caps each
+#      connection's RAM use so the SLURM allocation isn't oversubscribed.
+def _duckdb_per_pid_tmpdir() -> Path:
+    """Create (idempotent) and return a per-PID DuckDB spill directory."""
+    p = Path(tempfile.gettempdir()) / f"am_duckdb_{os.getpid()}"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 # -----------------------------
 # Logging helpers
@@ -131,6 +155,7 @@ def _convert_to_parquet(
     xa_max: int = -1,
     row_group_size: int = 100_000,
     duckdb_threads: int = 4,
+    duckdb_memory_limit: str = "16GB",
     verbose: bool = True,
 ) -> list[Path]:
     """Convert filtered QCMapping TSVs to sorted Parquet files.
@@ -184,11 +209,11 @@ def _convert_to_parquet(
         where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
         # Detect whether the TSV has a frag_loc column
+        _tmpdir = _duckdb_per_pid_tmpdir()
         con = _duckdb.connect()
         con.execute(f"SET threads TO {max(1, duckdb_threads)}")
-        # Cap memory so DuckDB uses disk-based external sort for large files
-        con.execute("SET memory_limit='16GB'")
-        con.execute(f"SET temp_directory='{tempfile.gettempdir()}'")
+        con.execute(f"SET memory_limit='{duckdb_memory_limit}'")
+        con.execute(f"SET temp_directory='{_tmpdir}'")
         con.execute("SET preserve_insertion_order=false")
         cols_df = con.execute(
             f"SELECT * FROM read_csv('{tsv_str}', delim='\\t', header=true) LIMIT 0"
@@ -293,6 +318,7 @@ def _learn_edges_duckdb(
     hi_mq: float,
     nb_mq: int,
     verbose: bool,
+    duckdb_memory_limit: str = "16GB",
 ) -> tuple:
     """
     DuckDB fast path for Pass A: compute winner AS/MAPQ histograms in one SQL pass.
@@ -302,8 +328,11 @@ def _learn_edges_duckdb(
     """
     import pyarrow as pa
 
+    _tmpdir = _duckdb_per_pid_tmpdir()
     con = _duckdb.connect()
     con.execute(f"SET threads TO {max(1, duckdb_threads)}")
+    con.execute(f"SET memory_limit='{duckdb_memory_limit}'")
+    con.execute(f"SET temp_directory='{_tmpdir}'")
 
     con.register(
         "_bcs",
@@ -380,6 +409,7 @@ def _learn_ecdfs_duckdb(
     hi_dmq: float,
     nb_dmq: int,
     verbose: bool,
+    duckdb_memory_limit: str = "16GB",
 ) -> tuple:
     """
     DuckDB fast path for Pass B: compute per-decile delta histograms in one SQL pass.
@@ -392,8 +422,11 @@ def _learn_ecdfs_duckdb(
     """
     import pyarrow as pa
 
+    _tmpdir = _duckdb_per_pid_tmpdir()
     con = _duckdb.connect()
     con.execute(f"SET threads TO {max(1, duckdb_threads)}")
+    con.execute(f"SET memory_limit='{duckdb_memory_limit}'")
+    con.execute(f"SET temp_directory='{_tmpdir}'")
 
     con.register(
         "_bcs",
@@ -507,6 +540,7 @@ def _score_chunk_duckdb(
     mapq_min: int,
     xa_max: int,
     duckdb_threads: int,
+    duckdb_memory_limit: str = "16GB",
 ):
     """
     DuckDB-backed Pass C helpers.
@@ -520,8 +554,11 @@ def _score_chunk_duckdb(
     """
     import pyarrow as pa
 
+    _tmpdir = _duckdb_per_pid_tmpdir()
     con = _duckdb.connect()
     con.execute(f"SET threads TO {max(1, duckdb_threads)}")
+    con.execute(f"SET memory_limit='{duckdb_memory_limit}'")
+    con.execute(f"SET temp_directory='{_tmpdir}'")
 
     # Register BC set via Arrow (zero-copy)
     con.register("_bcs", pa.table({"bc": pa.array(list(bcs), type=pa.string())}))
@@ -1128,6 +1165,15 @@ def learn_edges(
         "--edges-duckdb-threads",
         help="DuckDB threads for Pass A edge learning (default: 4).",
     ),
+    duckdb_memory_limit: str = typer.Option(
+        "16GB",
+        "--duckdb-memory-limit",
+        help=(
+            "Per-DuckDB-connection memory cap (default: 16GB). Critical when "
+            "multiple parallel score-batch workers run: DuckDB's default is "
+            "~80%% of system RAM, oversubscribing SLURM allocations."
+        ),
+    ),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
 ):
     """
@@ -1176,6 +1222,7 @@ def learn_edges(
         as_counts, mq_counts, winners = _learn_edges_duckdb(
             files, sampled_bcs, mapq_min, xa_max, duckdb_threads,
             lo_as, hi_as, nb_as, lo_mq, hi_mq, nb_mq, verbose,
+            duckdb_memory_limit=duckdb_memory_limit,
         )
         _log_ok(
             f"[assign/edges] DuckDB done: winners={winners:,} ({time.time()-t0:.1f}s)",
@@ -1267,6 +1314,11 @@ def learn_ecdfs(
         "--ecdf-duckdb-threads",
         help="DuckDB threads for Pass B ECDF learning (default: 4).",
     ),
+    duckdb_memory_limit: str = typer.Option(
+        "16GB",
+        "--duckdb-memory-limit",
+        help="Per-DuckDB-connection memory cap (default: 16GB).",
+    ),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
 ):
     """
@@ -1322,6 +1374,7 @@ def learn_ecdfs(
             as_edges, mq_edges, k,
             lo_das, hi_das, nb_das, lo_dmq, hi_dmq, nb_dmq,
             verbose,
+            duckdb_memory_limit=duckdb_memory_limit,
         )
         _log_ok(
             f"[assign/ecdf] DuckDB done: pairs={n_pairs:,} ({time.time()-t0:.1f}s)",
@@ -1732,6 +1785,11 @@ def score_chunk(
     alpha: float = typer.Option(0.05, "--alpha"),
     use_duckdb: bool = typer.Option(True, "--score-duckdb/--score-no-duckdb"),
     duckdb_threads: int = typer.Option(2, "--duckdb-threads"),
+    duckdb_memory_limit: str = typer.Option(
+        "16GB",
+        "--duckdb-memory-limit",
+        help="Per-DuckDB-connection memory cap (default: 16GB).",
+    ),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
 ):
     """
@@ -1775,7 +1833,8 @@ def score_chunk(
     # ----------------------------------------------------------------
     if use_duckdb and _HAS_DUCKDB:
         top3_df, lazy_ambig = _score_chunk_duckdb(
-            files, bcs, mapq_min, xa_max, duckdb_threads
+            files, bcs, mapq_min, xa_max, duckdb_threads,
+            duckdb_memory_limit=duckdb_memory_limit,
         )
         if top3_df.empty:
             pd.DataFrame().to_csv(raw_out, sep="\t", index=False, compression="gzip")
@@ -2035,6 +2094,7 @@ def score_chunks_batched(
     alpha: float,
     duckdb_threads: int,
     verbose: bool,
+    duckdb_memory_limit: str = "16GB",
 ) -> list:
     """
     Score multiple chunk files in a single DuckDB scan.
@@ -2089,7 +2149,8 @@ def score_chunks_batched(
 
     # Single DuckDB query for the entire batch
     top3_df, lazy_ambig = _score_chunk_duckdb(
-        files, all_bcs, mapq_min, xa_max, duckdb_threads
+        files, all_bcs, mapq_min, xa_max, duckdb_threads,
+        duckdb_memory_limit=duckdb_memory_limit,
     )
 
     if top3_df.empty:

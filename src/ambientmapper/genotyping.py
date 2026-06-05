@@ -41,6 +41,7 @@ import re
 import os
 import shutil
 import subprocess
+import tempfile
 import numpy as np
 import pandas as pd
 import typer
@@ -59,6 +60,20 @@ except ImportError:
     _HAS_DUCKDB = False
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
+
+
+# ---------------------------------------------------------------------------
+# DuckDB connection setup
+# ---------------------------------------------------------------------------
+# Per-PID spill subdir + bounded memory_limit. See assign_streaming for the
+# full rationale; sibling fix to keep multiple concurrent ProcessPoolExecutor
+# workers (Pass 1/2.75 batch sharding) from racing on shared temp files and
+# oversubscribing the SLURM allocation.
+def _duckdb_per_pid_tmpdir() -> Path:
+    """Create (idempotent) and return a per-PID DuckDB spill directory."""
+    p = Path(tempfile.gettempdir()) / f"am_duckdb_{os.getpid()}"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 # Environment keys to keep when spawning subprocesses (sort, gzip, zcat, bash).
 # Full SLURM environments can exceed ARG_MAX and cause E2BIG / "Argument list too long".
@@ -1224,6 +1239,7 @@ def _pass1_read_and_reduce_duckdb(
     fp: Path,
     min_mapq: int = 0,
     max_xa: int = -1,
+    duckdb_memory_limit: str = "16GB",
 ) -> pd.DataFrame:
     """
     DuckDB fast path: read an assign output TSV(.gz) and perform the
@@ -1283,8 +1299,11 @@ def _pass1_read_and_reduce_duckdb(
     GROUP BY {bc_col}, {read_col}, {genome_col}
     """
 
+    _tmpdir = _duckdb_per_pid_tmpdir()
     con = duckdb.connect()
     con.execute("SET threads TO 2")
+    con.execute(f"SET memory_limit='{duckdb_memory_limit}'")
+    con.execute(f"SET temp_directory='{_tmpdir}'")
     result = con.execute(sql).fetchdf()
     con.close()
 
@@ -1472,6 +1491,7 @@ def _pass275_read_and_reduce_duckdb(
     topk: Dict[str, List[str]],
     min_mapq: int = 0,
     max_xa: int = -1,
+    duckdb_memory_limit: str = "16GB",
 ) -> pd.DataFrame:
     """
     DuckDB fast path for Pass 2.75: read assign TSV, perform per-genome
@@ -1545,8 +1565,11 @@ def _pass275_read_and_reduce_duckdb(
         ON a.barcode = t.tk_barcode AND a.genome = t.tk_genome
     """
 
+    _tmpdir = _duckdb_per_pid_tmpdir()
     con = duckdb.connect()
     con.execute("SET threads TO 2")
+    con.execute(f"SET memory_limit='{duckdb_memory_limit}'")
+    con.execute(f"SET temp_directory='{_tmpdir}'")
     con.register("topk_tbl", topk_arrow)
     result = con.execute(sql).fetchdf()
     con.close()
@@ -1840,6 +1863,7 @@ def _compute_eta_from_shards_duckdb(
     target_bcs: Sequence[str],
     all_genomes: Sequence[str],
     cfg: MergeConfig,
+    duckdb_memory_limit: str = "16GB",
 ) -> pd.Series:
     """DuckDB fast path: read all merged shards and aggregate L by genome in one SQL pass."""
     import duckdb
@@ -1852,8 +1876,11 @@ def _compute_eta_from_shards_duckdb(
 
     merged_glob = str(shard_root / "merged" / "shard_*.tsv.gz").replace("'", "''")
 
+    _tmpdir = _duckdb_per_pid_tmpdir()
     con = duckdb.connect()
     con.execute("SET threads TO 4")
+    con.execute(f"SET memory_limit='{duckdb_memory_limit}'")
+    con.execute(f"SET temp_directory='{_tmpdir}'")
 
     con.register(
         "_target_bcs",

@@ -248,6 +248,8 @@ def _run_assign(ctx: Ctx) -> None:
     ecdf_duckdb = bool(aconf.get("ecdf_duckdb", True))
     ecdf_duckdb_threads = int(aconf.get("ecdf_duckdb_threads", 4))
 
+    duckdb_memory_limit = str(aconf.get("duckdb_memory_limit", "16GB"))
+
     learn_edges(
         workdir=workdir, sample=sample, chunks_dir=chunks_dir, out_model=edges_npz,
         mapq_min=parse_int(mapq_min), xa_max=parse_int(xa_max),
@@ -257,6 +259,7 @@ def _run_assign(ctx: Ctx) -> None:
         edges_subsample=parse_int(edges_subsample),
         edges_duckdb=edges_duckdb,
         duckdb_threads=parse_int(edges_duckdb_threads),
+        duckdb_memory_limit=duckdb_memory_limit,
         verbose=verbose,
     )
     learn_ecdfs(
@@ -266,6 +269,7 @@ def _run_assign(ctx: Ctx) -> None:
         ecdf_subsample=parse_int(ecdf_subsample),
         ecdf_duckdb=ecdf_duckdb,
         ecdf_duckdb_threads=parse_int(ecdf_duckdb_threads),
+        duckdb_memory_limit=duckdb_memory_limit,
     )
 
     # Retired in 0.2: the implicit txt→parquet conversion previously fired
@@ -312,7 +316,9 @@ def _run_assign(ctx: Ctx) -> None:
                     ecdf_model=ecdf_npz,
                     out_raw_dir=out_raw_dir, out_filtered_dir=out_filtered_dir,
                     mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize_val, alpha=alpha,
-                    duckdb_threads=duckdb_threads_eff, verbose=verbose,
+                    duckdb_threads=duckdb_threads_eff,
+                    duckdb_memory_limit=duckdb_memory_limit,
+                    verbose=verbose,
                 ): batch
                 for batch in batches
             }
@@ -342,6 +348,7 @@ def _run_assign(ctx: Ctx) -> None:
                     out_raw_dir=None, out_filtered_dir=None,
                     mapq_min=mapq_min, xa_max=xa_max, chunksize=chunksize_val, alpha=alpha,
                     use_duckdb=score_duckdb_eff, duckdb_threads=duckdb_threads_eff,
+                    duckdb_memory_limit=duckdb_memory_limit,
                 ): chf
                 for chf in chunk_files
             }
