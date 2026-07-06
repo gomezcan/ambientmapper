@@ -16,12 +16,22 @@ def _load_read_ids(reads_to_drop_tsv: Path) -> Set[str]:
     """
     Load read IDs (QNAMEs) to drop.
     Expects a TSV/TSV.GZ with a 'read_id' column.
+
+    Streams ONLY the 'read_id' column in chunks and accumulates directly into the
+    set, to bound peak memory. Drop lists can reach hundreds of millions of rows
+    (e.g. ~500M for the largest pools); reading the whole 7-column frame + a list +
+    the set simultaneously (the previous approach) peaked well past 100 GB and
+    OOM-killed those jobs. usecols keeps only read_id; chunksize caps the transient.
     """
-    df = pd.read_csv(reads_to_drop_tsv, sep="\t", dtype=str)
-    if "read_id" not in df.columns:
+    header = pd.read_csv(reads_to_drop_tsv, sep="\t", dtype=str, nrows=0)
+    if "read_id" not in header.columns:
         raise ValueError(f"{reads_to_drop_tsv} must contain a 'read_id' column.")
-    # Drop NA, enforce str
-    return set(df["read_id"].dropna().astype(str).tolist())
+    ids: Set[str] = set()
+    for chunk in pd.read_csv(
+        reads_to_drop_tsv, sep="\t", usecols=["read_id"], dtype=str, chunksize=10_000_000
+    ):
+        ids.update(chunk["read_id"].dropna().to_numpy())
+    return ids
 
 
 def _iter_bams(bam: Optional[Path], bam_map: Optional[Path]):
